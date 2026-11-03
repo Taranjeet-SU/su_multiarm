@@ -1,0 +1,1 @@
+{"query":"When was the first CloudTax case recorded?","filters":{"source":"case","product":"CloudTax"},"aggregate":{"operation":"first_seen","field":"created_at"}}

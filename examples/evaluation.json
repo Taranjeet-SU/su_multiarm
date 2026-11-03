@@ -1,0 +1,5 @@
+[
+  {"id":"certificates","request":{"query":"exemption certificate"},"expected_ids":["kb:certificate","case:certificate"]},
+  {"id":"rounding","request":{"query":"ERR-204 rounding"},"expected_ids":["kb:rounding","tracker:rounding"]},
+  {"id":"sources","request":{"query":"content source","filters":{"product":"SearchDesk"}},"expected_ids":["kb:source","case:source"]}
+]

@@ -1,0 +1,446 @@
+"""Provider kernel: typed errors, usage, call metering, the ``ChatProvider`` protocol, HTTP helpers.
+
+Strict behaviour (plan §3.6): no automatic retries, no repair calls, no silent downgrade from native
+to prompt mode. Every failure is a typed ``ProviderError`` (``RuntimeError``) carrying a
+``category``; a reply that does not satisfy the schema is a ``SchemaViolation`` (``ValueError``)
+carrying the raw text so callers can keep it for replay. The caller's fail policy decides what
+happens next. Provider response bodies are never echoed into error messages (they can contain
+source text or secrets). API keys are read only from the environment variable the role names.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any, Protocol, TypeVar, runtime_checkable
+
+import httpx
+from pydantic import BaseModel, ValidationError
+
+from .capabilities import ModelCapabilities
+
+T = TypeVar("T", bound=BaseModel)
+
+
+def tokens(text: str) -> list[str]:
+    return re.findall(r"\w+", text.casefold())
+
+
+# --- errors ------------------------------------------------------------------------------------
+
+
+class ProviderError(RuntimeError):
+    """A provider call failed. ``category`` is stable and machine-readable."""
+
+    category = "provider_error"
+
+    def __init__(self, message: str, *, stage: str | None = None, status: int | None = None):
+        self.stage, self.status = stage, status
+        super().__init__(f"{stage}: {message}" if stage else message)
+
+
+class ProviderAuthError(ProviderError):
+    category = "auth"
+
+
+class ProviderRateLimited(ProviderError):
+    category = "rate_limited"
+
+    def __init__(self, message: str, *, stage: str | None = None, status: int | None = None, retry_after: str | None = None):
+        self.retry_after = retry_after  # recorded only; the package never retries
+        super().__init__(message, stage=stage, status=status)
+
+
+class ProviderServerError(ProviderError):
+    category = "server_error"
+
+
+class ProviderRequestError(ProviderError):
+    """4xx other than auth/rate limit, e.g. a schema the server refuses in strict mode."""
+
+    category = "bad_request"
+
+
+class ProviderTimeout(ProviderError):
+    category = "timeout"
+
+
+class ProviderConnectionError(ProviderError):
+    category = "connection"
+
+
+class ProviderResponseError(ProviderError):
+    """The body is not the documented shape (not JSON, missing choices/content, no tool call)."""
+
+    category = "bad_response"
+
+
+class ProviderIncomplete(ProviderError):
+    """Truncation (``max_tokens``/``length``) or another non-final stop: always a failure."""
+
+    category = "incomplete"
+
+
+class ProviderRefusal(ProviderError):
+    category = "refusal"
+
+
+class ProviderUnavailable(ProviderError):
+    """No provider is configured for a stage that needs one (``provider: none``)."""
+
+    category = "unavailable"
+
+
+class CapabilityMismatch(ProviderError):
+    """The role relies on a capability the registry does not declare, or the schema cannot be sent
+    in the declared mode. Raised before any network call or budget reservation; never downgraded."""
+
+    category = "capability_mismatch"
+
+
+class SchemaViolation(ValueError):
+    """The reply does not parse as the requested schema. ``raw`` keeps the reply for replay."""
+
+    category = "schema_violation"
+
+    def __init__(self, message: str, *, raw: str, stage: str | None = None, error_count: int = 0):
+        self.raw, self.stage, self.error_count = raw, stage, error_count
+        super().__init__(f"{stage}: {message}" if stage else message)
+
+
+def map_http_error(response: httpx.Response, stage: str) -> ProviderError:
+    status = response.status_code
+    message = f"provider HTTP {status}"
+    if status in (401, 403):
+        return ProviderAuthError(message, stage=stage, status=status)
+    if status == 429:
+        return ProviderRateLimited(message, stage=stage, status=status, retry_after=response.headers.get("retry-after"))
+    if status >= 500:
+        return ProviderServerError(message, stage=stage, status=status)
+    return ProviderRequestError(message, stage=stage, status=status)
+
+
+# --- usage and metering -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Usage:
+    """Normalised token usage. ``input_tokens`` is the total prompt size including cached and
+    cache-write tokens on every provider (Anthropic reports them separately; they are summed)."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    reported: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CallEstimate:
+    """What a call may consume, reserved before it is sent. Output is the ``max_tokens`` ceiling;
+    input is a chars/4 heuristic (the committed value is the provider-reported usage)."""
+
+    input_tokens: int
+    output_tokens: int
+
+    @classmethod
+    def of(cls, text_chars: int, max_tokens: int) -> "CallEstimate":
+        return cls(input_tokens=max(1, math.ceil(text_chars / 4)), output_tokens=max_tokens)
+
+
+@dataclass(frozen=True)
+class CallContext:
+    """Per-call metadata. ``stage`` names the caller (planner, review, generator, extraction ...)."""
+
+    stage: str
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class CallMeter(Protocol):
+    """What providers need from a budget: a reservation before the call and a record after it.
+
+    ``record`` receives a dict with ``stage``, ``provider``, ``model``, ``returned_model``,
+    ``mode``, ``success``, ``error_category``, ``seconds``, ``usage`` (``Usage.as_dict()``),
+    ``estimate`` and ``pricing_key``. Implementations: ``CallBudget`` (ingestion) and
+    ``providers.accounting.RunBudgetMeter`` (request path: ``Budget`` + ``Trace``).
+    """
+
+    def reserve(self, estimate: CallEstimate | None = None) -> None: ...
+
+    def record(self, item: dict[str, Any]) -> None: ...
+
+
+class CallBudget:
+    """Call-count budget used on the write path; records every call with its normalised usage."""
+
+    def __init__(self, maximum: int):
+        self.maximum = maximum
+        self.calls: list[dict] = []
+        self._reserved = 0
+        self._lock = threading.Lock()
+
+    def reserve(self, estimate: CallEstimate | None = None):
+        with self._lock:
+            if self._reserved >= self.maximum:
+                raise RuntimeError("LLM call budget exhausted")
+            self._reserved += 1
+
+    def record(self, item):
+        with self._lock:
+            self.calls.append(item)
+
+    def usage(self) -> dict[str, int]:
+        """Token totals over the recorded calls (unreported usage counts as zero)."""
+        keys = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens")
+        with self._lock:
+            return {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in self.calls) for k in keys}
+
+
+# --- protocol ---------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RoleSpec:
+    """Provider-facing view of a chat role (v2 ``ChatRole`` or v1 ``ModelConfig``)."""
+
+    provider: str
+    model: str
+    base_url: str | None = None
+    api_key_env: str | None = None
+    max_tokens: int = 2048
+    timeout_seconds: float = 60
+    max_tokens_parameter: str = "max_completion_tokens"
+    structured_output: str = "none"
+    prompt_caching: str = "none"
+    reasoning_effort: str | None = None
+    pricing_key: str | None = None
+    streaming: bool = False  # the role declares ``capabilities.streaming``
+
+    @classmethod
+    def of(cls, config: Any) -> "RoleSpec":
+        caps = getattr(config, "capabilities", None)
+        pricing = getattr(config, "pricing_key", None)
+        return cls(
+            provider=config.provider,
+            model=config.model,
+            base_url=config.base_url,
+            api_key_env=config.api_key_env,
+            max_tokens=config.max_tokens,
+            timeout_seconds=config.timeout_seconds,
+            max_tokens_parameter=getattr(config, "max_tokens_parameter", "max_completion_tokens"),
+            structured_output=getattr(caps, "structured_output", "none"),
+            prompt_caching=getattr(caps, "prompt_caching", "none"),
+            reasoning_effort=getattr(config, "reasoning_effort", None),
+            pricing_key=pricing or config.model or None,
+            streaming=bool(getattr(caps, "streaming", False)),
+        )
+
+
+@runtime_checkable
+class ChatProvider(Protocol):
+    name: str
+    role: RoleSpec
+
+    def capabilities(self) -> ModelCapabilities: ...
+
+    def complete_json(self, system: str, payload: Any, schema: type[T], budget: CallMeter, ctx: CallContext) -> tuple[T, Usage]: ...
+
+    def complete_json_raw(self, system: str, payload: Any, schema: type[BaseModel], budget: CallMeter, ctx: CallContext) -> tuple[str, Usage]: ...
+
+    def complete_text(self, system: str, payload: Any, budget: CallMeter, ctx: CallContext) -> tuple[str, Usage]: ...
+
+
+# --- shared helpers ---------------------------------------------------------------------------
+
+FENCE = re.compile(r"^```(?:json)?\s*|\s*```$")
+
+
+def user_content(payload: Any) -> str:
+    return payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+
+
+def schema_instruction(schema: type[BaseModel]) -> str:
+    return "\nReturn only one JSON object matching this schema:\n" + json.dumps(schema.model_json_schema())
+
+
+def schema_name(schema: type[BaseModel]) -> str:
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", schema.__name__)[:64]
+    return name or "result"
+
+
+def validate_reply(schema: type[T], raw: str, stage: str) -> T:
+    try:
+        return schema.model_validate_json(raw)
+    except ValidationError as error:
+        raise SchemaViolation(
+            f"reply violates the {schema.__name__} schema ({error.error_count()} errors)", raw=raw, stage=stage, error_count=error.error_count()
+        ) from error
+
+
+def strict_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """The schema in OpenAI strict form (every object closed, every property required), or ``None``
+    when it contains a free-form mapping (``additionalProperties`` with a schema, or an object
+    without declared properties), which strict mode cannot express. Defaults and titles are
+    dropped; the reply is still validated with the original pydantic model, so a value the model
+    now has to emit explicitly is accepted."""
+
+    class NotStrict(Exception):
+        pass
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if not isinstance(node, dict):
+            return node
+        result: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in {"default", "title"}:
+                continue
+            if key in {"properties", "$defs"} and isinstance(value, dict):
+                result[key] = {name: walk(sub) for name, sub in value.items()}
+            else:
+                result[key] = walk(value)
+        if node.get("type") == "object" or "properties" in node:
+            if "properties" not in node or node.get("additionalProperties") not in (None, False):
+                raise NotStrict
+            result["additionalProperties"] = False
+            result["required"] = list(node["properties"])
+        return result
+
+    try:
+        return walk(schema)
+    except NotStrict:
+        return None
+
+
+class HttpCall:
+    """One HTTP POST with typed error mapping. No retry, no redirect following."""
+
+    def __init__(self, transport: httpx.BaseTransport | None = None):
+        self.transport = transport
+
+    def post(self, url: str, *, headers: dict[str, str], body: dict[str, Any], timeout: float, stage: str) -> dict[str, Any]:
+        try:
+            options: dict[str, Any] = {} if self.transport is None else {"transport": self.transport}
+            with httpx.Client(timeout=timeout, follow_redirects=False, **options) as client:
+                response = client.post(url, headers=headers, json=body)
+        except httpx.TimeoutException as error:
+            raise ProviderTimeout(f"provider timed out ({type(error).__name__})", stage=stage) from error
+        except httpx.TransportError as error:
+            raise ProviderConnectionError(f"provider unreachable ({type(error).__name__})", stage=stage) from error
+        if response.is_error:
+            raise map_http_error(response, stage)
+        try:
+            data = response.json()
+        except ValueError as error:
+            raise ProviderResponseError("provider reply is not JSON", stage=stage, status=response.status_code) from error
+        if not isinstance(data, dict):
+            raise ProviderResponseError("provider reply is not a JSON object", stage=stage, status=response.status_code)
+        return data
+
+    def post_stream(self, url: str, *, headers: dict[str, str], body: dict[str, Any], timeout: float, stage: str, consumer: Any) -> dict[str, Any]:
+        """POST and read a ``text/event-stream`` reply, feeding every event to ``consumer.feed(event,
+        data)``; returns ``consumer.result()`` (the reply in the provider's non-streaming shape). A
+        reply that is not an event stream is a ``ProviderResponseError`` (no silent non-streaming
+        fallback). Exceptions raised by the consumer (a cancelled run) close the connection."""
+        try:
+            options: dict[str, Any] = {} if self.transport is None else {"transport": self.transport}
+            with httpx.Client(timeout=timeout, follow_redirects=False, **options) as client:
+                with client.stream("POST", url, headers={**headers, "Accept": "text/event-stream"}, json=body) as response:
+                    if response.is_error:
+                        raise map_http_error(response, stage)
+                    kind = response.headers.get("content-type", "")
+                    if not kind.startswith("text/event-stream"):
+                        raise ProviderResponseError("provider reply is not an event stream", stage=stage, status=response.status_code)
+                    for event, data in iter_sse(response.iter_lines()):
+                        consumer.feed(event, data)
+        except httpx.TimeoutException as error:
+            raise ProviderTimeout(f"provider timed out ({type(error).__name__})", stage=stage) from error
+        except httpx.TransportError as error:
+            raise ProviderConnectionError(f"provider unreachable ({type(error).__name__})", stage=stage) from error
+        return consumer.result()
+
+
+def iter_sse(lines: Any) -> Any:
+    """Server-sent events from text lines: yields ``(event, data)``; ``event`` defaults to
+    ``message``; multi-line ``data`` fields are joined with newlines; comments are skipped."""
+    event, data = "", []
+    for line in lines:
+        line = line.rstrip("\r")
+        if not line:
+            if data:
+                yield event or "message", "\n".join(data)
+            event, data = "", []
+            continue
+        if line.startswith(":"):
+            continue
+        name, _, value = line.partition(":")
+        value = value[1:] if value.startswith(" ") else value
+        if name == "event":
+            event = value
+        elif name == "data":
+            data.append(value)
+    if data:
+        yield event or "message", "\n".join(data)
+
+
+def as_int(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+class MeteredCall:
+    """Wraps one provider exchange: reservation, timing, and a record in ``finally`` (also on failure)."""
+
+    def __init__(self, provider: Any, budget: CallMeter, ctx: CallContext, mode: str, estimate: CallEstimate):
+        self.provider, self.budget, self.ctx, self.mode, self.estimate = provider, budget, ctx, mode, estimate
+        self.usage = Usage()
+        self.returned_model: str | None = None
+        self.extra: dict[str, Any] = {}
+
+    def __enter__(self) -> "MeteredCall":
+        self.budget.reserve(self.estimate)
+        self.started = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        role: RoleSpec = self.provider.role
+        category = None
+        if exc is not None:
+            category = getattr(exc, "category", type(exc).__name__)
+        self.budget.record(
+            {
+                "stage": self.ctx.stage,
+                "provider": role.provider,
+                "model": role.model,
+                "returned_model": self.returned_model,
+                "mode": self.mode,
+                "success": exc is None,
+                "error_category": category,
+                "seconds": time.perf_counter() - self.started,
+                "usage": self.usage.as_dict(),
+                "estimate": asdict(self.estimate),
+                "pricing_key": role.pricing_key,
+                "prompt_caching": role.prompt_caching,
+                "reasoning_effort": role.reasoning_effort,
+                "max_tokens": role.max_tokens,
+                **self.extra,
+            }
+        )
+
+
+def timeout_for(role: RoleSpec, budget: CallMeter) -> float:
+    """The role timeout, capped by the request deadline when the meter knows it."""
+    remaining = getattr(budget, "remaining_seconds", None)
+    left = remaining() if callable(remaining) else None
+    if left is None:
+        return role.timeout_seconds
+    return max(0.001, min(role.timeout_seconds, left))

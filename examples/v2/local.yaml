@@ -1,0 +1,43 @@
+# schema_version 2, fully local and offline: one sqlite backend serves every capability, the hash
+# embedder needs no model download, decision is rules (no planner call) and generation is off.
+# Paths are relative to this file. Run from the repository root:
+#   su-multi-arm --config examples/v2/local.yaml ingest examples/documents.jsonl
+#   su-multi-arm --config examples/v2/local.yaml search 'exemption certificate'
+schema_version: 2
+dataset: demo
+profile: neutral
+backends:
+  local:
+    kind: sqlite
+    path: state
+storage:
+  catalog: local
+  records: local
+  ledger: local
+  sessions: local
+  cache: local
+  communities: local
+metadata_schema:
+  fields:
+    - {name: source, type: string, filterable: true, listable: true, groupable: true}
+    - {name: product, type: string, filterable: true, listable: true, groupable: true, casefold_match: true}
+    - {name: state, type: string, filterable: true, groupable: true}
+    - {name: status, type: string, filterable: true, groupable: true}
+    - {name: created_at, type: datetime, filterable: true, sortable: true, time_basis: created}
+models:
+  roles:
+    embedder: {provider: hash, dimensions: 256}
+pipeline:
+  decision: {kind: rules}
+  arms:
+    dense: {backend: local}
+    lexical: {backend: local}
+    structured: {backend: local}
+    graph: {backend: local}
+extraction:
+  extractors: [gazetteer, regex]
+  gazetteer:
+    topic: [exemption certificate, rounding, content source]
+    product: [CloudTax, SearchDesk]
+  patterns:
+    error: '\bERR-[0-9]+\b'

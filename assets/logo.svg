@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Multi-arm retrieval logo: one query fanning out into several arms that rejoin in one answer</title>
+  <!-- Original abstract mark: a query node on the left fans out into four arms that converge on an
+       answer node on the right. Mid-tone colours, no background, so it reads on light and dark themes. -->
+  <g fill="none" stroke-width="7" stroke-linecap="round">
+    <path d="M24 64 C 48 64, 44 22, 64 22 C 84 22, 80 64, 104 64" stroke="#0EA5A4"/>
+    <path d="M24 64 C 46 64, 46 47, 64 47 C 82 47, 82 64, 104 64" stroke="#3B82F6"/>
+    <path d="M24 64 C 46 64, 46 81, 64 81 C 82 81, 82 64, 104 64" stroke="#8B5CF6"/>
+    <path d="M24 64 C 48 64, 44 106, 64 106 C 84 106, 80 64, 104 64" stroke="#F59E0B"/>
+  </g>
+  <g stroke="#64748B" stroke-width="4">
+    <circle cx="20" cy="64" r="11" fill="#E2E8F0"/>
+    <circle cx="108" cy="64" r="11" fill="#E2E8F0"/>
+  </g>
+  <g fill="#64748B">
+    <circle cx="20" cy="64" r="4"/>
+    <circle cx="108" cy="64" r="4"/>
+  </g>
+</svg>

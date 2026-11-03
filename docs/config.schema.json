@@ -1,0 +1,2520 @@
+{
+  "$defs": {
+    "ActionsConfig": {
+      "additionalProperties": false,
+      "description": "Write actions (plan \u00a73.4). Default: none. Only built-in actions named here are registered;\nevery invocation (also a denied one) is audited on ``storage.ledger`` before it runs.",
+      "properties": {
+        "allow": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allow",
+          "type": "array"
+        },
+        "audit_retention_seconds": {
+          "default": 604800,
+          "minimum": 1,
+          "title": "Audit Retention Seconds",
+          "type": "integer"
+        }
+      },
+      "title": "ActionsConfig",
+      "type": "object"
+    },
+    "ActionsServingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allow",
+          "type": "array"
+        }
+      },
+      "title": "ActionsServingConfig",
+      "type": "object"
+    },
+    "AnswerContractConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "on_violation": {
+          "default": "abstain_with_reason",
+          "enum": [
+            "abstain_with_reason",
+            "fail"
+          ],
+          "title": "On Violation",
+          "type": "string"
+        }
+      },
+      "title": "AnswerContractConfig",
+      "type": "object"
+    },
+    "ArmsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "exact_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExactIdArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "dense": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DenseArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "lexical": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LexicalArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "structured": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StructuredArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "graph": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "community": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommunityArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ArmsConfig",
+      "type": "object"
+    },
+    "BudgetsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_llm_calls": {
+          "default": 12,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Max Llm Calls",
+          "type": "integer"
+        },
+        "max_input_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Input Tokens"
+        },
+        "max_output_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Output Tokens"
+        },
+        "max_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd"
+        },
+        "deadline_seconds": {
+          "default": 60,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Deadline Seconds",
+          "type": "number"
+        },
+        "price_table": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Price Table"
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "BudgetsConfig",
+      "type": "object"
+    },
+    "CacheArm": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Backend",
+          "type": "string"
+        },
+        "mode": {
+          "const": "exact",
+          "default": "exact",
+          "title": "Mode",
+          "type": "string"
+        },
+        "ttl_seconds": {
+          "default": 3600,
+          "minimum": 1,
+          "title": "Ttl Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "CacheArm",
+      "type": "object"
+    },
+    "CapabilityDeclaration": {
+      "additionalProperties": false,
+      "description": "What a chat role relies on; validated against ``providers/capabilities.py``.\n\n``structured_output``: ``none`` (default; schema in the system prompt, strict validation of the\nreply), ``json_mode`` (``response_format: json_object``; OpenAI-style providers only),\n``json_schema`` (``response_format: json_schema``, ``strict: false``; OpenAI-style providers\nonly), ``native`` (provider-enforced: Anthropic forced tool use, OpenAI strict json_schema; only\nfor registry-declared ``(provider, model)`` pairs). ``prompt_caching``: ``controlled`` sends\n``cache_control`` (Anthropic); ``passive`` records cached tokens the provider reports.",
+      "properties": {
+        "structured_output": {
+          "default": "none",
+          "enum": [
+            "none",
+            "json_mode",
+            "json_schema",
+            "native"
+          ],
+          "title": "Structured Output",
+          "type": "string"
+        },
+        "prompt_caching": {
+          "default": "none",
+          "enum": [
+            "none",
+            "passive",
+            "controlled"
+          ],
+          "title": "Prompt Caching",
+          "type": "string"
+        },
+        "streaming": {
+          "default": false,
+          "title": "Streaming",
+          "type": "boolean"
+        }
+      },
+      "title": "CapabilityDeclaration",
+      "type": "object"
+    },
+    "ChatRole": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": [
+            "openai_compatible",
+            "openai",
+            "anthropic"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "api_key_env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key Env"
+        },
+        "max_tokens": {
+          "default": 2048,
+          "maximum": 64000,
+          "minimum": 128,
+          "title": "Max Tokens",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "default": 60,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "max_tokens_parameter": {
+          "default": "max_completion_tokens",
+          "enum": [
+            "max_completion_tokens",
+            "max_tokens"
+          ],
+          "title": "Max Tokens Parameter",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "minimal",
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reasoning Effort"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/CapabilityDeclaration"
+        },
+        "evidence_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvidenceBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pricing_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pricing Key"
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ],
+      "title": "ChatRole",
+      "type": "object"
+    },
+    "ChunkingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "size": {
+          "default": 1600,
+          "maximum": 16000,
+          "minimum": 100,
+          "title": "Size",
+          "type": "integer"
+        },
+        "overlap": {
+          "default": 160,
+          "minimum": 0,
+          "title": "Overlap",
+          "type": "integer"
+        },
+        "field_order": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Field Order",
+          "type": "array"
+        }
+      },
+      "title": "ChunkingConfig",
+      "type": "object"
+    },
+    "ClassifierArtifactConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "model_path": {
+          "format": "path",
+          "title": "Model Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "manifest": {
+          "$ref": "#/$defs/ClassifierManifestConfig"
+        }
+      },
+      "required": [
+        "model_path",
+        "sha256",
+        "manifest"
+      ],
+      "title": "ClassifierArtifactConfig",
+      "type": "object"
+    },
+    "ClassifierManifestConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "features": {
+          "pattern": "^(hashed_ngrams|embedding:[a-z][a-z0-9_]*)$",
+          "title": "Features",
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Labels",
+          "type": "array"
+        },
+        "threshold": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Threshold",
+          "type": "number"
+        }
+      },
+      "required": [
+        "features",
+        "labels",
+        "threshold"
+      ],
+      "title": "ClassifierManifestConfig",
+      "type": "object"
+    },
+    "CommunitiesConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "default": "entity",
+          "enum": [
+            "entity",
+            "louvain"
+          ],
+          "title": "Strategy",
+          "type": "string"
+        },
+        "min_documents": {
+          "default": 2,
+          "minimum": 1,
+          "title": "Min Documents",
+          "type": "integer"
+        },
+        "seed": {
+          "default": 42,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt"
+        }
+      },
+      "title": "CommunitiesConfig",
+      "type": "object"
+    },
+    "CommunityArm": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Backend",
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "CommunityArm",
+      "type": "object"
+    },
+    "DecisionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "default": "rules",
+          "enum": [
+            "rules",
+            "classifier",
+            "llm",
+            "cascade"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "stages": {
+          "items": {
+            "enum": [
+              "rules",
+              "classifier",
+              "llm"
+            ],
+            "type": "string"
+          },
+          "title": "Stages",
+          "type": "array"
+        },
+        "on_failure": {
+          "default": "fail_closed",
+          "enum": [
+            "fail_closed",
+            "raw_all_arms"
+          ],
+          "title": "On Failure",
+          "type": "string"
+        },
+        "stage_policies": {
+          "$ref": "#/$defs/StagePolicies"
+        },
+        "max_steps": {
+          "default": 10,
+          "maximum": 20,
+          "minimum": 1,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt"
+        },
+        "prompt_file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt File"
+        },
+        "artifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClassifierArtifactConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "component": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Component"
+        }
+      },
+      "title": "DecisionConfig",
+      "type": "object"
+    },
+    "DenseArm": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Backend",
+          "type": "string"
+        },
+        "candidates": {
+          "default": 200,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Candidates",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "DenseArm",
+      "type": "object"
+    },
+    "DiversityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Field",
+          "type": "string"
+        },
+        "min_per_value": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Min Per Value",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "field"
+      ],
+      "title": "DiversityConfig",
+      "type": "object"
+    },
+    "EmbedderRole": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "default": "hash",
+          "enum": [
+            "hash",
+            "sentence_transformers",
+            "openai",
+            "openai_compatible"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "default": "hash-demo-v1",
+          "title": "Model",
+          "type": "string"
+        },
+        "dimensions": {
+          "default": 256,
+          "maximum": 65536,
+          "minimum": 16,
+          "title": "Dimensions",
+          "type": "integer"
+        },
+        "base_url": {
+          "default": "https://api.openai.com/v1",
+          "title": "Base Url",
+          "type": "string"
+        },
+        "api_key_env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key Env"
+        },
+        "batch_size": {
+          "default": 32,
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "query_prefix": {
+          "default": "",
+          "title": "Query Prefix",
+          "type": "string"
+        },
+        "document_prefix": {
+          "default": "",
+          "title": "Document Prefix",
+          "type": "string"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revision"
+        },
+        "device": {
+          "default": "cpu",
+          "title": "Device",
+          "type": "string"
+        }
+      },
+      "title": "EmbedderRole",
+      "type": "object"
+    },
+    "EvidenceBudget": {
+      "additionalProperties": false,
+      "properties": {
+        "chars": {
+          "default": 60000,
+          "maximum": 500000,
+          "minimum": 500,
+          "title": "Chars",
+          "type": "integer"
+        }
+      },
+      "title": "EvidenceBudget",
+      "type": "object"
+    },
+    "ExactIdArm": {
+      "additionalProperties": false,
+      "description": "Exact identifier lookups (plan \u00a73.8): ``alias_map`` is a YAML/JSON file ``{aliases: {alias:\ncanonical_id}}``; ``alias_fields`` are declared metadata fields whose values identify a record;\nidentifiers are recognised by the ``pattern`` of ``id`` fields in ``metadata_schema`` and by the\nalias map's keys. Matching is exact (``casefold`` is the only normalisation, opt-in); an unknown\nidentifier is reported, never guessed.",
+      "properties": {
+        "alias_map": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Alias Map"
+        },
+        "alias_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Alias Fields",
+          "type": "array"
+        },
+        "casefold": {
+          "default": false,
+          "title": "Casefold",
+          "type": "boolean"
+        },
+        "max_ids": {
+          "default": 20,
+          "maximum": 200,
+          "minimum": 1,
+          "title": "Max Ids",
+          "type": "integer"
+        }
+      },
+      "title": "ExactIdArm",
+      "type": "object"
+    },
+    "ExtractionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "extractors": {
+          "items": {
+            "enum": [
+              "gazetteer",
+              "regex",
+              "spacy",
+              "gliner",
+              "llm"
+            ],
+            "type": "string"
+          },
+          "title": "Extractors",
+          "type": "array"
+        },
+        "ontology": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ontology"
+        },
+        "grounding": {
+          "$ref": "#/$defs/GroundingConfig"
+        },
+        "policy": {
+          "default": "strict",
+          "enum": [
+            "strict",
+            "quarantine",
+            "partial"
+          ],
+          "title": "Policy",
+          "type": "string"
+        },
+        "prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt"
+        },
+        "predicate_triggers": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Predicate Triggers",
+          "type": "object"
+        },
+        "stemmer_language": {
+          "default": "english",
+          "title": "Stemmer Language",
+          "type": "string"
+        },
+        "gazetteer": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Gazetteer",
+          "type": "object"
+        },
+        "patterns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Patterns",
+          "type": "object"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "array"
+        },
+        "spacy_model": {
+          "default": "en_core_web_sm",
+          "title": "Spacy Model",
+          "type": "string"
+        },
+        "pos": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pos",
+          "type": "array"
+        },
+        "gliner_model": {
+          "default": "urchade/gliner_small-v2.1",
+          "title": "Gliner Model",
+          "type": "string"
+        },
+        "threshold": {
+          "default": 0.5,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Threshold",
+          "type": "number"
+        }
+      },
+      "title": "ExtractionConfig",
+      "type": "object"
+    },
+    "FieldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "datetime",
+            "date",
+            "enum",
+            "id"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "nullable": {
+          "default": true,
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "enum_values": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enum Values"
+        },
+        "filterable": {
+          "default": true,
+          "title": "Filterable",
+          "type": "boolean"
+        },
+        "listable": {
+          "default": false,
+          "title": "Listable",
+          "type": "boolean"
+        },
+        "groupable": {
+          "default": false,
+          "title": "Groupable",
+          "type": "boolean"
+        },
+        "sortable": {
+          "default": false,
+          "title": "Sortable",
+          "type": "boolean"
+        },
+        "max_catalog_cardinality": {
+          "default": 200,
+          "minimum": 0,
+          "title": "Max Catalog Cardinality",
+          "type": "integer"
+        },
+        "time_basis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Time Basis"
+        },
+        "timezone_policy": {
+          "default": "require_offset",
+          "enum": [
+            "require_offset",
+            "assume_utc"
+          ],
+          "title": "Timezone Policy",
+          "type": "string"
+        },
+        "casefold_match": {
+          "default": false,
+          "title": "Casefold Match",
+          "type": "boolean"
+        },
+        "pattern": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pattern"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "title": "FieldSpec",
+      "type": "object"
+    },
+    "GenerationStageConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/AnswerContractConfig"
+        },
+        "voice": {
+          "default": "none",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Voice",
+          "type": "string"
+        },
+        "prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt"
+        },
+        "prompt_file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt File"
+        },
+        "evidence_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Fields",
+          "type": "array"
+        }
+      },
+      "title": "GenerationStageConfig",
+      "type": "object"
+    },
+    "GraphArm": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Backend",
+          "type": "string"
+        },
+        "hops": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 0,
+          "title": "Hops",
+          "type": "integer"
+        },
+        "predicates": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Predicates",
+          "type": "array"
+        },
+        "direction": {
+          "default": "any",
+          "enum": [
+            "out",
+            "in",
+            "any"
+          ],
+          "title": "Direction",
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "GraphArm",
+      "type": "object"
+    },
+    "GroundingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "normalisation": {
+          "items": {
+            "enum": [
+              "nfkc",
+              "casefold",
+              "whitespace"
+            ],
+            "type": "string"
+          },
+          "title": "Normalisation",
+          "type": "array"
+        },
+        "ambiguous": {
+          "default": "reject",
+          "enum": [
+            "reject",
+            "first"
+          ],
+          "title": "Ambiguous",
+          "type": "string"
+        }
+      },
+      "title": "GroundingConfig",
+      "type": "object"
+    },
+    "HttpConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "bind": {
+          "default": "127.0.0.1:8099",
+          "title": "Bind",
+          "type": "string"
+        },
+        "auth": {
+          "default": "none",
+          "enum": [
+            "none",
+            "bearer_env"
+          ],
+          "title": "Auth",
+          "type": "string"
+        },
+        "token_env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Token Env"
+        },
+        "page_size_max": {
+          "default": 50,
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Page Size Max",
+          "type": "integer"
+        }
+      },
+      "title": "HttpConfig",
+      "type": "object"
+    },
+    "IngestionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "chunking": {
+          "$ref": "#/$defs/ChunkingConfig"
+        },
+        "input_mapping": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputMapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "IngestionConfig",
+      "type": "object"
+    },
+    "InputMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "default": "id",
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "title",
+          "title": "Title",
+          "type": "string"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "source",
+          "title": "Source"
+        },
+        "source_value": {
+          "default": "article",
+          "title": "Source Value",
+          "type": "string"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "url",
+          "title": "Url"
+        },
+        "fields": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Fields",
+          "type": "object"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Metadata",
+          "type": "object"
+        }
+      },
+      "title": "InputMapping",
+      "type": "object"
+    },
+    "KnnConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "default": "exact",
+          "enum": [
+            "hnsw",
+            "exact"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "exact_rescore": {
+          "default": true,
+          "title": "Exact Rescore",
+          "type": "boolean"
+        }
+      },
+      "title": "KnnConfig",
+      "type": "object"
+    },
+    "LexicalArm": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Backend",
+          "type": "string"
+        },
+        "candidates": {
+          "default": 200,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Candidates",
+          "type": "integer"
+        },
+        "phrase_boost": {
+          "$ref": "#/$defs/PhraseBoost"
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "LexicalArm",
+      "type": "object"
+    },
+    "LuceneBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "opensearch",
+            "elasticsearch"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "hosts_env": {
+          "title": "Hosts Env",
+          "type": "string"
+        },
+        "index_prefix": {
+          "default": "su_multi_arm",
+          "pattern": "^[a-z][a-z0-9_]{0,40}$",
+          "title": "Index Prefix",
+          "type": "string"
+        },
+        "knn": {
+          "$ref": "#/$defs/KnnConfig"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "hosts_env"
+      ],
+      "title": "LuceneBackend",
+      "type": "object"
+    },
+    "McpConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "transports": {
+          "items": {
+            "enum": [
+              "stdio",
+              "streamable_http"
+            ],
+            "type": "string"
+          },
+          "title": "Transports",
+          "type": "array"
+        }
+      },
+      "title": "McpConfig",
+      "type": "object"
+    },
+    "MemoryBackendConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "memory",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "MemoryBackendConfig",
+      "type": "object"
+    },
+    "MemoryConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "episodic": {
+          "default": true,
+          "title": "Episodic",
+          "type": "boolean"
+        },
+        "store_text": {
+          "default": false,
+          "title": "Store Text",
+          "type": "boolean"
+        },
+        "exclude_shown": {
+          "default": false,
+          "title": "Exclude Shown",
+          "type": "boolean"
+        }
+      },
+      "title": "MemoryConfig",
+      "type": "object"
+    },
+    "MetadataSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/FieldSpec"
+          },
+          "title": "Fields",
+          "type": "array"
+        },
+        "canonical_unit": {
+          "default": "document",
+          "minLength": 1,
+          "title": "Canonical Unit",
+          "type": "string"
+        },
+        "equivalence_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Equivalence Field"
+        },
+        "unknown_fields": {
+          "default": "allow",
+          "enum": [
+            "allow",
+            "reject"
+          ],
+          "title": "Unknown Fields",
+          "type": "string"
+        }
+      },
+      "title": "MetadataSchema",
+      "type": "object"
+    },
+    "ModelRoles": {
+      "additionalProperties": false,
+      "properties": {
+        "planner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "extractor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "generator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "community": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "judge": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cache_gate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "embedder": {
+          "$ref": "#/$defs/EmbedderRole"
+        },
+        "reranker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerankerRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ModelRoles",
+      "type": "object"
+    },
+    "ModelsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "roles": {
+          "$ref": "#/$defs/ModelRoles"
+        }
+      },
+      "title": "ModelsConfig",
+      "type": "object"
+    },
+    "MongoBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "mongodb",
+          "title": "Kind",
+          "type": "string"
+        },
+        "uri_env": {
+          "title": "Uri Env",
+          "type": "string"
+        },
+        "database": {
+          "title": "Database",
+          "type": "string"
+        },
+        "collection_prefix": {
+          "default": "su_multi_arm",
+          "pattern": "^[a-z][a-z0-9_]{0,40}$",
+          "title": "Collection Prefix",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "uri_env",
+        "database"
+      ],
+      "title": "MongoBackend",
+      "type": "object"
+    },
+    "Neo4jBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "neo4j",
+          "title": "Kind",
+          "type": "string"
+        },
+        "uri": {
+          "default": "bolt://localhost:7687",
+          "title": "Uri",
+          "type": "string"
+        },
+        "user": {
+          "default": "neo4j",
+          "title": "User",
+          "type": "string"
+        },
+        "password_env": {
+          "default": "SU_NEO4J_PASSWORD",
+          "title": "Password Env",
+          "type": "string"
+        },
+        "database": {
+          "default": "neo4j",
+          "title": "Database",
+          "type": "string"
+        },
+        "namespace": {
+          "default": "su_multi_arm",
+          "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Neo4jBackend",
+      "type": "object"
+    },
+    "PackingConfig": {
+      "additionalProperties": false,
+      "description": "Evidence budget with fair per-record allocation and a configured field priority.",
+      "properties": {
+        "budget_chars": {
+          "default": 60000,
+          "maximum": 500000,
+          "minimum": 500,
+          "title": "Budget Chars",
+          "type": "integer"
+        },
+        "field_priority": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Field Priority",
+          "type": "array"
+        },
+        "fairness": {
+          "default": "fair_share",
+          "enum": [
+            "fair_share",
+            "greedy"
+          ],
+          "title": "Fairness",
+          "type": "string"
+        },
+        "min_per_record": {
+          "default": 200,
+          "minimum": 0,
+          "title": "Min Per Record",
+          "type": "integer"
+        }
+      },
+      "title": "PackingConfig",
+      "type": "object"
+    },
+    "PgVectorConfig": {
+      "additionalProperties": false,
+      "description": "pgvector search. ``exact`` (default) scans with the scope in the WHERE clause; ``hnsw`` builds\nper-namespace HNSW indexes at refresh and fails the refresh when the measured filter recall\nagainst exact search is below ``min_filter_recall``.",
+      "properties": {
+        "index": {
+          "default": "exact",
+          "enum": [
+            "exact",
+            "hnsw"
+          ],
+          "title": "Index",
+          "type": "string"
+        },
+        "hnsw_m": {
+          "default": 16,
+          "maximum": 100,
+          "minimum": 2,
+          "title": "Hnsw M",
+          "type": "integer"
+        },
+        "hnsw_ef_construction": {
+          "default": 64,
+          "maximum": 1000,
+          "minimum": 4,
+          "title": "Hnsw Ef Construction",
+          "type": "integer"
+        },
+        "hnsw_ef_search": {
+          "default": 100,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Hnsw Ef Search",
+          "type": "integer"
+        },
+        "min_filter_recall": {
+          "default": 0.95,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Filter Recall",
+          "type": "number"
+        }
+      },
+      "title": "PgVectorConfig",
+      "type": "object"
+    },
+    "PhraseBoost": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "window_tokens": {
+          "default": 6,
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Window Tokens",
+          "type": "integer"
+        }
+      },
+      "title": "PhraseBoost",
+      "type": "object"
+    },
+    "PipelineConfig": {
+      "additionalProperties": false,
+      "description": "One retrieval/answer pipeline. ``pipeline`` is the default (named ``default``); every entry of\n``pipelines`` is an overlay deep-merged onto it before validation (an arm set to ``null`` is\ndisabled in that pipeline).",
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/DecisionConfig"
+        },
+        "arms": {
+          "$ref": "#/$defs/ArmsConfig"
+        },
+        "selection": {
+          "$ref": "#/$defs/SelectionConfig"
+        },
+        "review": {
+          "$ref": "#/$defs/ReviewConfig"
+        },
+        "guards": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Guards",
+          "type": "array"
+        },
+        "generation": {
+          "$ref": "#/$defs/GenerationStageConfig"
+        },
+        "concurrency": {
+          "default": 5,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Concurrency",
+          "type": "integer"
+        },
+        "allow_incomplete_arms": {
+          "default": false,
+          "title": "Allow Incomplete Arms",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "arms"
+      ],
+      "title": "PipelineConfig",
+      "type": "object"
+    },
+    "PostgresBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "postgres",
+          "title": "Kind",
+          "type": "string"
+        },
+        "dsn_env": {
+          "default": "SU_POSTGRES_DSN",
+          "title": "Dsn Env",
+          "type": "string"
+        },
+        "table_prefix": {
+          "default": "su_multi_arm",
+          "pattern": "^[a-z][a-z0-9_]{0,40}$",
+          "title": "Table Prefix",
+          "type": "string"
+        },
+        "text_search_config": {
+          "default": "english",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}(\\.[a-z_][a-z0-9_]{0,62})?$",
+          "title": "Text Search Config",
+          "type": "string"
+        },
+        "vector": {
+          "$ref": "#/$defs/PgVectorConfig"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "PostgresBackend",
+      "type": "object"
+    },
+    "PrivacyConfig": {
+      "additionalProperties": false,
+      "description": "Opt-in conservative redaction; not a complete PII detector.",
+      "properties": {
+        "redact_emails": {
+          "default": false,
+          "title": "Redact Emails",
+          "type": "boolean"
+        },
+        "patterns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Patterns",
+          "type": "object"
+        },
+        "metadata_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Metadata Fields",
+          "type": "array"
+        },
+        "trace_masking": {
+          "default": "privacy",
+          "enum": [
+            "privacy",
+            "raw"
+          ],
+          "title": "Trace Masking",
+          "type": "string"
+        }
+      },
+      "title": "PrivacyConfig",
+      "type": "object"
+    },
+    "RequestConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "context_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Context Keys",
+          "type": "array"
+        },
+        "context_max_bytes": {
+          "default": 8192,
+          "maximum": 1000000,
+          "minimum": 256,
+          "title": "Context Max Bytes",
+          "type": "integer"
+        },
+        "context_max_field_chars": {
+          "default": 4000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Context Max Field Chars",
+          "type": "integer"
+        },
+        "record_id_key": {
+          "default": "record_id",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Record Id Key",
+          "type": "string"
+        },
+        "canonical_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Canonical Fields",
+          "type": "array"
+        },
+        "pipelines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pipelines",
+          "type": "array"
+        },
+        "modes": {
+          "items": {
+            "enum": [
+              "rules",
+              "classifier",
+              "llm",
+              "cascade"
+            ],
+            "type": "string"
+          },
+          "title": "Modes",
+          "type": "array"
+        }
+      },
+      "title": "RequestConfig",
+      "type": "object"
+    },
+    "RerankerRole": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "const": "sentence_transformers",
+          "default": "sentence_transformers",
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "RerankerRole",
+      "type": "object"
+    },
+    "ReviewConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_hops": {
+          "default": 2,
+          "maximum": 5,
+          "minimum": 1,
+          "title": "Max Hops",
+          "type": "integer"
+        },
+        "prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt"
+        }
+      },
+      "title": "ReviewConfig",
+      "type": "object"
+    },
+    "SelectionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "collapse": {
+          "default": "document",
+          "enum": [
+            "document",
+            "chunk"
+          ],
+          "title": "Collapse",
+          "type": "string"
+        },
+        "per_arm": {
+          "default": 20,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Per Arm",
+          "type": "integer"
+        },
+        "union": {
+          "const": "preserve",
+          "default": "preserve",
+          "title": "Union",
+          "type": "string"
+        },
+        "ordering": {
+          "default": "reciprocal_rank",
+          "enum": [
+            "reciprocal_rank",
+            "per_arm",
+            "best_arm_rank",
+            "stable_interleave",
+            "rrf",
+            "minmax",
+            "zscore"
+          ],
+          "title": "Ordering",
+          "type": "string"
+        },
+        "rrf_k": {
+          "default": 60,
+          "minimum": 1,
+          "title": "Rrf K",
+          "type": "integer"
+        },
+        "source_weights": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Source Weights",
+          "type": "object"
+        },
+        "arm_weights": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Arm Weights",
+          "type": "object"
+        },
+        "max_documents": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Documents"
+        },
+        "diversity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiversityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pins": {
+          "items": {
+            "const": "exact_id",
+            "type": "string"
+          },
+          "title": "Pins",
+          "type": "array"
+        },
+        "rerank": {
+          "default": false,
+          "title": "Rerank",
+          "type": "boolean"
+        },
+        "packing": {
+          "$ref": "#/$defs/PackingConfig"
+        }
+      },
+      "title": "SelectionConfig",
+      "type": "object"
+    },
+    "ServingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "http": {
+          "$ref": "#/$defs/HttpConfig"
+        },
+        "mcp": {
+          "$ref": "#/$defs/McpConfig"
+        },
+        "actions": {
+          "$ref": "#/$defs/ActionsServingConfig"
+        }
+      },
+      "title": "ServingConfig",
+      "type": "object"
+    },
+    "SessionBudget": {
+      "additionalProperties": false,
+      "description": "Cumulative limits over every turn of one session; each request's limits are clipped to what\nthe session has left, and an exhausted session refuses further turns (``BudgetExhausted``).",
+      "properties": {
+        "max_llm_calls": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Llm Calls"
+        },
+        "max_input_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Input Tokens"
+        },
+        "max_output_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Output Tokens"
+        },
+        "max_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd"
+        }
+      },
+      "title": "SessionBudget",
+      "type": "object"
+    },
+    "SessionsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "store": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Store"
+        },
+        "ttl_seconds": {
+          "default": 3600,
+          "minimum": 1,
+          "title": "Ttl Seconds",
+          "type": "integer"
+        },
+        "memory": {
+          "$ref": "#/$defs/MemoryConfig"
+        }
+      },
+      "title": "SessionsConfig",
+      "type": "object"
+    },
+    "SqlAlchemyBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "sqlalchemy",
+          "title": "Kind",
+          "type": "string"
+        },
+        "url_env": {
+          "title": "Url Env",
+          "type": "string"
+        },
+        "table_prefix": {
+          "default": "su_multi_arm",
+          "pattern": "^[a-z][a-z0-9_]{0,40}$",
+          "title": "Table Prefix",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "url_env"
+      ],
+      "title": "SqlAlchemyBackend",
+      "type": "object"
+    },
+    "SqliteBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "sqlite",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "default": "state",
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "vector_engine": {
+          "default": "numpy",
+          "enum": [
+            "numpy",
+            "faiss"
+          ],
+          "title": "Vector Engine",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "SqliteBackend",
+      "type": "object"
+    },
+    "StagePolicies": {
+      "additionalProperties": false,
+      "description": "Outcome of a failed stage inside a ``cascade`` (plan \u00a73.7.1 rows \"cascade stage\").",
+      "properties": {
+        "rules": {
+          "default": "fallback_to_next_stage",
+          "enum": [
+            "fallback_to_next_stage",
+            "abstain"
+          ],
+          "title": "Rules",
+          "type": "string"
+        },
+        "classifier": {
+          "default": "fallback_to_next_stage",
+          "enum": [
+            "fallback_to_next_stage",
+            "abstain"
+          ],
+          "title": "Classifier",
+          "type": "string"
+        },
+        "llm": {
+          "default": "abstain",
+          "enum": [
+            "fallback_to_next_stage",
+            "abstain"
+          ],
+          "title": "Llm",
+          "type": "string"
+        }
+      },
+      "title": "StagePolicies",
+      "type": "object"
+    },
+    "StorageConfig": {
+      "additionalProperties": false,
+      "description": "Authoritative backend per non-arm capability; each must name exactly one backend declaring it.",
+      "properties": {
+        "catalog": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Catalog",
+          "type": "string"
+        },
+        "records": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Records",
+          "type": "string"
+        },
+        "ledger": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Ledger",
+          "type": "string"
+        },
+        "sessions": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Sessions",
+          "type": "string"
+        },
+        "cache": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Cache",
+          "type": "string"
+        },
+        "communities": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Communities",
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "records",
+        "ledger",
+        "sessions",
+        "cache",
+        "communities"
+      ],
+      "title": "StorageConfig",
+      "type": "object"
+    },
+    "StructuredArm": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Backend",
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "StructuredArm",
+      "type": "object"
+    },
+    "ToolsConfig": {
+      "additionalProperties": false,
+      "description": "Read-only tools exposed through the engine (plan \u00a73.4). Only registered components can be\nnamed: the built-ins; there is no code loading from config.",
+      "properties": {
+        "enabled": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Enabled",
+          "type": "array"
+        }
+      },
+      "title": "ToolsConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "dataset": {
+      "default": "default",
+      "minLength": 1,
+      "title": "Dataset",
+      "type": "string"
+    },
+    "profile": {
+      "default": "neutral",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "title": "Profile",
+      "type": "string"
+    },
+    "plugins": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Plugins",
+      "type": "array"
+    },
+    "backends": {
+      "additionalProperties": {
+        "discriminator": {
+          "mapping": {
+            "elasticsearch": "#/$defs/LuceneBackend",
+            "memory": "#/$defs/MemoryBackendConfig",
+            "mongodb": "#/$defs/MongoBackend",
+            "neo4j": "#/$defs/Neo4jBackend",
+            "opensearch": "#/$defs/LuceneBackend",
+            "postgres": "#/$defs/PostgresBackend",
+            "sqlalchemy": "#/$defs/SqlAlchemyBackend",
+            "sqlite": "#/$defs/SqliteBackend"
+          },
+          "propertyName": "kind"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/SqliteBackend"
+          },
+          {
+            "$ref": "#/$defs/MemoryBackendConfig"
+          },
+          {
+            "$ref": "#/$defs/PostgresBackend"
+          },
+          {
+            "$ref": "#/$defs/SqlAlchemyBackend"
+          },
+          {
+            "$ref": "#/$defs/LuceneBackend"
+          },
+          {
+            "$ref": "#/$defs/Neo4jBackend"
+          },
+          {
+            "$ref": "#/$defs/MongoBackend"
+          }
+        ]
+      },
+      "title": "Backends",
+      "type": "object"
+    },
+    "storage": {
+      "$ref": "#/$defs/StorageConfig"
+    },
+    "metadata_schema": {
+      "$ref": "#/$defs/MetadataSchema"
+    },
+    "models": {
+      "$ref": "#/$defs/ModelsConfig"
+    },
+    "pipeline": {
+      "$ref": "#/$defs/PipelineConfig"
+    },
+    "pipelines": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PipelineConfig"
+      },
+      "title": "Pipelines",
+      "type": "object"
+    },
+    "default_pipeline": {
+      "default": "default",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "title": "Default Pipeline",
+      "type": "string"
+    },
+    "request": {
+      "$ref": "#/$defs/RequestConfig"
+    },
+    "extraction": {
+      "$ref": "#/$defs/ExtractionConfig"
+    },
+    "communities": {
+      "$ref": "#/$defs/CommunitiesConfig"
+    },
+    "ingestion": {
+      "$ref": "#/$defs/IngestionConfig"
+    },
+    "sessions": {
+      "$ref": "#/$defs/SessionsConfig"
+    },
+    "budgets": {
+      "$ref": "#/$defs/BudgetsConfig"
+    },
+    "privacy": {
+      "$ref": "#/$defs/PrivacyConfig"
+    },
+    "serving": {
+      "$ref": "#/$defs/ServingConfig"
+    },
+    "tools": {
+      "$ref": "#/$defs/ToolsConfig"
+    },
+    "actions": {
+      "$ref": "#/$defs/ActionsConfig"
+    }
+  },
+  "required": [
+    "backends",
+    "storage",
+    "pipeline"
+  ],
+  "title": "Config",
+  "type": "object"
+}

@@ -1,0 +1,132 @@
+# Throwaway service stack for the real-service test tier (plan §6.1 / §6.2).
+#
+#   docker compose -p su-multi-arm-tests -f tests/services/docker-compose.yml up -d --wait
+#   docker compose -p su-multi-arm-tests -f tests/services/docker-compose.yml down -v
+#
+# Every host port is read from an environment variable with a NON-default default so the stack
+# never collides with a service already listening on the standard port. All ports bind to
+# 127.0.0.1 only. Nothing here is persistent: data directories are tmpfs or container-local and
+# `down -v` removes anything the images declare as a volume. Credentials below are disposable
+# dev values that exist only inside this file; never point these variables at a real database.
+#
+# Security is disabled where the vendor dev image allows it:
+#   - OpenSearch: DISABLE_SECURITY_PLUGIN=true (plain HTTP, no auth; dev-only switch).
+#   - Elasticsearch: xpack.security.enabled=false (plain HTTP, no auth; dev-only switch).
+#   - PostgreSQL, Neo4j, MongoDB: no "disable auth" switch is offered, so each uses a throwaway
+#     user/password defined here.
+# Both Lucene engines run with discovery.type=single-node, which disables the production bootstrap
+# checks (so the host's vm.max_map_count is not modified) and caps the JVM heap at 512 MiB.
+
+name: su-multi-arm-tests
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      bootstrap.memory_lock: "false"
+      cluster.name: su-multi-arm-tests
+    ports:
+      - "127.0.0.1:${SU_TEST_OPENSEARCH_PORT:-19200}:9200"
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.ml.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      bootstrap.memory_lock: "false"
+      cluster.name: su-multi-arm-tests
+    ports:
+      - "127.0.0.1:${SU_TEST_ES_PORT:-19201}:9200"
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg17
+    environment:
+      POSTGRES_USER: su_test
+      POSTGRES_PASSWORD: su_test_password
+      POSTGRES_DB: su_test
+    ports:
+      - "127.0.0.1:${SU_TEST_POSTGRES_PORT:-15432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U su_test -d su_test -h 127.0.0.1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  neo4j:
+    image: neo4j:5.26.0-community
+    environment:
+      NEO4J_AUTH: neo4j/su_test_password
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+      NEO4J_server_default__listen__address: 0.0.0.0
+    ports:
+      - "127.0.0.1:${SU_TEST_NEO4J_BOLT_PORT:-17687}:7687"
+      - "127.0.0.1:${SU_TEST_NEO4J_HTTP_PORT:-17474}:7474"
+    tmpfs:
+      - /data
+      - /logs
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p su_test_password 'RETURN 1' >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 15s
+
+  mongo:
+    image: mongo:7.0.16
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: su_test
+      MONGO_INITDB_ROOT_PASSWORD: su_test_password
+    ports:
+      - "127.0.0.1:${SU_TEST_MONGO_PORT:-27018}:27017"
+    tmpfs:
+      - /data/db
+      - /data/configdb
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping: 1}).ok' 127.0.0.1:27017/test | grep -q 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s

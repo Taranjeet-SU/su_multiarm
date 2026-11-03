@@ -1,0 +1,65 @@
+# Real paid providers are opt-in. Set ANTHROPIC_API_KEY yourself; no key is bundled.
+# Model IDs are examples, independently replaceable for each stage. Verify account access.
+dataset: demo
+storage_path: ./anthropic/state
+chunk_size: 500
+chunk_overlap: 50
+embedding:
+  provider: sentence_transformers
+  model: sentence-transformers/all-MiniLM-L6-v2
+  dimensions: 384
+  device: cpu
+extraction:
+  providers: [llm]
+  model:
+    provider: anthropic
+    model: claude-haiku-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 2048
+  labels: [product, country, state, county, error, topic]
+arms:
+  enabled: [dense, lexical, sql, graph, community]
+  dense: faiss
+  lexical: sqlite
+  graph: sqlite
+  per_arm: 20
+  graph_hops: 2
+fusion:
+  strategy: per_arm
+  source_weights: {article: 1.2, manual: 1.1, case: 1.0, tracker: 0.9}
+routing:
+  mode: planned
+  model:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 2048
+  max_steps: 10
+  max_hops: 2
+  reviewer:
+    provider: anthropic
+    model: claude-haiku-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 512
+generation:
+  model:
+    provider: anthropic
+    model: claude-haiku-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 2048
+  evidence_char_budget: 60000
+# Separate operations each get this ceiling. Lower for a small experiment.
+max_llm_calls: 100
+privacy:
+  redact_emails: true
+
+# Optional precomputed summaries; uses additional ingestion calls.
+community:
+  strategy: entity
+  min_documents: 2
+  evidence_char_budget: 30000
+  model:
+    provider: anthropic
+    model: claude-haiku-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 2048

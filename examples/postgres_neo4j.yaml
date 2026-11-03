@@ -1,0 +1,24 @@
+# Independently select these adapters; either can be combined with local backends.
+dataset: demo
+storage_path: ./postgres_neo4j/state
+embedding:
+  provider: hash
+  dimensions: 256
+extraction:
+  providers: [tags]
+  tags:
+    topic: [exemption certificate, rounding, content source]
+    product: [CloudTax, SearchDesk]
+arms:
+  dense: pgvector
+  lexical: postgres
+  graph: neo4j
+  per_arm: 20
+  postgres:
+    dsn_env: SU_POSTGRES_DSN
+    table_prefix: su_multi_arm
+  neo4j:
+    uri: bolt://127.0.0.1:7687
+    user: neo4j
+    password_env: SU_NEO4J_PASSWORD
+    database: neo4j

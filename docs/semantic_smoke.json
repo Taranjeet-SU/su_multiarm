@@ -1,0 +1,131 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "device": "cpu",
+  "manifest": {
+    "schema_version": 1,
+    "generation": "0ef729cf6cb14ff1a1dccc6df139094c",
+    "dataset": "demo",
+    "index_format": 2,
+    "fingerprint": "c3a236cfe54e6f0100e7fd5cfa0465ad5023504189dd59a09f05b9b0f31cfb5d",
+    "documents": 6,
+    "chunks": 16,
+    "entities": 23,
+    "relations": 0,
+    "communities": 6,
+    "reused_extractions": 0,
+    "seconds": 10.091389075969346,
+    "redactions_in_input": {},
+    "llm_calls": [],
+    "embedding": {
+      "provider": "sentence_transformers",
+      "model": "sentence-transformers/all-MiniLM-L6-v2",
+      "dimensions": 384,
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": null,
+      "batch_size": 32,
+      "query_prefix": "",
+      "document_prefix": "",
+      "revision": null,
+      "device": "cpu"
+    }
+  },
+  "evaluation": {
+    "queries": 3,
+    "labelled_queries": 3,
+    "expected_documents": 6,
+    "macro_recall": {
+      "5": 1.0,
+      "10": 1.0,
+      "20": 1.0,
+      "100": 1.0
+    },
+    "micro_recall": {
+      "5": 1.0,
+      "10": 1.0,
+      "20": 1.0,
+      "100": 1.0
+    },
+    "mrr": 1.0,
+    "median_seconds": 0.007809825008735061,
+    "rows": [
+      {
+        "id": "certificates",
+        "labelled": true,
+        "expected_count": 2,
+        "recall": {
+          "5": 1.0,
+          "10": 1.0,
+          "20": 1.0,
+          "100": 1.0
+        },
+        "matches": {
+          "5": 2,
+          "10": 2,
+          "20": 2,
+          "100": 2
+        },
+        "pool_recall": 1.0,
+        "reciprocal_rank": 1.0,
+        "arm_recall": {
+          "dense": 1.0,
+          "lexical": 1.0,
+          "graph": 1.0,
+          "community": 1.0
+        },
+        "seconds": 7.888744185038377
+      },
+      {
+        "id": "rounding",
+        "labelled": true,
+        "expected_count": 2,
+        "recall": {
+          "5": 1.0,
+          "10": 1.0,
+          "20": 1.0,
+          "100": 1.0
+        },
+        "matches": {
+          "5": 2,
+          "10": 2,
+          "20": 2,
+          "100": 2
+        },
+        "pool_recall": 1.0,
+        "reciprocal_rank": 1.0,
+        "arm_recall": {
+          "dense": 1.0,
+          "lexical": 1.0,
+          "graph": 1.0,
+          "community": 1.0
+        },
+        "seconds": 0.007809825008735061
+      },
+      {
+        "id": "sources",
+        "labelled": true,
+        "expected_count": 2,
+        "recall": {
+          "5": 1.0,
+          "10": 1.0,
+          "20": 1.0,
+          "100": 1.0
+        },
+        "matches": {
+          "5": 2,
+          "10": 2,
+          "20": 2,
+          "100": 2
+        },
+        "pool_recall": 1.0,
+        "reciprocal_rank": 1.0,
+        "arm_recall": {
+          "dense": 1.0,
+          "lexical": 1.0,
+          "graph": 1.0,
+          "community": 1.0
+        },
+        "seconds": 0.00722957297693938
+      }
+    ]
+  }
+}

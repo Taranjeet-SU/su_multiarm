@@ -1,0 +1,51 @@
+# Documentation site: build (strict) on every PR touching docs; build and deploy to GitHub Pages on
+# push to main. Uses the runner's own temporary workspace; no secrets beyond the Pages token.
+name: docs
+on:
+  pull_request:
+    paths: ['docs/**', 'mkdocs.yml', 'README.md', 'assets/**', 'scripts/gen_capability_tables.py',
+            'src/su_multi_arm/backends/capabilities.py', 'src/su_multi_arm/providers/capabilities.py',
+            'CONTRIBUTING.md', 'SECURITY.md', '.github/workflows/docs.yml']
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[docs]'
+      - name: Generated capability tables are up to date
+        run: python scripts/gen_capability_tables.py --check
+      - run: mkdocs build --strict --site-dir "$RUNNER_TEMP/site"
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

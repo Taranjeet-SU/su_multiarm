@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "su_multi_arm: configurable multi-arm retrieval with typed scope, provenance and contract-checked answers"
+type: software
+authors:
+  - name: "su_multi_arm contributors"
+version: "2.0.0a1"
+license: Apache-2.0
+repository-code: "https://github.com/Taranjeet-SU/su_multiarm"
+url: "https://taranjeet-su.github.io/su_multiarm/"
+abstract: >-
+  A Python package for retrieval across several arms (dense, lexical, structured aggregates,
+  entity graph, communities, exact identifiers) on configurable backends, with a decision agent,
+  deterministic selection, an optional review stage and an answer contract that refuses claims the
+  evidence cannot support.
+keywords:
+  - information retrieval
+  - retrieval-augmented generation
+  - hybrid search
+  - knowledge graph
+  - provenance

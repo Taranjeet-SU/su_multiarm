@@ -1,0 +1,22 @@
+dataset: demo
+storage_path: ./semantic/state
+chunk_size: 500
+chunk_overlap: 50
+embedding:
+  provider: sentence_transformers
+  model: sentence-transformers/all-MiniLM-L6-v2
+  dimensions: 384
+  device: cpu
+extraction:
+  providers: [tags, regex]
+  tags:
+    topic: [exemption certificate, rounding, content source]
+    product: [CloudTax, SearchDesk]
+    state: [California, Texas]
+  patterns:
+    error: '\bERR-[0-9]+\b'
+arms:
+  per_arm: 20
+fusion:
+  strategy: per_arm
+  source_weights: {article: 1.2, manual: 1.1, case: 1.0, tracker: 0.9}

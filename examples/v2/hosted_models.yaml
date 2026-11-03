@@ -1,0 +1,53 @@
+# schema_version 2 with hosted model roles on local sqlite storage: an LLM planner (decision kind
+# llm, fail-closed by default), a bounded review stage and a grounded generator, each role chosen
+# independently. Paid providers are opt-in: set ANTHROPIC_API_KEY / OPENAI_API_KEY yourself; no key
+# is bundled and the default test suite never calls them. Model ids are examples: replace each with
+# one you have evaluated and can access. The embedder can be any OpenAI-compatible endpoint; the
+# hash embedder keeps this file runnable without one.
+schema_version: 2
+dataset: demo
+profile: neutral
+backends:
+  local:
+    kind: sqlite
+    path: state
+storage:
+  catalog: local
+  records: local
+  ledger: local
+  sessions: local
+  cache: local
+  communities: local
+metadata_schema:
+  fields:
+    - {name: source, type: string, filterable: true, listable: true, groupable: true}
+    - {name: product, type: string, filterable: true, listable: true, groupable: true, casefold_match: true}
+    - {name: status, type: string, filterable: true, groupable: true}
+    - {name: created_at, type: datetime, filterable: true, sortable: true, time_basis: created}
+models:
+  roles:
+    planner:
+      provider: anthropic
+      model: claude-sonnet-5-5
+      api_key_env: ANTHROPIC_API_KEY
+      capabilities: {structured_output: native}
+    reviewer:
+      provider: anthropic
+      model: claude-haiku-5-5
+      api_key_env: ANTHROPIC_API_KEY
+    generator:
+      provider: openai
+      model: gpt-5-mini
+      api_key_env: OPENAI_API_KEY
+      capabilities: {structured_output: native}
+    embedder: {provider: hash, dimensions: 256}
+budgets:
+  max_llm_calls: 6
+  deadline_seconds: 60
+pipeline:
+  decision: {kind: llm, on_failure: fail_closed}
+  review: {enabled: true, max_hops: 2}
+  arms:
+    dense: {backend: local}
+    lexical: {backend: local}
+    structured: {backend: local}

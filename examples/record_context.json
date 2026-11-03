@@ -1,0 +1,12 @@
+{
+  "query": "Find similar cases and their resolutions",
+  "record_context": {
+    "record_id": "case:certificate",
+    "record_type": "case",
+    "subject": "Exemption certificate no longer applying",
+    "description": "California transactions started charging tax after the certificate expired.",
+    "product": "CloudTax",
+    "status": "open"
+  },
+  "filters": {"source": "case"}
+}

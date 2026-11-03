@@ -1,0 +1,17 @@
+{
+  "python": "3.13.5",
+  "platform": "Linux",
+  "pydantic": "2.11.7",
+  "numpy": "2.1.3",
+  "httpx": "0.28.1",
+  "PyYAML": "6.0.3",
+  "faiss-cpu": "1.14.3",
+  "psycopg": "3.3.6",
+  "neo4j": "6.3.1",
+  "sentence-transformers": "5.5.1",
+  "gliner": "0.2.27",
+  "spacy": "3.8.16",
+  "fastapi": "0.141.1",
+  "mcp": "1.30.0",
+  "pytest": "8.3.4"
+}

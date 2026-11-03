@@ -1,0 +1,76 @@
+# Documentation site. Build: pip install -e '.[docs]' && mkdocs build --strict
+# The public project name lives here (site_name) and in the README title.
+site_name: su_multi_arm
+site_description: Configurable multi-arm retrieval with typed scope, span-level provenance and contract-checked answers.
+site_url: https://taranjeet-su.github.io/su_multiarm/
+repo_url: https://github.com/Taranjeet-SU/su_multiarm
+repo_name: Taranjeet-SU/su_multiarm
+edit_uri: edit/main/docs/
+copyright: Apache-2.0 · su_multi_arm contributors
+
+docs_dir: docs
+# Rewrites links that leave docs/ (e.g. ../examples/...) to the repository on GitHub.
+hooks:
+  - scripts/mkdocs_hooks.py
+# Review transcripts are working records of the plan, not user documentation.
+exclude_docs: |
+  plans/reviews/
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: teal
+      toggle: {icon: material/weather-night, name: Switch to dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: teal
+      toggle: {icon: material/weather-sunny, name: Switch to light mode}
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc: {permalink: true}
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts:
+      - Architecture: ARCHITECTURE.md
+      - Adopting: ADOPTING.md
+  - Configuration:
+      - Reference: CONFIGURATION.md
+      - JSON schema: schema.md
+  - Backends: backends.md
+  - Providers: providers.md
+  - Serving: serving.md
+  - Validation:
+      - Validation record: VALIDATION.md
+      - Lexical agreement: LEXICAL_AGREEMENT.md
+  - Plan & roadmap:
+      - V2 implementation plan: plans/v2_implementation_plan.md
+      - Execution log: plans/execution_log.md
+  - Contributing: contributing.md

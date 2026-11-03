@@ -1,0 +1,5 @@
+# Neutral profile (default): no domain behaviour. Built-in prompts are domain-neutral, no record
+# context keys are accepted, no field is privileged in chunking or evidence packing, and no
+# extraction labels are assumed. Declare what your corpus needs in the configuration itself.
+name: neutral
+overlay: {}

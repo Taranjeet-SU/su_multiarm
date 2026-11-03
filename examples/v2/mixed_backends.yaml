@@ -1,0 +1,54 @@
+# schema_version 2 with one backend per projection: PostgreSQL holds the authoritative catalog,
+# records, ledger, sessions and cache plus pgvector dense search; OpenSearch serves lexical (BM25);
+# Neo4j serves the graph arm and community memberships. Every secret is an environment-variable
+# NAME; set the variables yourself (no value is bundled). Needs:
+#   pip install 'su-multi-arm[postgres,opensearch,neo4j]'
+# OpenSearch cannot hold storage.catalog (no generation registry); it is used for an arm only.
+schema_version: 2
+dataset: demo
+profile: neutral
+backends:
+  pg:
+    kind: postgres
+    dsn_env: SU_POSTGRES_DSN
+    table_prefix: su_multi_arm
+    vector: {index: exact}
+  search:
+    kind: opensearch
+    hosts_env: SU_OPENSEARCH_HOSTS
+    index_prefix: su_multi_arm
+  graph:
+    kind: neo4j
+    uri: bolt://127.0.0.1:7687
+    user: neo4j
+    password_env: SU_NEO4J_PASSWORD
+    database: neo4j
+storage:
+  catalog: pg
+  records: pg
+  ledger: pg
+  sessions: pg
+  cache: pg
+  communities: graph
+metadata_schema:
+  fields:
+    - {name: source, type: string, filterable: true, listable: true, groupable: true}
+    - {name: product, type: string, filterable: true, listable: true, groupable: true, casefold_match: true}
+    - {name: status, type: string, filterable: true, groupable: true}
+    - {name: created_at, type: datetime, filterable: true, sortable: true, time_basis: created}
+models:
+  roles:
+    embedder: {provider: hash, dimensions: 256}
+pipeline:
+  decision: {kind: rules}
+  arms:
+    dense: {backend: pg}
+    lexical: {backend: search}
+    structured: {backend: pg}
+    graph: {backend: graph}
+    community: {backend: graph}
+extraction:
+  extractors: [gazetteer]
+  gazetteer:
+    topic: [exemption certificate, rounding, content source]
+    product: [CloudTax, SearchDesk]

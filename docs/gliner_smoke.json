@@ -1,0 +1,25 @@
+{
+  "model": "urchade/gliner_small-v2.1",
+  "device": "cpu",
+  "seconds": 5.860468168044463,
+  "result": {
+    "entities": [
+      {
+        "name": "Alice",
+        "type": "person",
+        "quote": "Alice"
+      },
+      {
+        "name": "Acme",
+        "type": "organization",
+        "quote": "Acme"
+      },
+      {
+        "name": "California",
+        "type": "location",
+        "quote": "California"
+      }
+    ],
+    "relations": []
+  }
+}

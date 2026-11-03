@@ -1,0 +1,71 @@
+# Real-service tier (docs/plans/v2_implementation_plan.md §6.2, job `services`).
+# Starts the throwaway container stack in tests/services/, runs the `external`-marked tests
+# against it and tears it down. Never calls paid providers; uses $RUNNER_TEMP, not a home path.
+name: services
+on:
+  schedule:
+    - cron: '17 2 * * *'   # nightly, UTC
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+concurrency:
+  group: services-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-service:
+    # On PRs only when the `services` label is present; always on schedule / manual dispatch.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'services')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE_PROJECT: su-multi-arm-tests
+      COMPOSE_FILE_PATH: tests/services/docker-compose.yml
+      # Non-default host ports (same defaults as the compose file); nothing else listens on them here.
+      SU_TEST_OPENSEARCH_PORT: '19200'
+      SU_TEST_ES_PORT: '19201'
+      SU_TEST_POSTGRES_PORT: '15432'
+      SU_TEST_NEO4J_BOLT_PORT: '17687'
+      SU_TEST_NEO4J_HTTP_PORT: '17474'
+      SU_TEST_MONGO_PORT: '27018'
+      # Connection variables the tests read; credentials are the throwaway ones in the compose file.
+      SU_TEST_POSTGRES_DSN: postgresql://su_test:su_test_password@127.0.0.1:15432/su_test
+      SU_TEST_NEO4J_URI: bolt://127.0.0.1:17687
+      SU_TEST_NEO4J_PASSWORD: su_test_password
+      SU_TEST_OPENSEARCH_URL: http://127.0.0.1:19200
+      SU_TEST_ELASTICSEARCH_URL: http://127.0.0.1:19201
+      SU_TEST_MONGO_URI: mongodb://su_test:su_test_password@127.0.0.1:27018/?authSource=admin
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install package with database extras
+        run: python -m pip install -e '.[dev,postgres,sql,neo4j,mongodb,opensearch,elasticsearch]'
+      - name: Start service stack
+        run: docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE_PATH" up -d --wait --wait-timeout 420
+      - name: Wait for protocol-level readiness
+        run: python tests/services/wait_ready.py --timeout 300 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Record image digests
+        run: |
+          {
+            echo
+            echo '### Service images'
+            docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE_PATH" images
+            echo
+            docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE_PATH" images --format json \
+              | python -c 'import json,sys; [print(f"- {i[\"Repository\"]}:{i[\"Tag\"]} {i.get(\"ID\",\"\")}") for i in json.load(sys.stdin)]'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run external tests
+        run: >
+          pytest -q -m external -p no:cacheprovider
+          --basetemp="$RUNNER_TEMP/su_multi_arm_pytest"
+          -o cache_dir="$RUNNER_TEMP/su_multi_arm_pytest_cache"
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE_PATH" logs --no-color --tail=200
+      - name: Tear down service stack
+        if: always()
+        run: docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE_PATH" down -v --remove-orphans

@@ -1,0 +1,15 @@
+.venv*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+.env
+.env.*
+!.env.example
+state/
+*.sqlite*
+*.faiss
+*.npy
+/.astra_recommendations.md

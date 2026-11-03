@@ -1,0 +1,17 @@
+# Synthetic field names demonstrate explicit mapping. Nulls remain empty; no invented content.
+dataset: demo
+storage_path: ./mapping/state
+input_mapping:
+  id: ArticleNumber
+  title: Article.Title
+  source: null
+  source_value: article
+  url: PublicUrl
+  fields:
+    issue: Issue__text
+    details: Details__text
+  metadata:
+    product: Product__name
+    created_at: CreatedDate
+privacy:
+  redact_emails: true

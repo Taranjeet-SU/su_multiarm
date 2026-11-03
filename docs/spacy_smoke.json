@@ -1,0 +1,40 @@
+{
+  "model": "en_core_web_sm",
+  "device": "cpu",
+  "seconds": 0.8280830240109935,
+  "result": {
+    "entities": [
+      {
+        "name": "Alice",
+        "type": "PERSON",
+        "quote": "Alice"
+      },
+      {
+        "name": "Microsoft",
+        "type": "ORG",
+        "quote": "Microsoft"
+      },
+      {
+        "name": "California",
+        "type": "GPE",
+        "quote": "California"
+      },
+      {
+        "name": "Alice",
+        "type": "POS:PROPN",
+        "quote": "Alice"
+      },
+      {
+        "name": "Microsoft",
+        "type": "POS:PROPN",
+        "quote": "Microsoft"
+      },
+      {
+        "name": "California",
+        "type": "POS:PROPN",
+        "quote": "California"
+      }
+    ],
+    "relations": []
+  }
+}
