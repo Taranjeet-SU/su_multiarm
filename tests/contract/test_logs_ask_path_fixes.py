@@ -240,8 +240,12 @@ def test_fatal_alone_with_only_a_combined_count_query_is_never_none_exact(varian
 )
 def test_every_level_combination_uses_the_unit_source_counts(variant, levels, status):
     out = vtool(variant, "log_top", by="service", level=levels, window="yesterday")
-    expected = Counter(e.service for e in select(EVENTS, days=[D9], level=tuple(lv.upper() for lv in levels)) if not e.values.get("raw"))
+    # fix5: only a count query over exactly the asked levels ranks by the source counts (here
+    # ERROR+FATAL, incomplete parse); FATAL or ERROR alone cannot be separated from it
+    ranked = levels == ["error", "fatal"]
+    expected = Counter(e.service for e in select(EVENTS, days=[D9], level=tuple(lv.upper() for lv in levels)) if ranked or not e.values.get("raw"))
     assert {r["service"]: r["lines"] for r in out.rows} == dict(expected)
+    assert out.ranked_by == ("source_counts" if ranked else "parsed_rows")
     assert out.status == status and out.source_counts
     assert (out.exactness == "exact") == (status == "answered")
     if status == "bounded":

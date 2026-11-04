@@ -54,7 +54,7 @@ def gold(tmp_path_factory):
 
 
 def comparable(output: dict) -> dict:
-    return {k: output[k] for k in ("intent", "args", "rows", "rendering", "exactness", "status", "source_unavailable", "source_counts")}
+    return {k: output[k] for k in ("intent", "args", "rows", "rendering", "exactness", "status", "source_unavailable", "source_counts", "ranked_by")}
 
 
 def no_model(monkeypatch):
@@ -92,7 +92,9 @@ def test_llm_selected_intent_is_compiled_like_the_tool(gold, monkeypatch):
     monkeypatch.setattr(JsonModel, "call", respond)
     result = engine.search(SearchRequest(query="crash report numbers by customer, please", as_of=D, mode="llm"))
     tool = comparable(engine.call_tool("log_top", {"by": "tenant", "level": ["fatal"], "window": "yesterday", "as_of": D}).result.output.model_dump(mode="json"))
-    assert comparable(result.aggregates[0]) == tool and tool["rows"] == [{"tenant": "t01", "lines": 2}, {"tenant": "t03", "lines": 2}]
+    # ranked by source counts (fix5): t02 and t04 have only unparsed svc-legacy FATAL lines
+    assert comparable(result.aggregates[0]) == tool and tool["ranked_by"] == "source_counts"
+    assert [(r["tenant"], r["lines"], r["lines_parsed"]) for r in tool["rows"]] == [("t01", 2, 2), ("t03", 2, 2), ("t02", 2, 0), ("t04", 1, 0)]
 
 
 def test_llm_free_scope_over_log_kinds_is_refused(gold, monkeypatch):

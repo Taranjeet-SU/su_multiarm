@@ -96,14 +96,18 @@ class LogAffectedInput(LogWindow):
 class LogTrendInput(LogWindow):
     signature_id: str | None = Field(default=None, max_length=256)
     service: str | None = None
+    tenant: str | None = None
     deployment_id: str | None = None
     level: list[str] | None = Field(default=None, max_length=5)
     granularity: Literal["hour", "day"] = "day"
 
 
 class LogCompareInput(StrictModel):
+    # compared in date order (earliest first) whatever order they are named in: the change is
+    # always from the earlier period to the later one
     periods: list[str] = Field(min_length=2, max_length=4)
     service: str | None = None
+    tenant: str | None = None
     signature_id: str | None = Field(default=None, max_length=256)
     level: list[str] | None = Field(default=None, max_length=5)
     as_of: date | None = None
@@ -370,7 +374,7 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         assert isinstance(args, LogTrendInput)
         window = out.window = resolve_window(args, ctx)
         kind, key = ("log_hour", "ts_hour") if args.granularity == "hour" else ("log_day", "date")
-        preds = [_kind(kind), window.predicate(), *_eq("service", args.service), *_eq("deployment_id", args.deployment_id), *_in("level", args.level)]
+        preds = [_kind(kind), window.predicate(), *_eq("service", args.service), *_eq("tenant", args.tenant), *_eq("deployment_id", args.deployment_id), *_in("level", args.level)]
         if args.signature_id:
             preds += [_signed(), Predicate(field="signature_id", op="eq", value=args.signature_id)]
         else:
@@ -382,11 +386,14 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         for text in args.periods:
             window = resolve_window(LogWindow(window=text, as_of=args.as_of), ctx)
             periods.append(Period(label=text, lower=window.start.isoformat(), upper=window.end.isoformat()))
+        # earliest first (persona eval: "November 3 compared to November 2" reported the change
+        # with the sign inverted because the periods kept the question's order)
+        periods.sort(key=lambda p: (p.lower, p.upper))
         first = min(date.fromisoformat(p.lower) for p in periods)
         last = max(date.fromisoformat(p.upper) for p in periods)
         out.window = Window(start=first, end=last, label=" vs ".join(args.periods))
         # the union of the periods bounds the rows read (the periods split them)
-        preds = [_kind("log_day"), out.window.predicate(), *_eq("service", args.service), *_in("level", args.level)]
+        preds = [_kind("log_day"), out.window.predicate(), *_eq("service", args.service), *_eq("tenant", args.tenant), *_in("level", args.level)]
         if args.signature_id:
             preds += [_signed(), Predicate(field="signature_id", op="eq", value=args.signature_id)]
         else:
@@ -502,6 +509,10 @@ _LEVEL_WORDS: dict[str, tuple[str, ...]] = {
     "warn": ("warn",), "warning": ("warn",), "warnings": ("warn",),
     **{w: FAILURE_LEVELS for w in ("errors", "failing", "fails", "failed", "failure", "failures", "issue", "issues", "problem", "problems", "broken", "breaking")},
 }  # fmt: skip
+# Words for the tenant dimension (persona eval: "which customers ..." was ranked by signature).
+_TENANT_WORDS = r"\b(?:tenants?|customers?|clients?|accounts?)\b"
+# A change between two named periods ("increase", "drop", "worse" ...): a period comparison.
+_CHANGE_WORDS = r"\b(?:vs\.?|versus|compared? (?:to|with)|than|increased?|increases|decreased?|decreases|drop(?:ped|s)?|rise|rose|grew|grow|change[ds]?|worse|better)\b"
 _HOUR = re.compile(r"\baround\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
 
 
@@ -568,7 +579,7 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
         return call("log_signature", signature_id=signatures[0], window=window or "last 10 days")
     if signatures and re.search(r"\b(affect|affected|affects|impacted)\b", low):
         return call("log_affected", signature_id=signatures[0], window=window or "last 10 days", per_day=bool(re.search(r"\bper day|by day|each day\b", low)) or None)
-    if re.search(r"\b(vs\.?|versus|compared? (?:to|with)|than)\b", low):
+    if re.search(_CHANGE_WORDS, low):
         try:
             found = [w.text.strip() for w in find_windows(q, as_of)]
         except WindowError:
@@ -577,13 +588,23 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
             first = parse_window(found[0], as_of)
             found.append((first.start - timedelta(days=1)).isoformat())
         if len(found) >= 2:
-            return call("log_compare", periods=found[:4], service=services[0] if len(services) == 1 else None, signature_id=signatures[0] if signatures else None, level=levels or None)
+            if not levels and re.search(r"\b(?:worse|better|healthier)\b", low):
+                levels = list(FAILURE_LEVELS)  # "did things get worse": failures
+            return call(
+                "log_compare",
+                periods=found[:4],
+                service=services[0] if len(services) == 1 else None,
+                tenant=tenants[0] if len(tenants) == 1 else None,
+                signature_id=signatures[0] if signatures else None,
+                level=levels or None,
+            )
     if re.search(r"\b(trend|trended|over time|per day|per hour|hourly|daily)\b", low):
         return call(
             "log_trend",
             window=window or "last 10 days",
             signature_id=signatures[0] if signatures else None,
             service=services[0] if len(services) == 1 else None,
+            tenant=tenants[0] if len(tenants) == 1 else None,
             level=levels or None,
             granularity="hour" if re.search(r"\b(per hour|hourly|by hour)\b", low) else None,
         )
@@ -592,14 +613,14 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
         return call("log_endpoints", window=window, service=services[0] if len(services) == 1 else None, metric=metric)
     if re.search(r"\bnew\b|first (?:seen|appeared)|appeared\b", low):
         return call("log_new", window=window)
-    if re.search(r"\btenants?\b", low) and levels and services:
+    if re.search(_TENANT_WORDS, low) and levels and services:
         return call("log_tenants", window=window, service=services[0], level=levels[0])
     if re.search(r"\b(which|top|most|what)\b", low) and (levels or re.search(r"\b(signatures?|errors?|exceptions?|services?)\b", low)):
         if re.search(r"\bexceptions?\b", low):
             by = "exception_class"
         elif re.search(r"\b(?:deployments?|instances?)\b", low):
             by = "deployment"
-        elif re.search(r"\btenants?\b", low):
+        elif re.search(_TENANT_WORDS, low):
             by = "tenant"
         elif re.search(r"\bservices?\b", low) and not services:
             by = "service"

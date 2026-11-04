@@ -24,6 +24,13 @@ Planted structure (``GoldSpec`` defaults, days ``D1``–``D10`` from ``first_day
   none" defect);
 * ``t04/svc-worker`` on day 8 logs more lines than ``max_docs_per_unit`` (a capped, sampled unit);
 * day 4 is never pulled (``source_unavailable``).
+
+Optional plant (off by default, so the default plan and its expected answers do not change):
+
+* ``GoldSpec.error_flood = (tenant, service, day number, n)``: ``n`` ERROR lines of that unit in a
+  line style no format pattern knows (``raw``), more than ``max_docs_per_unit``: the source's own
+  ERROR count holds all ``n`` while the pull is capped and the parse cannot read the lines (the
+  real-run "a service failing with mostly unparsed errors drops out of the ranking" defect).
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ class GoldSpec:
     capped: tuple[str, str, int] = ("t04", "svc-worker", 8)
     capped_extra: int = 140
     max_docs_per_unit: int = 120
+    error_flood: tuple[str, str, int, int] | None = None  # (tenant, service, day number, raw ERROR lines)
 
 
 def day_of(spec: GoldSpec, n: int) -> date:
@@ -135,6 +143,9 @@ def _unit_events(spec: GoldSpec, n: int, d: date, tenant: str, service: str) -> 
                 out.append(Event(d, tenant, service, hour, 6, "WARN", "queue.backlog", "parsed", f"queue backlog depth {9000 + hour}"))
             else:
                 out.append(Event(d, tenant, service, hour, 7, "ERROR", "worker.restarted", "parsed", "worker restarted after watchdog timeout"))
+    if spec.error_flood is not None and spec.error_flood[:3] == (tenant, service, n):
+        for k in range(spec.error_flood[3]):
+            out.append(Event(d, tenant, service, k % 24, k // 24 % 60, "ERROR", None, "unparsed", f"ERROR batch {k:05d} failed: upstream reset by peer", {"raw": True}))
     cap_tenant, cap_service, cap_day = spec.capped
     if (tenant, service, n) == (cap_tenant, cap_service, cap_day):
         for k in range(spec.capped_extra):

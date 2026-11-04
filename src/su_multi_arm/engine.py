@@ -48,7 +48,7 @@ from .core.config import Config, KuzuBackend as KuzuBackendConfig, LuceneBackend
 from .core.config import PostgresBackend as PostgresBackendConfig
 from .core.config import SqlAlchemyBackend as SqlAlchemyBackendConfig
 from .core.config import SqliteBackend as SqliteBackendConfig
-from .core.errors import BackendError, ConfigError
+from .core.errors import BackendError, BudgetExhausted, ConfigError
 from .core.types import Document, GroupRow, Measure, Page, Predicate, Scope, ScopeResult, ScopeSpec
 from .decision.values import FilterCheck, ValueResolver, check_request_filters
 from .decision import (
@@ -71,13 +71,13 @@ from .decision import (
 )
 from .extraction.base import BuiltinExtractor
 from .generation import AggregateEvidence, AnswerContract
-from .generation.contract import CLAIM_KINDS, answer_schema
+from .generation.contract import CLAIM_KINDS, answer_schema, labelled
 from .ingestion.write import WritePath
 from .models import Aggregate, Answer, AnswerResult, Coverage, Hit, SearchRequest, SearchResult, UnsupportedConstraint
 from .pipeline import JsonModelReviewer, ReviewInput, ReviewStage, ReviewStageConfig
 from .pipeline.spec import ARM_ORDER, PipelineRuntime, RequestRejected, allowed_modes, choose
 from .pipeline.validate import decision_for_mode, raise_for
-from .profiles.prompts import GENERATOR_PROMPT, voice_instruction
+from .profiles.prompts import AGGREGATE_NARRATIVE_PROMPT, GENERATOR_PROMPT, voice_instruction
 from .providers import Embedder, JsonModel, RunBudgetMeter
 from .providers._chat import MissingSecret
 from .providers.base import SchemaViolation
@@ -869,6 +869,7 @@ class Engine:
                 "source_unavailable": output.source_unavailable,
                 "methods": output.methods,
                 "source_counts": output.source_counts,
+                "ranked_by": output.ranked_by,
             }
         )
         if output.document_ids:
@@ -1280,6 +1281,52 @@ class Engine:
             )
         return reply if isinstance(reply, Answer) else Answer.model_validate(reply.model_dump(mode="json"))
 
+    def _rendered_aggregates(self, state: _Retrieval, evidence: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """The aggregates whose deterministic renderings are the answer text (fix5), or ``None`` for
+        the generator path. A pure ranking/count plan: the plan ran, every aggregate has a rendering
+        and no record passage reached the evidence; and either every aggregate is a typed log
+        intent, no generator is configured, or no aggregate fit the evidence budget (the generator
+        would see nothing). Never "No matching evidence" while an aggregate exists."""
+        if state.decision.outcome == "abstain" or not state.aggregates:
+            return None
+        if not all(a.get("rendering") for a in state.aggregates):
+            return None
+        if any(row.get("source") != "structured" for row in evidence):
+            return None
+        packed = {row["id"] for row in evidence}
+        if self.models.get("generator") is None or not packed or all(a.get("intent") for a in state.aggregates):
+            return list(state.aggregates)
+        return None
+
+    def _narrative(self, ctx: RunContext, state: _Retrieval, aggregates: list[AggregateEvidence]) -> tuple[str | None, str]:
+        """The generator's optional one-sentence summary of a rendered answer: ``(text, status)``.
+        Skipped (and traced) when the run budget refuses the call or the reply violates the schema;
+        the rendered answer stands either way. Other provider errors propagate as on the generator
+        path."""
+        generator = self.models.get("generator")
+        if generator is None:
+            return None, "none: no generator configured"
+        role = self.config.models.roles.generator
+        bridge = RunBudgetMeter(ctx, "generator", role.price_key())
+        evidence = [{"id": a.id, "source": "structured", "passage": labelled(a)} for a in aggregates]
+        payload = {"question": state.request.query, "evidence": evidence}
+        schema: Any = answer_schema([a.id for a in aggregates], ("narrative",)) if generator.enforces_schema() else Answer
+        try:
+            reply = generator.call(AGGREGATE_NARRATIVE_PROMPT, payload, schema, bridge, "generator")
+        except BudgetExhausted as exc:
+            ctx.trace.event("aggregate_narrative", status="skipped", reason="budget", detail=str(exc))
+            return None, "skipped: budget"
+        except SchemaViolation as error:
+            details = {"errors": error.error_count, "paths": error.paths, "stop_reason": error.stop_reason, "model": role.model if role else None}
+            LOGGER.warning("aggregate narrative reply violated the answer schema: %s", json.dumps(details, sort_keys=True))
+            ctx.trace.event("aggregate_narrative", status="skipped", reason="schema_violation", **details)
+            return None, "skipped: schema_violation"
+        answer = reply if isinstance(reply, Answer) else Answer.model_validate(reply.model_dump(mode="json"))
+        if answer.insufficient_evidence or not answer.answer.strip():
+            ctx.trace.event("aggregate_narrative", status="none", reason="the generator declined")
+            return None, "none: the generator declined"
+        return answer.answer, "proposed"
+
     def answer(self, request: SearchRequest | str, principal: Principal | None = None, session_id: str | None = None) -> AnswerResult:
         if isinstance(request, str):
             request = SearchRequest(query=request)
@@ -1363,22 +1410,43 @@ class Engine:
                     emit(ReviewRoundEvent(round=round_))
         if emit is not None:
             emit(EvidenceEvent(ids=[row["id"] for row in evidence], omitted_ids=list(evidence_trace.get("omitted_ids", [])), truncated_ids=list(evidence_trace.get("truncated_ids", []))))
-        answer = self._generate(ctx, state, evidence, on_delta=on_delta)
-        evidence_ids = {row["id"] for row in evidence}
-        aggregates = [AggregateEvidence(id=a["id"], result=scope_result_of(a), rendering=a.get("rendering")) for a in state.aggregates if a["id"] in evidence_ids]
         manifest = pinned[1]
-        checked = pipe.contract.enforce(
-            answer,
-            evidence_ids=evidence_ids,
-            aggregates=aggregates,
-            intents=state.decision.intents,
-            unsupported=self._unsupported(state.decision.unsupported, state.filter_check.unsupported),
-            coverage=self._coverage(manifest),
-            trace=ctx.trace,
-            question=state.request.query,
-            targets=state.capabilities.structured_targets(),
-            passages=[row.get("passage", "") for row in evidence if row.get("source") != "structured"],
-        )
+        rendered = self._rendered_aggregates(state, evidence)
+        rendered_trace: dict[str, Any] | None = None
+        if rendered is not None:
+            # A pure ranking/count (fix5): the aggregates' renderings are the answer text, with
+            # their exactness labels; the generator may add one sentence restating their numbers.
+            aggregates = [AggregateEvidence(id=a["id"], result=scope_result_of(a), rendering=a["rendering"]) for a in rendered]
+            refused = all(a.get("status") == "refused" for a in rendered)
+            narrative, status = (None, "none: refused") if refused else self._narrative(ctx, state, aggregates)
+            checked = pipe.contract.rendered_answer(
+                aggregates,
+                intents=state.decision.intents,
+                narrative=narrative,
+                refused=refused,
+                unsupported=self._unsupported(state.decision.unsupported, state.filter_check.unsupported),
+                coverage=self._coverage(manifest),
+                trace=ctx.trace,
+            )
+            if narrative is not None:
+                status = "kept" if checked.answer.short_answer else "dropped"
+            rendered_trace = {"aggregates": [a.id for a in aggregates], "narrative": status}
+        else:
+            answer = self._generate(ctx, state, evidence, on_delta=on_delta)
+            evidence_ids = {row["id"] for row in evidence}
+            aggregates = [AggregateEvidence(id=a["id"], result=scope_result_of(a), rendering=a.get("rendering")) for a in state.aggregates if a["id"] in evidence_ids]
+            checked = pipe.contract.enforce(
+                answer,
+                evidence_ids=evidence_ids,
+                aggregates=aggregates,
+                intents=state.decision.intents,
+                unsupported=self._unsupported(state.decision.unsupported, state.filter_check.unsupported),
+                coverage=self._coverage(manifest),
+                trace=ctx.trace,
+                question=state.request.query,
+                targets=state.capabilities.structured_targets(),
+                passages=[row.get("passage", "") for row in evidence if row.get("source") != "structured"],
+            )
         trace: dict[str, Any] = {
             "seconds": time.perf_counter() - started,
             "rounds": state.rounds,
@@ -1394,6 +1462,8 @@ class Engine:
             "trace_id": ctx.trace.id,
             "profile": self.config.profile,
         }
+        if rendered_trace is not None:
+            trace["rendered_answer"] = rendered_trace
         if "exact_id" in result.trace:
             trace["exact_id"] = result.trace["exact_id"]
         if "record_context" in result.trace:

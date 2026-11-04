@@ -146,6 +146,9 @@ def build(engine: Any, ctx: Any, *, arms: list[str], max_chars: int, values_cap:
             "answer log questions with one structured step: log_intent + log_args (never a free scope over these kinds)",
             "failure words (errors, failing, issues, problems, broken) mean levels error and fatal",
             "a question without a date is about the latest served day",
+            "customers, clients, tenants and accounts are the tenant dimension: 'which customers ...' is log_top with by: tenant, never by: signature",
+            "a tenant or service the question names goes into the intent's tenant/service argument (log_top, log_trend, log_compare); never drop it",
+            "log_compare compares its periods in date order: an increase, drop or change is from the earlier period to the later one",
         ],
     }
     return bounded(pack, max_chars)

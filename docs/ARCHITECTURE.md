@@ -942,6 +942,22 @@ WARN query) is checked against the lines of the same units whose level the parse
 their 25 source lines)") and `unknown_level` carries the numbers; with none it stays exact and the
 note says the rows were not cross-checked.
 
+**Rankings when the parse is incomplete.** A `log_top` ranking of services, tenants or deployments
+at asked levels (`metric: lines`) ranks by the **source counts** when the parse is incomplete
+(`runtime/log_tools.source_ranking`): the count queries whose sum is exactly the asked levels are
+summed per group over every unit of the window and filters, and when any group has more source
+lines than lines in the parsed rows, the rows are the groups ordered by the source count (`lines`),
+with `lines_parsed` (the lines at those levels in the composed rows), `lines_unparsed`,
+`unparsed_share`, `basis`/`source_exactness` and `ranked_by: source_counts`, cut at `top_n`. The
+rendering says "ranked by source counts (the parse is incomplete)" and the parse's share of the
+source lines. A service whose errors are almost all unparsed therefore ranks where the source puts
+it, instead of dropping out of the top N. The parsed ranking stands (`ranked_by: parsed_rows`) when
+the parse is complete, when a level has no count query over exactly it (a wider query would
+over-count; a note says so), when a filter has no source-side equivalent (`owner: reviewed`), or
+when units lack the count fields (named). A signature ranking keeps the parsed rows (the source
+cannot count per signature) and its rendering states the unparsed share of the source lines and the
+services with the most unparsed lines at those levels.
+
 **Vocabulary, error rate and the default day.** In the rules grammar a named level ("ERROR",
 "FATAL", "warnings") is that level, while words for failure in general ("errors", "failing",
 "failures", "issues", "problems", "broken") mean ERROR and FATAL; a level word inside a named value
@@ -990,6 +1006,29 @@ like a tool call; a free scope over the log kinds is still refused (`intent_requ
 generator is asked to quote it, and when the answer text states a number the cited exact aggregate
 does not back, the contract replaces the text with the rendering (plus the model's number-free
 sentences) instead of passing or abstaining.
+
+**Pure ranking and count answers are their rendering.** When an answer's evidence is aggregates only
+(no record passage) and either every aggregate is a typed log intent, no generator is configured, or
+no aggregate fit the evidence budget, the answer text is the aggregates' deterministic renderings
+with their exactness labels (`AnswerContract.rendered_answer`; trace `rendered_answer`), citing the
+aggregates; "No matching evidence was retrieved." is never the answer while an aggregate exists. A
+configured generator is then asked (`AGGREGATE_NARRATIVE_PROMPT`, the renderings as its only
+evidence) for one short sentence; it is appended (and returned as `short_answer`) only when it is a
+single sentence and every number in it, digits or number words, appears in the renderings. A
+foreign number is an `answer_number_mismatch` (action `strip`, contract `stripped`); more than one
+sentence drops it (never cut to the first); a run budget that refuses the call or a schema
+violation skips it (traced); the renderings stand in every case. A refused aggregate's answer is
+`insufficient_evidence`.
+
+**Labelled counts on approximate or bounded aggregates.** A `count` claim and a count statement
+in the answer text may rest on an approximate or bounded aggregate (`labelled_backing`: no dropped
+predicate) when the statement's own sentence labels the number (`has_label`: "approximately",
+"about", "around", "roughly", "at least", "~" before the number, or "approximate", "estimated",
+"sampled", "bounded", "lower bound", "parsed", "source counts", "token_match" in the sentence) and
+the number equals a value of that aggregate. An unlabelled count, a mismatching number, a complete
+list or an absence still needs an exact scope. Sentences (for strips and for the label) end at
+`.`/`!`/`?` followed by whitespace or the end, or at a line break, never inside an identifier or a
+decimal.
 
 **History.** Days beyond the partition window are composed from the per-day derived snapshots
 (`logs.retention.derived`; the bug-fix slice's archive), whose aggregates include the format-2

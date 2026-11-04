@@ -7,6 +7,43 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Fixed (live deployment follow-ups; synthetic reproductions)
+
+- **Rankings ignored unparsed lines.** "Which service is failing the most" (`log_top` by service at
+  ERROR+FATAL) ranked by parsed lines, so a service whose errors were almost all unparsed dropped
+  out of the top N while the answer listed its source counts. A ranking by service, tenant or
+  deployment at asked levels now ranks by the source counts when the parse is incomplete
+  (`ranked_by: source_counts`; rows carry `lines` = source lines, `lines_parsed`,
+  `lines_unparsed`, `unparsed_share`; rendering "ranked by source counts (the parse is
+  incomplete)"). Without count queries over exactly the asked levels, with an `owner: reviewed`
+  filter or with units missing count fields the parsed ranking stands with a note. Signature
+  rankings keep the parsed rows and now state the unparsed share and the services with the most
+  unparsed lines. Gold plan: `GoldSpec.error_flood` plants such a service (off by default). A
+  `log_top` call without `by` (it defaults to service) now gets the source cross-check too; it used
+  to be skipped.
+- **Pure ranking answers read "No matching evidence was retrieved."** When a log aggregate did not
+  fit the generator's evidence budget the generator saw no evidence. An answer whose evidence is
+  aggregates only (typed log intents, no generator, or nothing packed) is now the aggregates'
+  deterministic rendering with its exactness label, citing them; a configured generator may add one
+  sentence, kept only when every number in it appears in the rendering (`answer_number_mismatch`,
+  action `strip`, otherwise). Trace: `rendered_answer`. Generic structured aggregates that fit the
+  budget still go to the generator as before.
+- **Usable approximate/bounded rankings abstained.** A count stated in the answer text and backed
+  by an approximate or bounded aggregate now passes when its own sentence labels it
+  ("approximately 304", "at least 304", "304 in the parsed rows", "bounded") and its number
+  matches that aggregate; unlabelled counts, mismatching numbers, complete lists and absences
+  still need an exact scope. The generator prompt asks for the label.
+- **Garbled stripped answers.** The contract split sentences at every dot, so stripping a sentence
+  that named `gen.error_word` left "… signatures were gen." or a fragment starting mid-sentence. A
+  sentence now ends only at `.`/`!`/`?` before whitespace or the end (or at a line break).
+- **Customers ranked by signature; tenant filters dropped; inverted change.** The rules grammar
+  maps customers, clients, accounts and tenants to `by: tenant`; `log_trend` and `log_compare` take
+  `tenant` and the rules carry a named tenant into them; "increase", "drop", "change", "worse" and
+  similar words with two dates are a comparison ("worse" means ERROR+FATAL). `log_compare` compares
+  its periods in date order and renders "(change from <earlier> to <later>: ±N)" (the change was
+  computed in the question's order, so "Nov 3 compared to Nov 2" had the sign inverted). The
+  planner context pack's rules and the profile's few-shot examples say the same.
+
 ### Fixed (second real-deployment smoke test; synthetic reproductions)
 
 - **Wrong day on the Ask path.** `/v2/answer`, the stream and the llm planner filled the log

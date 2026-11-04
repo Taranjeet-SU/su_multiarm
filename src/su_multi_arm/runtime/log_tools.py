@@ -79,6 +79,10 @@ class LogToolOutput(StrictModel):
     # The latest served day: set when the window was anchored on it (a question without a date) or
     # when a requested day lies after it (source_unavailable; never silently shifted onto it).
     latest_available_day: str | None = None
+    # How a ``log_top`` ranking of services, tenants or deployments at asked levels was ordered:
+    # ``source_counts`` when the parse is incomplete (the rows then carry ``lines`` = source lines,
+    # ``lines_parsed``, ``lines_unparsed`` and ``unparsed_share``), else ``parsed_rows``.
+    ranked_by: Literal["parsed_rows", "source_counts"] | None = None
 
 
 # --- execution -------------------------------------------------------------------------------------
@@ -202,7 +206,7 @@ def _levels_of(compiled: CompiledIntent) -> list[str]:
     """The levels a level question asks about (lower case); empty for any other question."""
     if compiled.intent not in LEVEL_INTENTS or compiled.window is None:
         return []
-    if compiled.intent == "log_top" and compiled.args.get("by") not in {"service", "tenant", "signature", "deployment"}:
+    if compiled.intent == "log_top" and compiled.args.get("by", "service") not in {"service", "tenant", "signature", "deployment"}:
         return []
     level = compiled.args.get("level")
     if compiled.intent == "log_top" and compiled.args.get("metric") == "error_rate" and not level:
@@ -372,6 +376,116 @@ def source_counts(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[di
     return rows, notes, unknown
 
 
+# Predicates of a ``log_top`` main scope the unit source counts can also apply (the rest, e.g. a
+# reviewed-owner filter, have no source-side equivalent: such a ranking stays on the parsed rows).
+_SOURCE_RANKABLE_FIELDS = {"kind", "date", "level", "extraction_source", "status", "service", "tenant", "deployment_id"}
+
+
+def source_ranking(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """A ``log_top`` ranking of a unit-level dimension (service, tenant or deployment) at the asked
+    levels by the **source's own counts** when the parse is incomplete (real-run fix: a service
+    whose errors were almost all unparsed dropped out of "which service is failing the most").
+
+    Returns ``(rows, notes)``; ``rows`` is ``None`` when the parsed ranking stands: not a unit-level
+    ranking, no levels asked, a level no count query counts exactly (a query over more levels would
+    over-count), a filter the source counts cannot apply, units without the needed count fields
+    (named in a note), or a parse that is complete (no group has more source lines than parsed
+    ones). Each row: ``lines`` (source lines at the levels, the ranked value), ``lines_parsed``
+    (the lines at those levels in the composed rows, what the parsed ranking counts),
+    ``lines_unparsed`` (``lines - lines_parsed``, never below 0), ``unparsed_share``, ``basis``,
+    ``source_exactness`` and ``ranked_by: source_counts``."""
+    from ..core.types import Measure, Predicate
+    from ..decision.log_intents import count_fields
+
+    args = compiled.args
+    if compiled.intent != "log_top" or args.get("by", "service") not in {"service", "tenant", "deployment"} or _is_error_rate(compiled):
+        return None, []
+    levels = _levels_of(compiled)
+    if not levels or compiled.window is None:
+        return None, []
+    main = compiled.scopes["main"]
+    label = "+".join(lv.upper() for lv in levels)
+    names, missing = count_fields(levels, ops.log_context(ctx).count_queries)
+    if missing:
+        return None, [f"not ranked by source counts: no count query counts exactly {label} (missing {'/'.join(lv.upper() for lv in missing)})"]
+    if any(p.field not in _SOURCE_RANKABLE_FIELDS for p in main.predicates):
+        return None, ["not ranked by source counts: the ranking filters on a field the source counts do not carry"]
+    group = list(main.group_by)
+    filters = [p for p in main.predicates if p.field in {"service", "tenant", "deployment_id"}]
+    base = [Predicate(field="kind", op="eq", value="unit_day"), compiled.window.predicate(), *filters]
+    complete = [*base, *(Predicate(field=f"count_{n}", op="range", lower=0) for n in names)]
+    units = _grouped(ops, ctx, ScopeSpec(predicates=base, group_by=group, measure=Measure(kind="count")))
+    counted = _grouped(ops, ctx, ScopeSpec(predicates=complete, group_by=group, measure=Measure(kind="count")))
+    lacking = {k: int(n or 0) - int(counted.get(k) or 0) for k, n in units.items() if int(n or 0) > int(counted.get(k) or 0)}
+    if lacking:
+        return None, [f"not ranked by source counts: {sum(lacking.values())} units have no source {label} count (" + ", ".join(sorted(_group_key(dict(zip(group, k)), group) for k in lacking)) + ")"]
+    source: dict[tuple, int] = {}
+    bases: dict[Any, set[str]] = {}
+    for name in names:
+        for key, n in _grouped(ops, ctx, ScopeSpec(predicates=complete, group_by=group, measure=Measure(kind="sum", field=f"count_{name}"))).items():
+            source[key] = source.get(key, 0) + int(n or 0)
+        for (first, basis), _n in _grouped(ops, ctx, ScopeSpec(predicates=complete, group_by=[group[0], f"basis_{name}"], measure=Measure(kind="count"))).items():
+            if basis:
+                bases.setdefault(first, set()).update(str(basis).split(","))
+    every = main.model_copy(update={"order": None, "top_n": None, "nth": None, "sort": None, "limit": None})
+    parsed = {k: int(v or 0) for k, v in _grouped(ops, ctx, every).items()}
+    if not any(n > parsed.get(k, 0) for k, n in source.items()):
+        return None, []  # the parse holds every source-counted line: the parsed ranking stands
+    rows = []
+    for key in set(source) | set(parsed):
+        n, got = source.get(key, 0), parsed.get(key, 0)
+        if not n and not got:
+            continue
+        basis = ",".join(sorted(bases.get(key[0], set()))) or "unknown"
+        unparsed = max(0, n - got)
+        rows.append(
+            {
+                **dict(zip(group, key)),
+                "lines": n,
+                "lines_parsed": got,
+                "lines_unparsed": unparsed,
+                "unparsed_share": round(unparsed / n, 4) if n else None,
+                "basis": basis,
+                "source_exactness": "exact" if basis == "level_field" else "approximate",
+                "ranked_by": "source_counts",
+            }
+        )
+    rows.sort(key=lambda r: (-r["lines"], -r["lines_parsed"], _group_key(r, group)))
+    top_n = int(args.get("top_n", 10))
+    tied = len(rows) > top_n and rows[top_n]["lines"] == rows[top_n - 1]["lines"]
+    total, held = sum(source.values()), sum(min(n, parsed.get(k, 0)) for k, n in source.items())
+    notes = [
+        f"ranked by source counts ({', '.join(names)}): the parse is incomplete, the composed rows hold {held} of the source's {total} {label} lines "
+        f"({(total - held) / total:.1%} unparsed)" if total else f"ranked by source counts ({', '.join(names)})"
+    ]
+    if tied:
+        notes.append(f"ties at the top-{top_n} boundary ({rows[top_n]['lines']} source lines): more groups have that count than are shown")
+    return rows[:top_n], notes
+
+
+def _unparsed_summary(output: LogToolOutput, limit: int = 5) -> str | None:
+    """The unparsed share of a ranking the source cannot count per row (by signature) and the
+    services with the most unparsed lines at the asked levels."""
+    by_label: dict[str, tuple[int, int]] = {}
+    services: dict[str, dict[str, int]] = {}
+    for row in output.source_counts:
+        n, unparsed = by_label.get(row["level"], (0, 0))
+        by_label[row["level"]] = (n + row["lines_source"], unparsed + row["lines_unparsed"])
+        if row["lines_unparsed"]:
+            per = services.setdefault(row["level"], {})
+            per[row["service"]] = per.get(row["service"], 0) + row["lines_unparsed"]
+    parts = []
+    for label, (n, unparsed) in sorted(by_label.items()):
+        if not unparsed or not n:
+            continue
+        top = sorted(services.get(label, {}).items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        parts.append(
+            f"unparsed share: {unparsed} of {n} source {label} lines ({unparsed / n:.1%}) are not in the parsed rows, so no signature ranks them; "
+            f"services with the most unparsed {label} lines: " + ", ".join(f"{s} {u}" for s, u in top)
+        )
+    return "; ".join(parts) or None
+
+
 def _unit_label(row: dict[str, Any]) -> str:
     if "deployment_id" in row:
         return f"{row['service']} (deployment {row.get('deployment_id') or 'none'})"
@@ -454,6 +568,16 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
         if _levels_of(compiled):
             exactness = "bounded"  # a level answer that cannot be cross-checked is never exact
     compiled.notes.extend(count_notes)
+    ranked_by = None
+    if compiled.intent == "log_top" and _levels_of(compiled) and compiled.args.get("by", "service") in {"service", "tenant", "deployment"} and not rate:
+        ranked_by = "parsed_rows"
+        try:
+            ranked, rank_notes = source_ranking(ops, ctx, compiled)
+        except BackendError as exc:
+            ranked, rank_notes = None, [f"not ranked by source counts: source counts unavailable ({exc})"]
+        compiled.notes.extend(rank_notes)
+        if ranked is not None:
+            rows, ranked_by = ranked, "source_counts"
     bounded_by: list[str] = []
     short = [r for r in counted if r["lines_source"] > r["lines_answered"]]
     if short:
@@ -490,10 +614,11 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
         notes=[*compiled.notes, *(f"{u.reason}: {u.suggestion or u.constraint_text}" for u in unsupported)],
         rendering="",
         document_ids=documents,
-        truncated=bool(main.ties) or any(r.matched_ids_truncated for r in results.values()),
+        truncated=(any(n.startswith("ties at the top-") for n in compiled.notes) if ranked_by == "source_counts" else bool(main.ties)) or any(r.matched_ids_truncated for r in results.values()),
         source_counts=counted,
         unknown_level=unknown,
         bounded_by=bounded_by,
+        ranked_by=ranked_by,
     )
     output.rendering = render(output, basis_note, ops, ctx, compiled)
     return output
@@ -710,10 +835,28 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
         head = f"Top {len(rows)} {label} by error rate (source {levels} lines / source total lines, unit_day source counts){where}: " + "; ".join(
             f"{_group_key(r, group)}: {r['error_rate']:.2%} ({r['lines']} of {r['lines_total']}" + (", token_match, approximate" if r["rate_exactness"] == "approximate" else "") + ")" for r in rows
         )
+    elif intent == "log_top" and output.ranked_by == "source_counts":
+        group = compiled.scopes["main"].group_by
+        label = "deployment" if group == DEPLOYMENT_GROUP else group[0]
+        levels = "+".join(lv.upper() for lv in _levels_of(compiled))
+        head = f"Top {len(rows)} {label} by source {levels} lines, ranked by source counts (the parse is incomplete){where}: " + "; ".join(
+            f"{_group_key(r, group)}: {r['lines']} source"
+            + (" (token_match, approximate)" if r["source_exactness"] == "approximate" else "")
+            + f", {r['lines_parsed']} parsed"
+            + (f", {r['unparsed_share']:.1%} unparsed" if r["unparsed_share"] is not None else "")
+            for r in rows
+        )
+        ranked = next((n for n in output.notes if n.startswith("ranked by source counts")), None)
+        if ranked:
+            tail.insert(0, ranked)
     elif intent == "log_top":
         group = compiled.scopes["main"].group_by
         label = "deployment" if group == DEPLOYMENT_GROUP else group[0]
         head = f"Top {len(rows)} {label} by {counted}{where}: " + "; ".join(f"{_group_key(r, group)}: {r['lines']}" for r in rows)
+        if compiled.args.get("by") == "signature":
+            summary = _unparsed_summary(output)
+            if summary:
+                tail.insert(0, summary)
     elif intent == "log_new":
         head = f"{len(rows)} signatures first seen{where} (across all composed history): " + "; ".join(f"{r['signature_id']} (first seen {r['first_seen']}, {r['lines_history']} lines)" for r in rows)
     elif intent == "log_affected":
@@ -728,8 +871,10 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
         head = f"{counted.capitalize()} per {'hour' if key == 'ts_hour' else 'day'}{where}: " + "; ".join(f"{r[key]}: {r['lines']}" for r in rows)
     elif intent == "log_compare":
         head = f"{counted.capitalize()} by period: " + "; ".join(f"{r['period']}: {r['lines']}" for r in rows)
-        if len(rows) >= 2 and isinstance(rows[0]["lines"], (int, float)) and isinstance(rows[1]["lines"], (int, float)):
-            head += f" (change {rows[1]['lines'] - rows[0]['lines']:+d})" if isinstance(rows[1]["lines"] - rows[0]["lines"], int) else ""
+        if len(rows) >= 2 and isinstance(rows[0]["lines"], (int, float)) and isinstance(rows[-1]["lines"], (int, float)):
+            first, last = rows[0], rows[-1]  # the periods are in date order (compile_intent)
+            delta = last["lines"] - first["lines"]
+            head += f" (change from {first['period']} to {last['period']}: {delta:+d})" if isinstance(delta, int) else ""
     elif intent == "log_tenants":
         service = compiled.args.get("service")
         group = compiled.scopes["main"].group_by

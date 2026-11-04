@@ -1901,3 +1901,44 @@ Follow-ups:
 - `log_tenants` still takes one level; `log_coverage`/`log_endpoints` do not take `deployment_id`.
 - The token phrase in `source_counts` uses the level names as the words; the query's own `tokens`
   are not in the compile context.
+
+### 2026-11-04 — Logs fix5: live follow-ups (source-count rankings, rendered ranking answers) and persona-eval fixes — DONE (synthetic/mocked; item 6 not done)
+
+Base `v2/logs` at `84bf49d`. Commits: `beec634` (rankings by source counts, rendered answers),
+`af9dffd` (labelled counts, sentence splitter, tenant words/filters, compare order), and the docs
+commit (VALIDATION, this entry). Synthetic reproductions only.
+
+Done:
+1. `runtime/log_tools.source_ranking`: `log_top` by service/tenant/deployment at asked levels ranks
+   by the source counts when any group has more source than parsed lines (`ranked_by`,
+   `lines`=source, `lines_parsed`, `lines_unparsed`, `unparsed_share`); signature rankings state the
+   unparsed share and top unparsed services. `GoldSpec.error_flood` plant.
+2. `Engine._rendered_aggregates` + `AnswerContract.rendered_answer`: aggregate-only answers are the
+   renderings with exactness labels; optional one-sentence generator narrative checked by
+   `numbers_outside` (`answer_number_mismatch`, strip). `AGGREGATE_NARRATIVE_PROMPT`.
+3. Labelled counts on approximate/bounded aggregates pass (`has_label`, `labelled_backing`);
+   generator prompt asks for labels.
+4. Rules: customer/client/account words → tenant; planner pack rules and profile few-shot.
+5. `tenant` on `log_trend`/`log_compare`; change words → compare; periods in date order.
+7. `_SENTENCE` no longer splits inside identifiers/decimals.
+
+Deviations:
+- Source ranking applies only when the parse is incomplete (title of the request); a complete
+  parse keeps the parsed ranking so a token_match source count never replaces exact parsed rows.
+  Needs count queries over exactly the asked levels (a superset query would over-count).
+- Rendered answers apply to log-intent aggregates always, and to generic aggregates only without a
+  generator or when nothing was packed; generic aggregates that fit still go to the generator.
+- The narrative is dropped (not cut) when it has more than one sentence; traced, no violation rule.
+- `_levels_of` now treats a `log_top` without `by` as by service (it skipped the cross-check).
+- Item 6 (planner schema repair re-prompt, then fallback) NOT implemented: the slice ground rules
+  forbid repair and fallback; needs an explicit owner decision.
+- Item 7 cause: the sentence splitter (identifiers with dots); `max_tokens` truncation not measured.
+- Per-tenant comparison ("which tenant increased") is not an intent: `periods` cannot be grouped.
+
+Tests: `not external` 2523 passed, 99 skipped (was 2473/99). ruff clean. Schema unchanged. Fresh
+`[dev]`-only install of `af9dffd`: 1859 passed, 736 skipped, 0 failed, 0 errors.
+
+Follow-ups:
+- Re-run the persona eval and the smoke on the deployment (local model first).
+- Owner decision on planner schema-violation handling; a per-tenant comparison intent; a
+  share-of-total intent ("what share of errors comes from X").

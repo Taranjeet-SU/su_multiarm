@@ -48,7 +48,7 @@ from pydantic import Field, create_model
 from ..core.types import ScopeResult, UnsupportedConstraint
 from ..decision.intent import Intents, untargeted_constraint
 from ..models import Answer, Claim, ClaimKind, ContractRule, Coverage, StrictModel, Violation
-from .statements import Statement, detect_statements, population_frame, stated_number, units_for
+from .statements import _WORD_VALUES, Statement, detect_statements, population_frame, stated_number, units_for
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..runtime.trace import Trace
@@ -73,8 +73,26 @@ __all__ = [
     "Violation",
     "answer_from_generator",
     "answer_schema",
+    "has_label",
+    "labelled",
+    "numbers_outside",
 ]
-_SENTENCE = re.compile(r"[^.!?\n]*(?:[.!?]+|\n|$)")
+# A sentence ends at ``.``/``!``/``?`` followed by whitespace or the end of the text, or at a line
+# break; a terminator inside a token ("gen.error_word", "99.0", "e.g.x") does not end it (live fix:
+# strips split identifiers and left fragments such as "... signatures were gen.").
+_SENTENCE = re.compile(r"(?:[^.!?\n]|[.!?]+(?=[^\s.!?]))*(?:[.!?]+(?=\s|$)|\n|$)")
+# The qualifier that labels a number of an approximate or bounded aggregate (fix5): a word before
+# the number ("approximately 304", "at least 304", "~304") or an exactness word in the sentence.
+_LABEL = re.compile(
+    r"(?:\b(?:approximately|approx\.?|about|around|roughly|nearly|at\s+least|more\s+than|estimated)|~)\s*\d"
+    r"|\b(?:approximate|approximately|estimated|estimate|sampled|bounded|lower\s+bound|at\s+least|parsed|unparsed|source\s+counts?|token_match)\b",
+    re.I,
+)
+
+
+def has_label(text: str) -> bool:
+    """``text`` labels its numbers as approximate or bounded (``_LABEL``)."""
+    return bool(_LABEL.search(text or ""))
 
 
 class AnswerResult(StrictModel):
@@ -98,6 +116,12 @@ class AggregateEvidence(StrictModel):
         # Defence in depth: a result with a dropped predicate never backs a count/list claim,
         # whatever exactness label the adapter reported.
         return self.result.exactness == "exact" and not self.result.unsupported
+
+    def labelled_backing(self) -> bool:
+        """An approximate or bounded result that may back a **labelled** count (fix5): its numbers
+        are usable when the answer says they are approximate or a lower bound. Never an
+        exhaustive list or an absence; never a result with a dropped predicate."""
+        return self.result.exactness in {"approximate", "bounded"} and not self.result.unsupported
 
     def exhaustive(self) -> bool:
         return self.exact() and not self.result.unsupported and self.result.missing_or_invalid == 0
@@ -157,14 +181,18 @@ class AnswerContract:
     # --- checks ----------------------------------------------------------------------------------
 
     @staticmethod
-    def _backs(claim: Claim, by_id: dict[str, AggregateEvidence], kind: str) -> bool:
+    def _backs(claim: Claim, by_id: dict[str, AggregateEvidence], kind: str, labelled: bool = False) -> bool:
+        """``labelled``: the claim (or the answer text) labels its numbers as approximate or
+        bounded, so a ``count`` may rest on an approximate/bounded aggregate (fix5)."""
         backing = [by_id[e] for e in claim.evidence_ids if e in by_id]
         if kind == "absence":
             return any(a.exhaustive() and a.empty() for a in backing)
-        return any(a.exact() for a in backing)
+        if any(a.exact() for a in backing):
+            return True
+        return kind == "count" and labelled and any(a.labelled_backing() for a in backing)
 
     @staticmethod
-    def _number_matches(statement: Statement, answer: Answer, by_id: dict[str, AggregateEvidence]) -> bool:
+    def _number_matches(statement: Statement, answer: Answer, by_id: dict[str, AggregateEvidence], labelled: bool = False) -> bool:
         """A backed ``count`` statement's number equals a value of an exact aggregate cited by a count
         claim (scalar value, a group count, or the number of listed ids). Vague counts pass (N2).
         A total/sum statement compares its ``amount`` (QQ-03)."""
@@ -183,7 +211,7 @@ class AnswerContract:
                 continue
             for evidence in claim.evidence_ids:
                 aggregate = by_id.get(evidence)
-                if aggregate is None or not aggregate.exact():
+                if aggregate is None or not (aggregate.exact() or (labelled and aggregate.labelled_backing())):
                     continue
                 value = aggregate.result.value
                 if isinstance(value, bool):
@@ -246,13 +274,19 @@ class AnswerContract:
         if unknown:
             findings.append(_Finding(violation=Violation(rule="unknown_evidence", detail=f"cited evidence not supplied: {unknown}")))
         exact_exists = any(a.exact() for a in aggregates)
+        text_labelled = has_label(answer.answer)
+
+        def claim_labelled(claim: Claim) -> bool:
+            return has_label(claim.text) or text_labelled
+
         for index, claim in enumerate(answer.claims):
-            if claim.kind not in AGGREGATE_CLAIMS or self._backs(claim, by_id, claim.kind):
+            if claim.kind not in AGGREGATE_CLAIMS or self._backs(claim, by_id, claim.kind, claim_labelled(claim)):
                 continue
             needs = "an exact, exhaustive and empty" if claim.kind == "absence" else "an exact"
             findings.append(_Finding(violation=Violation(rule="claim_without_exact_scope", detail=f"{claim.kind} claim needs {needs} ScopeResult"), claims=[index]))
         if intents.aggregate() and not exact_exists:
-            offending = [i for i, c in enumerate(answer.claims) if c.kind in {"count", "exhaustive_list"}]
+            # a labelled count on an approximate/bounded aggregate is a usable answer (fix5)
+            offending = [i for i, c in enumerate(answer.claims) if c.kind in {"count", "exhaustive_list"} and not self._backs(c, by_id, c.kind, claim_labelled(c))]
             if offending:
                 kinds = [answer.claims[i].kind for i in offending]
                 findings.append(_Finding(violation=Violation(rule="aggregate_intent_without_scope", detail=f"aggregate intent without exact scope; claims {kinds}"), claims=offending))
@@ -260,12 +294,16 @@ class AnswerContract:
             findings.append(_Finding(violation=Violation(rule="factual_without_citations", detail="factual answer without citations")))
         if not answer.insufficient_evidence and not answer.answer.strip():
             findings.append(_Finding(violation=Violation(rule="empty_answer", detail="factual answer with empty text")))
+        # a count statement may rest on an approximate/bounded aggregate when its own sentence
+        # labels it ("approximately 304", "at least 304", "304 in the parsed rows"); lists and
+        # absences always need an exact scope
+        labelled = {i: st.kind == "count" and has_label(sentence_of(answer.answer, st.start, st.end)) for i, st in enumerate(statements)}
         unbacked: list[Statement] = []
-        for statement in statements:
+        for i, statement in enumerate(statements):
             accepted = ("absence", "count") if statement.kind == "absence" else (statement.kind,)
-            if not any(c.kind in accepted and self._backs(c, by_id, statement.kind) for c in answer.claims):
+            if not any(c.kind in accepted and self._backs(c, by_id, statement.kind, labelled[i]) for c in answer.claims):
                 unbacked.append(statement)
-        mismatched = [s for s in statements if s.kind == "count" and s not in unbacked and not self._number_matches(s, answer, by_id)]
+        mismatched = [st for i, st in enumerate(statements) if st.kind == "count" and st not in unbacked and not self._number_matches(st, answer, by_id, labelled[i])]
         # QQ-06: the model's insufficient_evidence flag does not exempt the text from these checks.
         if mismatched:
             findings.append(
@@ -297,6 +335,92 @@ class AnswerContract:
 
     # --- enforcement -----------------------------------------------------------------------------
 
+    @staticmethod
+    def _flagged(aggregates: list[AggregateEvidence], intents: Intents, unsupported: list[UnsupportedConstraint] | None) -> list[UnsupportedConstraint]:
+        """``unsupported_constraints`` of an answer: the engine's, each aggregate's, one per aggregate
+        intent without an exact scope, and one per untargeted list noun (QQ-04)."""
+        flagged = list(unsupported or [])
+        for aggregate in aggregates:
+            for item in aggregate.result.unsupported:
+                if item not in flagged:
+                    flagged.append(item)
+        if intents.aggregate() and not any(a.exact() for a in aggregates) and not flagged:
+            flagged = [
+                UnsupportedConstraint(constraint_text=a.text, reason="aggregate_intent_without_scope", suggestion="no exact typed scope was executed")
+                for a in intents.aggregates
+            ]
+        for item in intents.untargeted:  # QQ-04: a list of a noun no structured scope can express
+            if not any(f.constraint_text == item.text for f in flagged):
+                flagged.append(untargeted_constraint(item))
+        return flagged
+
+    def rendered_answer(
+        self,
+        aggregates: list[AggregateEvidence],
+        *,
+        intents: Intents,
+        narrative: str | None = None,
+        refused: bool = False,
+        unsupported: list[UnsupportedConstraint] | None = None,
+        coverage: Coverage | None = None,
+        trace: Trace | None = None,
+    ) -> AnswerResult:
+        """The answer of a pure ranking/count plan (fix5): the aggregates' deterministic renderings
+        (each with its exactness label) are the answer text; nothing the model wrote carries a
+        number of it. ``narrative`` is the generator's optional one-sentence summary: kept (after
+        the renderings, and as ``short_answer``) only when it is one sentence and every number in it
+        appears in the renderings (``answer_number_mismatch``, action ``strip``, otherwise; the
+        renderings stand). ``refused``: every aggregate was refused, the answer is
+        ``insufficient_evidence``. ``fail`` raises on a dropped narrative like on any violation."""
+        if not aggregates or not all(a.rendering for a in aggregates):
+            raise ValueError("rendered_answer needs aggregates with a rendering")
+        flagged = self._flagged(aggregates, intents, unsupported)
+        parts = [labelled(a) for a in aggregates]
+        rendered = " ".join(parts)
+        violations: list[Violation] = []
+        kept: str | None = None
+        status = "none"
+        if narrative is not None and narrative.strip():
+            text = narrative.strip()
+            # a sentence ends at . ! ? before whitespace (a decimal point is not an end) or a line break
+            sentences = [p for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
+            foreign = numbers_outside(text, rendered)
+            if foreign:
+                violations.append(
+                    Violation(rule="answer_number_mismatch", detail=f"the narrative sentence states numbers the rendering does not: {foreign}", action="strip")
+                )
+                status = "dropped: numbers not in the rendering"
+            elif len(sentences) != 1:
+                status = f"dropped: {len(sentences)} sentences, one is allowed"  # never cut to its first sentence
+            else:
+                kept, status = text, "kept"
+        if violations and self.on_violation == "fail":
+            raise AnswerContractViolation(violations)
+        claims = [Claim(text=a.rendering or a.id, kind="count" if a.exact() else "narrative", evidence_ids=[a.id]) for a in aggregates]
+        if kept:
+            claims.append(Claim(text=kept, kind="narrative", evidence_ids=[a.id for a in aggregates]))
+        answer = Answer(
+            answer=rendered + (f"\n\n{kept}" if kept else ""),
+            claims=claims,
+            citations=[a.id for a in aggregates],
+            insufficient_evidence=refused,
+            short_answer=kept,
+        )
+        outcome = "stripped" if violations else "passed"
+        if trace is not None:
+            trace.event(
+                "answer_contract",
+                violations=[v.model_dump() for v in violations],
+                unsupported=flagged,
+                on_violation=self.on_violation,
+                exact_scope=any(a.exact() for a in aggregates),
+                statements=[],
+                outcome=outcome,
+                rendered=True,
+                narrative=status,
+            )
+        return AnswerResult(answer=answer, unsupported_constraints=flagged, coverage=coverage, violations=violations, contract=outcome)
+
     def enforce(
         self,
         answer: Answer,
@@ -314,19 +438,7 @@ class AnswerContract:
         """Check ``answer`` and apply ``on_violation``. ``question``, ``targets`` (the deployment's
         structured targets) and ``passages`` (the non-aggregate evidence text) tune the text check:
         unit nouns and quotations (``statements.py``)."""
-        flagged = list(unsupported or [])
-        for aggregate in aggregates:
-            for item in aggregate.result.unsupported:
-                if item not in flagged:
-                    flagged.append(item)
-        if intents.aggregate() and not any(a.exact() for a in aggregates) and not flagged:
-            flagged = [
-                UnsupportedConstraint(constraint_text=a.text, reason="aggregate_intent_without_scope", suggestion="no exact typed scope was executed")
-                for a in intents.aggregates
-            ]
-        for item in intents.untargeted:  # QQ-04: a list of a noun no structured scope can express
-            if not any(f.constraint_text == item.text for f in flagged):
-                flagged.append(untargeted_constraint(item))
+        flagged = self._flagged(aggregates, intents, unsupported)
         statements = detect_statements(
             answer.answer,
             units=units_for(targets, question),
@@ -419,6 +531,45 @@ class AnswerContract:
         if not citations and not answer.insufficient_evidence:
             return "abstained", answer
         return "stripped", answer.model_copy(update={"answer": text, "claims": claims, "citations": citations})
+
+
+_NUMBER_TOKEN = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?")
+_NUMBER_WORD = re.compile(r"\b(" + "|".join(sorted((w for w in _WORD_VALUES if " " not in w), key=len, reverse=True)) + r")\b", re.I)
+
+
+def _numbers(text: str) -> dict[str, float]:
+    found: dict[str, float] = {}
+    for m in _NUMBER_TOKEN.finditer(text):
+        token = m.group(0).rstrip(",")
+        try:
+            found[token] = float(token.replace(",", ""))
+        except ValueError:  # pragma: no cover - the pattern only matches numbers
+            continue
+    for m in _NUMBER_WORD.finditer(text):
+        found[m.group(0)] = float(_WORD_VALUES[m.group(0).casefold()])
+    return found
+
+
+def sentence_of(text: str, start: int, end: int) -> str:
+    """The sentence(s) of ``text`` that overlap ``[start, end)``."""
+    parts = [m.group(0) for m in _SENTENCE.finditer(text) if m.group(0) and m.start() < end and start < m.end()]
+    return "".join(parts) or text[start:end]
+
+
+def numbers_outside(text: str, reference: str) -> list[str]:
+    """The numbers (digits or number words) of ``text`` whose value is not a number of
+    ``reference``: a narrative around a rendering may only restate the rendering's numbers."""
+    allowed = set(_numbers(reference).values())
+    return [token for token, value in _numbers(text).items() if value not in allowed]
+
+
+def labelled(aggregate: AggregateEvidence) -> str:
+    """An aggregate's rendering with its exactness label (appended when the rendering lacks it)."""
+    text = (aggregate.rendering or "").strip()
+    label = aggregate.result.exactness
+    if re.search(rf"\b{label}\b", text):
+        return text
+    return f"{text.rstrip('.')} ({label})."
 
 
 def answer_from_generator(data: dict[str, Any]) -> Answer:

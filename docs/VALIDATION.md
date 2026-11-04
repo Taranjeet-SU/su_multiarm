@@ -2531,3 +2531,61 @@ and a pinned engine clock. None of the fixes has been re-run on that deployment 
   archive of `9bebebf` in an isolated venv (non-editable, package imported from site-packages):
   1826 passed, 582 skipped, 0 failed, 0 errors; the gold-set tests skip there (no communities
   extra), so the new contract tests are established in the project venv only.
+
+## Live-deployment follow-ups: rankings by source counts, rendered ranking answers — 2026-11-04 (branch `v2/logs`, base `84bf49d`)
+
+Evidence level: **synthetic and mocked**. Both defects were seen on a real deployment ("which
+service is failing the most" left out a service whose errors were almost all unparsed; pure
+ranking answers read "No matching evidence was retrieved."). They are reproduced here only with
+the synthetic 10-day gold set composed through the real pipeline (fake source, sqlite backend, hash
+embedder) and a scripted generator (no model called). Neither fix has been re-run on that
+deployment yet.
+
+- `tests/contract/test_logs_rendered_answers.py` (new, 15). A gold variant plants 300 ERROR lines
+  in a line style no pattern reads in the token-only service for one tenant on D10
+  (`GoldSpec.error_flood`). Before the fix (reproduced at `84bf49d` with a scratch script) that
+  service ranked last of three by parsed lines (3) while the rendering listed 301 source-counted
+  unparsed lines. Now `log_top` by service at ERROR+FATAL ranks it first with its source count (304,
+  equal to a recount of the plan), parsed lines and unparsed share alongside, `ranked_by:
+  source_counts`, "ranked by source counts (the parse is incomplete)", `bounded`; the whole ranking
+  equals the plan's source counts; `top_n: 1` keeps it; by tenant the planted tenant ranks first; a
+  call without `by` behaves like `by: service`; a signature ranking keeps the parsed rows and names
+  the unparsed share and the service; a complete parse and an `owner: reviewed` filter keep the
+  parsed ranking. Answers: without a generator (rules and cascade) the answer text equals the log
+  aggregate's rendering and cites it; with a scripted generator a sentence restating rendered
+  numbers is appended (rules and cascade), a sentence with a foreign number is dropped
+  (`answer_number_mismatch`, `strip`), two sentences are dropped, a refused budget skips it; with an
+  evidence budget too small for the aggregate (the live failure: the aggregate was omitted and the
+  generator saw nothing) the answer is the rendering, never "No matching evidence".
+- `tests/unit/test_rendered_answer_contract.py` (new, 8): `numbers_outside` (digits, decimals,
+  dates, number words), `labelled`, `rendered_answer` claims/citations, kept/dropped narratives,
+  `fail` mode raising, refused aggregates `insufficient_evidence`.
+- Changed by decision (4 existing tests updated, same edge cases): FATAL by tenant on D9 and FATAL
+  by service on D8 (only unparsed FATAL lines) now rank by source counts (the D8 answer was "No
+  FATAL-level lines in the parsed rows …" and is now svc-legacy with 1 source line, 0 parsed,
+  bounded); the combined ERROR+FATAL count query ranks ERROR+FATAL by source counts while FATAL or
+  ERROR alone (not separable from it) keep the parsed ranking; the llm-planner parity test expects
+  the source ranking.
+- Persona-evaluation follow-ups (same evidence level; the categories were read from the private
+  evaluation report, no question text, names or numbers copied). `tests/unit/test_contract_labelled_counts.py`
+  (new, 12): labelled counts ("approximately", "about", "at least", "in the parsed rows",
+  "bounded") on approximate and bounded aggregates pass; unlabelled counts abstain; a labelled
+  wrong number is `answer_number_mismatch`; a dropped predicate, a complete list and an absence
+  still abstain; sentence boundaries keep identifiers and decimals whole, and a strip around
+  `gen.error_word`-style identifiers leaves only whole sentences (the old splitter cut at the dot,
+  which matches the garbled "… were gen." texts). `tests/unit/test_log_intents_persona_fixes.py`
+  (new, 13): customers/clients/accounts rank by tenant; a tenant reaches `log_trend` and
+  `log_compare`; increase/drop/change/worse questions are comparisons; later-first periods compile
+  in date order. `tests/contract/test_logs_rendered_answers.py` (+2): a tenant per-day question and
+  an "increase … compared to …" question on the Ask path keep the tenant, equal a recount of the
+  plan and render the change earlier → later. `test_compare_two_days` (3 cases) now expects date
+  order and the signed change (changed by decision). Whether the deployment's truncated texts were
+  also partly `max_tokens` cut-offs was not measured (the evaluation stores answers cut at 300
+  characters); the splitter defect alone reproduces the observed fragments.
+- Not done: a re-prompt repair of planner schema violations (the slice rules forbid repair and
+  fallback without an owner decision); the planner still abstains with `schema_violation`.
+- Full suite (project venv, `regex` engine): `not external` **2523 passed, 99 skipped, 0 failed**
+  (was 2473 passed, 99 skipped at `84bf49d`). ruff clean. Schema unchanged (`write_all` no diff).
+  Fresh `[dev]`-only install of the archive of `af9dffd` (isolated venv, non-editable): **1859
+  passed, 736 skipped, 0 failed, 0 errors** (skips: extras not installed — regex/re2 pattern
+  engines, communities, backend clients, api).

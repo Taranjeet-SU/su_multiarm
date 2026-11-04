@@ -2130,7 +2130,18 @@ single-level count query (e.g. `counts: {fatal: {levels: [FATAL], tokens: [fatal
 level operators ask about, so each level is checked on its own. `log_top metric: error_rate` divides
 the source counts of the levels by the unit's source total (`unit_day` `lines_total`) and refuses
 when no count query counts exactly those levels. With `index_name.service_suffix: numeric`,
-`log_top`/`log_tenants` take `deployment_id` and `by: deployment`.
+`log_top`/`log_tenants` take `deployment_id` and `by: deployment`. A `log_top` ranking by service,
+tenant or deployment at asked levels ranks by the source counts when the parse is incomplete
+(`ranked_by: source_counts`; rows carry `lines` = source lines, `lines_parsed`, `lines_unparsed`,
+`unparsed_share`); this needs count queries whose sum is exactly the asked levels (a single-level
+query per level, or one over exactly the set). A signature ranking keeps the parsed rows and names
+the services with the most unparsed lines. An answer whose evidence is only such aggregates is the
+deterministic rendering (no configuration); with a `generator` role, one sentence restating the
+rendering's numbers may follow it (one extra generator call per such answer, under the run budget).
+`log_trend` and `log_compare` take `tenant`; `log_compare` always compares its periods in date
+order. In the rules grammar "customers", "clients" and "accounts" mean tenants. A deployment's
+`few_shot_file` should include tenant ("which customers …") and comparison examples; the context
+pack's rules state both regardless of the file.
 
 ## Serving
 

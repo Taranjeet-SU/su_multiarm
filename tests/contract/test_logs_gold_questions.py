@@ -77,8 +77,13 @@ def test_row_count_order_differs_from_sum_order(gold):
 def test_fatal_tenants_ranked(gold):
     engine, _ = gold
     out = tool(engine, "log_top", by="tenant", level=["fatal"], window="yesterday")
-    assert [(r["tenant"], r["lines"]) for r in out.rows] == [("t01", 2), ("t03", 2)]
-    assert "FATAL-level lines" in out.rendering
+    # fix5: the parse misses svc-legacy's FATAL lines, so the tenants rank by the source counts
+    source = Counter(e.tenant for e in select(EVENTS, days=[AS_OF - timedelta(days=1)], level="FATAL"))
+    parsed = Counter(e.tenant for e in select(EVENTS, days=[AS_OF - timedelta(days=1)], level="FATAL", status="parsed"))
+    assert out.ranked_by == "source_counts"
+    assert [(r["tenant"], r["lines"], r["lines_parsed"]) for r in out.rows] == sorted(((t, n, parsed[t]) for t, n in source.items()), key=lambda r: (-r[1], -r[2], r[0]))
+    assert [r["tenant"] for r in out.rows] == ["t01", "t03", "t02", "t04"]
+    assert "by source FATAL lines, ranked by source counts" in out.rendering
     # the parsed rows miss svc-legacy's unparsed FATAL lines: bounded, never exact
     assert out.status == "bounded" and out.exactness == "bounded" and "exact." not in out.rendering
 
@@ -116,8 +121,10 @@ def test_no_parsed_fatal_but_source_counts_is_never_none_exact(gold):
     engine, _ = gold
     day = day_of(SPEC, 8)
     out = tool(engine, "log_top", by="service", level=["fatal"], start=day.isoformat(), end=day.isoformat())
-    assert out.rows == [] and out.status == "bounded" and out.exactness == "bounded"
-    assert out.rendering.startswith("No FATAL-level lines in the parsed rows for index date 2026-03-08")
+    # fix5: ranked by the source counts, the unparsed service is the answer, not "no lines"
+    assert out.ranked_by == "source_counts" and out.status == "bounded" and out.exactness == "bounded"
+    assert [(r["service"], r["lines"], r["lines_parsed"], r["unparsed_share"]) for r in out.rows] == [("svc-legacy", 1, 0, 1.0)]
+    assert out.rendering.startswith("Top 1 service by source FATAL lines, ranked by source counts (the parse is incomplete) for index date 2026-03-08")
     assert "svc-legacy t01: 1 lines containing 'fatal' (token_match, approximate), 1 unparsed" in out.rendering
     assert out.rendering.endswith("bounded.") and "exact" not in out.rendering.replace("approximate", "")
     assert [(r["service"], r["tenant"], r["lines_source"], r["lines_answered"]) for r in out.source_counts] == [("svc-legacy", "t01", 1, 0)]
@@ -265,8 +272,12 @@ def test_compare_two_days(gold, pair):
     engine, _ = gold
     first, second = (day_of(SPEC, n).isoformat() for n in pair)
     out = tool(engine, "log_compare", periods=[first, second], service="svc-api", level=["error"])
-    expected = [len(select(EVENTS, days=[day_of(SPEC, n)], service="svc-api", level="ERROR")) for n in pair]
-    assert [r["lines"] for r in out.rows] == expected and [r["period"] for r in out.rows] == [first, second]
+    # fix5: periods named later-first are compared in date order; the change is earlier -> later
+    ordered = sorted(pair)
+    expected = [len(select(EVENTS, days=[day_of(SPEC, n)], service="svc-api", level="ERROR")) for n in ordered]
+    assert [r["lines"] for r in out.rows] == expected and [r["period"] for r in out.rows] == sorted([first, second])
+    earlier, later = (day_of(SPEC, n).isoformat() for n in ordered)
+    assert f"(change from {earlier} to {later}: {expected[1] - expected[0]:+d})" in out.rendering
 
 
 # --- tenants (basis) ----------------------------------------------------------------------------------

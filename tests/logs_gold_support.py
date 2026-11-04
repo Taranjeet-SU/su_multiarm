@@ -77,19 +77,20 @@ class Clock:
         return self.value
 
 
-def build_gold(tmp: Path, *, days: list[date] | None = None, data: dict[str, Any] | None = None) -> tuple[Engine, LogsPipeline, dict[str, Any]]:
-    """Pull every gold day except the missing one, compose once (as of D10) and return the engine."""
+def build_gold(tmp: Path, *, days: list[date] | None = None, data: dict[str, Any] | None = None, spec: GoldSpec = SPEC) -> tuple[Engine, LogsPipeline, dict[str, Any]]:
+    """Pull every gold day except the missing one, compose once (as of D10) and return the engine
+    (``spec``: a variant plan, e.g. with an ``error_flood`` plant)."""
     write_gold_library(tmp / "patterns")
     cfg = validate_config(data or gold_config(tmp))
-    events = plan(SPEC)
-    found, mappings = indices(SPEC, events)
+    events = plan(spec)
+    found, mappings = indices(spec, events)
     cluster = FakeLogCluster(indices=found, mappings=mappings)
     engine = Engine(cfg)
     source = build_source("gold", cfg.sources["gold"], env=ENV, http_transport=cluster.transport())
     source._rate_limiter = no_wait()
     pipe = LogsPipeline(cfg, source=source, write_path=engine.write_path, redactor=redact, now=Clock(AS_OF))
     library = pipe.library()
-    for day in days or pulled_days(SPEC):
+    for day in days or pulled_days(spec):
         pipe.pull(day, library)
     composed = pipe.compose(AS_OF, library)
     return engine, pipe, composed.report()
