@@ -51,7 +51,9 @@ from .logs_parse import PARTITION_FORMAT
 from .partitions import FilePartitionStore, PartitionManifest
 from .rollups import DayInputs, day_documents, window_documents
 
-COMPOSE_FORMAT = 1
+# 2: day documents carry ``deployment_id`` (fix4); a new format changes the compose identity and the
+# day-document cache key, so a recompose rebuilds the day documents instead of reusing format-1 ones
+COMPOSE_FORMAT = 2
 DERIVED = "derived"
 
 

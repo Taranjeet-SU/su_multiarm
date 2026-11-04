@@ -23,6 +23,7 @@ overlay:
       - {name: tenant, type: string, groupable: true, listable: true}
       - {name: env, type: string, groupable: true, listable: true}
       - {name: deployment, type: string, groupable: true, listable: true}
+      - {name: deployment_id, type: string, groupable: true, listable: true}
       - {name: service, type: string, groupable: true, listable: true}
       - {name: level, type: string, groupable: true, listable: true}
       - {name: status, type: enum, enum_values: [parsed, noise, unparsed, format_only, timeout, provisional, model_line], groupable: true}

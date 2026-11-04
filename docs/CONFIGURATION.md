@@ -2097,7 +2097,7 @@ serving:
 | `logs.compose.endpoints.max_per_service` | 500 | endpoint templates kept per (day, unit); the rest fold into `__other__` (row `approximate`) |
 | `logs.communities.co_firing` | as above | lift over cells, per tenant; components above `split_above` signatures are split by the deterministic Louvain constructor |
 | `logs.intents.enabled` | `false` | typed log intents for every decision agent, the log tools, and the scope guard; requires the analytics kinds and `exemplars: per_tenant` |
-| `logs.intents.default_window` | `today` | the window when a question or tool call names none; anchored on the latest served day when today has no composed data (stated in the rendering) |
+| `logs.intents.default_window` | `today` | the window when a question or tool call names none; anchored on the latest served day when today has no composed data (stated in the rendering). Only a caller's `as_of` disables the anchor: the engine's clock default (Ask, stream, planner) does not |
 | `logs.intents.planner_context` | `true` | the llm planner (alone or in a cascade) gets the logs context pack: what each arm stores, a pattern-library summary, served dates, value vocabularies, the intents with input schemas, few-shot examples |
 | `logs.intents.planner_context_max_chars` | `24000` | JSON size bound of the pack; lists are cut in a fixed order and named in `truncated` |
 | `logs.intents.cascade_to_planner` | `true` | in a cascade, when the rules find no log intent the llm stage plans (earlier stages skipped, traced) |
@@ -2122,9 +2122,15 @@ logs source. Tools (`tools.enabled`): `log_top`, `log_new`, `log_affected`, `log
 `incidents`, `graph_neighbourhood`; each takes its typed input model on `POST /v2/tools/{name}` and
 on MCP, and returns rows, exactness, basis, `source_unavailable` days and a deterministic `rendering`.
 Level questions also return `source_counts` (the source's own per-unit level counts with their
-basis and the unparsed share; see ARCHITECTURE "Level questions against the source's counts"), so
-define a single-level count query (e.g. `counts: {fatal: {levels: [FATAL], tokens: [fatal]}}`) for
-every level operators ask about.
+basis and the unparsed share; see ARCHITECTURE "Level questions against the source's counts"). A
+level is cross-checked by its single-level count query, else by a query over exactly the asked
+levels, else by the smallest query that includes it (its other levels are compared too); a level no
+query covers is `bounded` whenever lines of the same units have no parsed level. Define a
+single-level count query (e.g. `counts: {fatal: {levels: [FATAL], tokens: [fatal]}}`) for every
+level operators ask about, so each level is checked on its own. `log_top metric: error_rate` divides
+the source counts of the levels by the unit's source total (`unit_day` `lines_total`) and refuses
+when no count query counts exactly those levels. With `index_name.service_suffix: numeric`,
+`log_top`/`log_tenants` take `deployment_id` and `by: deployment`.
 
 ## Serving
 

@@ -2489,3 +2489,45 @@ data only, and none of the fixes has been re-run on that deployment. No model wa
   `regex` pattern engine; google-re2 is not installed there, so RE2-only tests skip). Fresh
   `[dev]`-only install of the `git archive` of the branch head in an isolated venv (non-editable;
   the package imported from site-packages): 1814 passed, 563 skipped, 0 failed, 0 errors. ruff clean.
+
+## Second real-deployment smoke fixes: Ask-path day, FATAL-only source counts, error rate, deployment ids — 2026-11-04 (branch `v2/logs`, base `6f8e6a4`)
+
+Evidence level: **synthetic and mocked**. The four defects were reported by a smoke test on a real
+deployment; they are reproduced here only with the synthetic 10-day gold set composed through the
+real pipeline (fake source, sqlite backend, hash embedder), a scripted planner (no model called)
+and a pinned engine clock. None of the fixes has been re-run on that deployment yet.
+
+- `tests/contract/test_logs_ask_path_fixes.py` (new, 17). Ask path with the engine clock pinned
+  after the last gold day: an undated "which services had FATAL"/"… ERROR" through `Engine.answer`
+  (rules and cascade) and `answer_stream` carries no clock `as_of`, answers the latest served day and
+  says "latest available day: …"; "yesterday" reads the clock (answered when served); "yesterday"
+  and "today" after the last served day are `source_unavailable`, `bounded`, rendered "No composed
+  data for index date <that day>" plus the latest available day (never shifted); a caller's `as_of`
+  still disables the anchor; the cascade reaching the scripted planner (with and without the planner
+  copying `time_anchor` into `as_of`) anchors the same way, and the payload says
+  `time_anchor_source: clock`. A second gold build models the deployment's count setup (one
+  `failures` query over ERROR+FATAL, one WARN query, no single-level FATAL query) and splits
+  t01/svc-api into two numbered deployments: FATAL alone on D8 is "No FATAL-level lines in the parsed
+  rows … bounded" with `coverage: superset` source counts (the base code looked up single-level queries
+  only, so this setup had no cross-check; not re-run on the base); FATAL, ERROR, ERROR+FATAL, WARN and WARN+FATAL each use the
+  unit source counts (bounded exactly where svc-legacy's unparsed FATAL lines are, WARN exact); the
+  error rate works with the combined query; `deployment_id` is on `unit_day` (a pinned aggregate by
+  deployment equals the split), `log_top by: deployment`, the `deployment_id` filter, the error rate
+  by deployment and `log_tenants by: deployment` match a recount of the plan.
+- `tests/contract/test_logs_gold_questions.py` (+2 net). The error rate is now source ERROR+FATAL
+  lines over source total lines per service (svc-api 36/110 = 32.73% on D9, svc-legacy 7/47 token
+  match, approximate) and equals a recount of the plan; on the capped day the tenant totals are the
+  source totals (greater than what was pulled) and a level-field-only rate is exact; a WARN rate
+  without a WARN count query is refused. Changed by decision: WARN answers on the two days whose
+  token-only units hold lines with no parsed level are now `bounded` with that share (were exact);
+  the old error-rate test (parsed lines / pulled lines) is replaced.
+- `tests/unit/test_log_intents_detect.py` (+12 net): error-rate scopes read `unit_day` count and
+  total fields only, refusal without an exact count query (a superset query would over-count),
+  `count_fields` preference, `count_plan` for eight level/query combinations, deployment filter and
+  grouping (and "deployments"/"instances" in the rules grammar), and `detect(pin=False)` keeping a
+  clock day out of the call.
+- Full suite: `not external` 2473 passed, 99 skipped, 0 failed (was 2442 passed, 99 skipped at
+  `6f8e6a4`; project venv, `regex` engine). ruff clean. Fresh `[dev]`-only install of the
+  archive of `9bebebf` in an isolated venv (non-editable, package imported from site-packages):
+  1826 passed, 582 skipped, 0 failed, 0 errors; the gold-set tests skip there (no communities
+  extra), so the new contract tests are established in the project venv only.

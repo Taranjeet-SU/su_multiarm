@@ -38,7 +38,7 @@ ARM_STORES: dict[str, str] = {
 STRUCTURED_KINDS: dict[str, str] = {
     "log_day": "lines per day x tenant x env x service x level x status x signature (basis level_field or format_group)",
     "log_hour": "the same per UTC hour",
-    "unit_day": "the source's own counts per day x unit: lines_total, count_<query> with basis_<query> (level_field or token_match)",
+    "unit_day": "the source's own counts per day x unit (tenant, env, service, deployment_id): lines_total, count_<query> with basis_<query> (level_field or token_match)",
     "signature_day": "lines per day x unit x signature",
     "endpoint_day": "lines, latency sum/count/max and per-row p95 per endpoint, method and status class",
     "exception_day": "lines per exception class",
@@ -47,7 +47,7 @@ STRUCTURED_KINDS: dict[str, str] = {
     "incident": "co-firing incidents with their hours, signatures and statistics",
 }
 GRAPH_EDGE_KINDS = ("native_link", "fact", "co_occurrence")
-VOCABULARY_FIELDS = ("service", "tenant", "env", "level")
+VOCABULARY_FIELDS = ("service", "tenant", "env", "level", "deployment_id")
 _LIBRARY_CACHE: dict[tuple[str, tuple[tuple[str, float], ...]], list[dict[str, Any]]] = {}
 
 

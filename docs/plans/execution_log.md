@@ -1850,3 +1850,54 @@ Follow-ups:
 - RE2 runs of the new redactors and pseudonymisation tests (google-re2 not installed here).
 - `log_tenants` takes one level, so "tenants with errors" asks ERROR only; a multi-level variant.
 - A browser (Playwright) pass of the Enter-to-submit change.
+
+### 2026-11-04 — Logs fix4: second real-deployment smoke (Ask-path day, FATAL-only source counts, error_rate, deployment_id) — DONE (synthetic/mocked)
+
+Base `v2/logs` at `6f8e6a4`. Commits: `9bebebf` (code, tests, CHANGELOG, ARCHITECTURE,
+CONFIGURATION) and the docs commit (VALIDATION, this entry). Synthetic reproductions only.
+
+Done:
+1. `DecisionRequest.as_of_source` (`request` | `clock`, set by `Engine._decide`); `pinned_as_of()`.
+   Rules `detect(pin=False)` and the llm planner keep a clock day out of the log intent's arguments
+   (a planner echo of `time_anchor` is dropped; the payload carries `time_anchor_source` and the
+   log rule says not to copy it). Undated Ask/stream/planner questions anchor on the latest served
+   day; relative days read the clock; an unserved day is `source_unavailable` with
+   `latest_available_day` and "No composed data for index date …". `Engine._clock` is the one
+   clock (tests pin it).
+2. `runtime/log_tools.count_plan` + `source_counts`: every level/mix is cross-checked (single-level,
+   exact-set, or smallest superset query, `coverage`); uncovered levels give `unknown_level` and
+   `bounded` when units have lines with no parsed level. `bounded_by` lists every reason.
+3. `log_top metric: error_rate` compiles over `unit_day`: source count fields / `lines_total`,
+   units without them excluded and named, refusal when no count query counts exactly the levels;
+   per-row `basis`/`rate_exactness`, output exact or approximate by basis.
+4. `deployment_id` on unit_day/signature_day and the analytics kinds; profile field; `log_top`
+   (`by: deployment`, `deployment_id`), `log_tenants` (`by`, `deployment_id`), `log_trend`
+   (`deployment_id`); rules "deployments"/"instances"; planner pack vocabulary. `COMPOSE_FORMAT` 2.
+
+Deviations:
+- A scope groups by two fields at most, so a by-deployment answer groups (service, deployment_id)
+  and its source counts are per (service, deployment_id), not per tenant.
+- For a level no count query covers, the plan's "use unit source counts" is read as: compare with
+  the units' lines of unknown level (and their share of `lines_total`); this makes WARN answers
+  bounded on gold days whose token-only units hold raw lines (two existing parametrised cases).
+- A superset query (ERROR+FATAL for a FATAL question) bounds the answer when the source counts more
+  ERROR+FATAL lines than the rows: an ERROR-only answer is bounded by svc-legacy's unparsed FATAL
+  lines too, because the combined count cannot separate them.
+- `error_rate` refuses rather than excluding units when a level has no exact count query (the field
+  is missing for every unit); units lacking `lines_total` or a count field are excluded and named.
+- The error rate's exactness follows its basis, not `unit_day` `row_exactness`: a capped unit's
+  source counts are exact even though its pulled rows are sampled.
+- `COMPOSE_FORMAT` bumped 1 → 2 (not asked): without it the day-document cache would serve cached
+  rows without `deployment_id` after an upgrade.
+- When source counts cannot be read (backend error) a level answer is now `bounded` (was a note only).
+
+Tests: `not external` 2473 passed, 99 skipped (was 2442 / 99). ruff clean. Schema unchanged
+(`write_all` produced no diff). Fresh `[dev]`-only install of the archive of `9bebebf`
+(isolated venv, non-editable, package from site-packages): 1826 passed, 582 skipped, 0 failed, 0
+errors (the gold-set contract tests skip there: no communities extra).
+
+Follow-ups:
+- Re-run the smoke on the deployment (recompose once for `deployment_id`), and the persona eval.
+- `log_tenants` still takes one level; `log_coverage`/`log_endpoints` do not take `deployment_id`.
+- The token phrase in `source_counts` uses the level names as the words; the query's own `tokens`
+  are not in the compile context.

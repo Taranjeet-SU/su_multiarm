@@ -45,8 +45,15 @@ def test_top_services_by_level(gold, day, level):
     out = tool(engine, "log_top", by="service", level=[level.lower()], start=day.isoformat(), end=day.isoformat())
     expected = ranked(lines_by(select(EVENTS, days=[day], level=level), "service"))
     assert [(r["service"], r["lines"]) for r in out.rows] == expected
-    assert out.exactness == "exact" and out.status == ("answered" if expected else "empty")
     assert f"index date {day.isoformat()} (index_date, UTC)" in out.rendering
+    # WARN has no source count query: lines whose level the parse could not read (the token-only
+    # service's raw lines) may be WARN, so such a day is bounded with that share, never exact
+    unknown = len([e for e in select(EVENTS, days=[day]) if e.values.get("raw")]) if level == "WARN" else 0
+    if unknown:
+        assert out.exactness == "bounded" and out.status == "bounded" and out.unknown_level["lines_unknown_level"] == unknown
+        assert "no source count query covers WARN" in out.rendering and not out.rendering.endswith("exact.")
+    else:
+        assert out.exactness == "exact" and out.status == ("answered" if expected else "empty")
 
 
 @pytest.mark.parametrize("day", EXACT_DAYS)
@@ -125,7 +132,10 @@ def test_fully_parsed_levels_stay_exact_with_their_source_counts(gold):
     assert {(r["service"], r["tenant"]): r["lines_source"] for r in out.source_counts} == dict(expected)
     assert all(r["lines_answered"] == r["lines_source"] and r["lines_unparsed"] == 0 for r in out.source_counts)
     warn = tool(engine, "log_top", by="service", level=["warn"], window="yesterday")  # no WARN count query
-    assert warn.source_counts == [] and any("no single-level source count query for WARN" in n for n in warn.notes)
+    assert warn.source_counts == [] and warn.status == "bounded" and warn.unknown_level["lines_unknown_level"] == 3
+    assert any(n.startswith("no source count query covers WARN: 3 lines in 2 service/tenant units have no parsed level") for n in warn.notes)
+    quiet = tool(engine, "log_top", by="service", level=["warn"], service=["svc-api"], window="yesterday")
+    assert quiet.status == "answered" and quiet.exactness == "exact" and quiet.unknown_level["lines_unknown_level"] == 0
 
 
 def test_tenants_from_counts_report_the_unparsed_share(gold):
@@ -329,19 +339,48 @@ def test_coverage_equals_a_recount(gold):
 # --- error rate and the undated anchor (real-run fixes) -------------------------------------------
 
 
-def test_error_rate_ranks_services_by_failing_share_with_source_counts(gold):
+def source_rate(days, key="service", levels=("ERROR", "FATAL")):
+    """Source lines at ``levels`` over all source lines per group (every event is a source line;
+    the token-only service's raw FATAL lines are counted by its token query)."""
+    events = select(EVENTS, days=days)
+    failing = Counter(getattr(e, key) for e in events if e.level in levels)
+    total = Counter(getattr(e, key) for e in events)
+    return sorted(((s, n, total[s]) for s, n in failing.items()), key=lambda t: (-round(t[1] / t[2], 4), -t[1], t[0]))
+
+
+def test_error_rate_is_source_error_lines_over_source_total_lines(gold):
+    """Real-run fix: the rate divided the parsed ERROR/FATAL lines by the pulled lines (only the
+    pulled strata, capped), giving 94.5% for a 33% service. It now reads the source counts."""
     engine, _ = gold
     day = AS_OF - timedelta(days=1)
     out = tool(engine, "log_top", by="service", metric="error_rate", window="yesterday")
-    events = select(EVENTS, days=[day])
-    # the parse sees a level for every line except the token-only service's raw (unparsed) FATAL lines
-    failing = Counter(e.service for e in events if e.level in {"ERROR", "FATAL"} and not e.values.get("raw"))
-    total = Counter(e.service for e in events)
-    expected = sorted(((s, n, total[s]) for s, n in failing.items()), key=lambda t: (-round(t[1] / t[2], 4), -t[1], t[0]))
-    assert [(r["service"], r["lines"], r["lines_total"]) for r in out.rows] == expected
+    assert [(r["service"], r["lines"], r["lines_total"]) for r in out.rows] == source_rate([day])
     assert all(r["error_rate"] == round(r["lines"] / r["lines_total"], 4) for r in out.rows)
-    assert out.rendering.startswith("Top ") and "by error rate (ERROR, FATAL lines / all lines)" in out.rendering
-    assert {r["level"] for r in out.source_counts} == {"ERROR", "FATAL"} and out.status == "bounded"  # svc-legacy's unparsed FATAL
+    by_service = {r["service"]: r for r in out.rows}
+    assert by_service["svc-legacy"]["basis"] == "token_match" and by_service["svc-legacy"]["rate_exactness"] == "approximate"
+    assert by_service["svc-api"]["basis"] == "level_field" and by_service["svc-api"]["rate_exactness"] == "exact"
+    assert "by error rate (source ERROR, FATAL lines / source total lines, unit_day source counts)" in out.rendering
+    assert "svc-legacy: 14.89% (7 of 47, token_match, approximate)" in out.rendering
+    assert out.exactness == "approximate" and out.methods == ["token_match"] and out.rendering.endswith("approximate (token_match).")
+    # the source counts are not limited by the parse: svc-legacy's unparsed FATAL lines are in the rate
+    assert out.status == "answered" and {r["level"] for r in out.source_counts} == {"ERROR", "FATAL"}
+
+
+def test_error_rate_of_a_capped_unit_divides_by_the_source_total_not_the_pulled_lines(gold):
+    engine, _ = gold
+    out = tool(engine, "log_top", by="tenant", metric="error_rate", start=CAPPED_DAY.isoformat(), end=CAPPED_DAY.isoformat())
+    assert [(r["tenant"], r["lines"], r["lines_total"]) for r in out.rows] == source_rate([CAPPED_DAY], "tenant")
+    t04 = next(r for r in out.rows if r["tenant"] == "t04")
+    pulled = sum(r["lines_pulled"] for r in tool(engine, "log_coverage", by="tenant", start=CAPPED_DAY.isoformat(), end=CAPPED_DAY.isoformat()).rows if r["tenant"] == "t04")
+    assert t04["lines_total"] > pulled  # the capped unit's source total, not what was pulled
+    exact = tool(engine, "log_top", by="tenant", metric="error_rate", service=["svc-api"], start=CAPPED_DAY.isoformat(), end=CAPPED_DAY.isoformat())
+    assert exact.exactness == "exact" and exact.methods == [] and exact.rendering.endswith("exact.")
+
+
+def test_error_rate_refuses_without_a_count_query_for_a_level(gold):
+    engine, _ = gold
+    out = tool(engine, "log_top", by="service", metric="error_rate", level=["warn"], window="yesterday")
+    assert out.status == "refused" and "WARN" in out.refusal and "not a denominator" in out.refusal and not out.rows
 
 
 def test_an_undated_question_reads_the_latest_served_day_and_says_so(gold):

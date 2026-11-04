@@ -8,7 +8,8 @@ endpoint names in one header chunk (§3.4.2).
 =========================== ======================= =============================================
 kind                        one per                 metadata
 =========================== ======================= =============================================
-``unit_day``                day x unit              date, tenant, env, service, lines_total,
+``unit_day``                day x unit              date, tenant, env, service, deployment_id
+                                                    (numeric index suffix, when parsed), lines_total,
                                                     count_<query>, basis_<query>, lines_*,
                                                     row_exactness, basis, method
 ``signature_day``           day x unit x signature  date, tenant, env, service, signature_id,
@@ -110,6 +111,7 @@ def day_documents(dataset: str, day: DayInputs, *, signature_hour: bool = False)
             "tenant": attrs.get("tenant"),
             "env": attrs.get("env"),
             "service": attrs.get("service"),
+            "deployment_id": attrs.get("deployment_id"),  # numeric service suffix; dropped when absent
             "lines_total": unit["lines_total"],
             "lines_pulled": unit["pulled"],
             "lines_parsed": unit["statuses"]["parsed"],
@@ -138,6 +140,7 @@ def day_documents(dataset: str, day: DayInputs, *, signature_hour: bool = False)
             "tenant": attrs.get("tenant"),
             "env": attrs.get("env"),
             "service": attrs.get("service"),
+            "deployment_id": attrs.get("deployment_id"),
             "signature_id": row["signature_id"],
             "category": row["category"],
             "lines": row["lines"],

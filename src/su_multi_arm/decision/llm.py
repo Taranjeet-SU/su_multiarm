@@ -180,6 +180,7 @@ class LlmAgent(DecisionAgent):
             "explicit_scope": request.scope.model_dump(mode="json") if request.scope else None,
             "detected_intents": intents.kinds(),
             "time_anchor": request.as_of.isoformat() if request.as_of else None,
+            "time_anchor_source": request.as_of_source if request.as_of else None,
             "timezone": schema.timezone,
             "max_steps": min(capabilities.max_steps, self.config.max_steps),  # type: ignore[attr-defined]
         }
@@ -191,7 +192,9 @@ class LlmAgent(DecisionAgent):
                 "Log questions: a structured step names one of log_intents in `log_intent` and gives its arguments as "
                 "field/value pairs in `log_args` (repeat a field for a list); never write a scope over log documents. "
                 "`log_context` (when present) describes the stored data, the served dates, known values, each intent's input "
-                "schema and example question -> intent calls."
+                "schema and example question -> intent calls. Give `window` (or `start`/`end`) only when the question names "
+                "a day or a period; never copy `time_anchor` into `as_of`: a question without a date is answered for the "
+                "latest served day, and a relative word (today, yesterday) is read against the clock."
             )
             if callable(capabilities.log_context):
                 payload["log_context"] = capabilities.log_context()
@@ -308,8 +311,13 @@ class LlmAgent(DecisionAgent):
                 args.setdefault(pair.field, []).append(pair.value)
             else:
                 args[pair.field] = pair.value
-        if request.as_of is not None:
-            args.setdefault("as_of", request.as_of.isoformat())
+        pinned = request.pinned_as_of()
+        if pinned is not None:
+            args.setdefault("as_of", pinned.isoformat())
+        elif request.as_of is not None and str(args.get("as_of") or "") == request.as_of.isoformat():
+            # the planner echoed the engine's clock default (``time_anchor``): not a day the caller
+            # named, so the undated question keeps the latest-served-day anchor
+            args.pop("as_of")
         try:
             call = LogIntentCall(intent=step.log_intent, args=args)  # type: ignore[arg-type]
         except (ValidationError, ValueError) as error:

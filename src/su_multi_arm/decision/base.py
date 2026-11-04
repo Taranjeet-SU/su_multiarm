@@ -59,6 +59,14 @@ class DecisionRequest(StrictModel):
     # Anchor day for relative calendar expressions, in ``metadata_schema.timezone`` (the engine sets
     # it from ``SearchRequest.as_of`` or the clock). None: relative windows are refused.
     as_of: date | None = None
+    # Where ``as_of`` came from: ``request`` (the caller named the day) or ``clock`` (the engine's
+    # default). Only a caller-named day is pinned into a log intent's arguments; a clock default
+    # leaves an undated log question to the latest-served-day anchor (``log_intents.resolve_window``).
+    as_of_source: Literal["request", "clock"] = "request"
+
+    def pinned_as_of(self) -> date | None:
+        """The anchor day a log intent may carry: the caller's ``as_of`` only, never a clock default."""
+        return self.as_of if self.as_of_source == "request" else None
 
 
 class RetrievalStep(StrictModel):
@@ -319,7 +327,7 @@ class DecisionAgent:
             return [str(v) for v in records.values(ctx.generation, field, list(ctx.constraints()), 5000)]
 
         try:
-            call = detect(request.query, as_of=request.as_of, values=values)
+            call = detect(request.query, as_of=request.as_of, values=values, pin=request.as_of_source == "request")
         except ValueError as error:
             ctx.trace.event("log_intent_unrecognised", message=str(error))
             return None

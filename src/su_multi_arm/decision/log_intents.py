@@ -68,15 +68,19 @@ class LogWindow(StrictModel):
 
 
 class LogTopInput(LogWindow):
-    by: Literal["service", "signature", "tenant", "exception_class", "endpoint"] = "service"
+    # ``deployment``: one row per (service, deployment_id), the instances of a service told apart
+    # by the index-name grammar's numeric suffix (``index_name.service_suffix: numeric``)
+    by: Literal["service", "signature", "tenant", "exception_class", "endpoint", "deployment"] = "service"
     level: list[str] | None = Field(default=None, max_length=5)
     service: list[str] | None = Field(default=None, max_length=50)
     tenant: str | None = None
+    deployment_id: list[str] | None = Field(default=None, max_length=50)
     top_n: int = Field(default=10, ge=1, le=100)
     extraction: Literal["any", "deterministic"] = "any"
     owner: Literal["any", "reviewed"] = "any"
-    # ``error_rate``: lines at ``level`` (default ERROR and FATAL) over all lines of the group, by
-    # service or tenant (deterministic rows: every pulled head counted once)
+    # ``error_rate``: the source's lines at ``level`` (default ERROR and FATAL, from the unit's count
+    # queries) over the source's total lines of the unit (``unit_day`` ``lines_total``), by
+    # service, tenant or deployment; never over the pulled lines
     metric: Literal["lines", "error_rate"] = "lines"
 
 
@@ -92,6 +96,7 @@ class LogAffectedInput(LogWindow):
 class LogTrendInput(LogWindow):
     signature_id: str | None = Field(default=None, max_length=256)
     service: str | None = None
+    deployment_id: str | None = None
     level: list[str] | None = Field(default=None, max_length=5)
     granularity: Literal["hour", "day"] = "day"
 
@@ -107,6 +112,8 @@ class LogCompareInput(StrictModel):
 class LogTenantsInput(LogWindow):
     service: str | None = None
     level: str = "fatal"
+    deployment_id: str | None = None
+    by: Literal["tenant", "deployment"] = "tenant"  # deployment: one row per (service, deployment_id)
 
 
 class LogAroundInput(StrictModel):
@@ -257,13 +264,34 @@ def _sum(field: str = "lines") -> Measure:
     return Measure(kind="sum", field=field)
 
 
+DEPLOYMENT_GROUP = ["service", "deployment_id"]
+
+
+def count_fields(levels: list[str], queries: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+    """The source count queries whose sum is exactly the lines at ``levels`` (lower case): one
+    query declared for that level set, else one single-level query per level. Returns the query
+    names and the levels no such query covers (a query over more levels would over-count)."""
+    wanted = sorted({lv.casefold() for lv in levels})
+    exact = next((name for name, lv in sorted(queries.items()) if sorted(lv) == wanted), None)
+    if exact is not None:
+        return [exact], []
+    names, missing = [], []
+    for level in wanted:
+        name = next((n for n, lv in sorted(queries.items()) if lv == [level]), None)
+        if name is None:
+            missing.append(level)
+        else:
+            names.append(name)
+    return names, missing
+
+
 def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
     args = call.typed_args()
     out = CompiledIntent(intent=call.intent, args=call.args)
     if call.intent == "log_top":
         assert isinstance(args, LogTopInput)
         window = out.window = resolve_window(args, ctx)
-        common = [window.predicate(), *_in("service", args.service), *_eq("tenant", args.tenant)]
+        common = [window.predicate(), *_in("service", args.service), *_eq("tenant", args.tenant), *_in("deployment_id", args.deployment_id)]
         if args.by == "exception_class":
             extra = [_deterministic()] if args.extraction == "deterministic" else []
             out.scopes["main"] = ScopeSpec(predicates=[_kind("exception_day"), *common, *extra], group_by=["exception_class"], measure=_sum(), order="desc", top_n=args.top_n)
@@ -276,16 +304,39 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
                 preds.append(Predicate(field="status_class", op="eq", value="5xx"))
             out.scopes["main"] = ScopeSpec(predicates=preds, group_by=["endpoint"], measure=_sum(), order="desc", top_n=args.top_n)
         elif args.metric == "error_rate":
-            if args.by not in {"service", "tenant"}:
-                out.refusal = "error_rate ranks services or tenants (by: service or tenant)"
+            if args.by not in {"service", "tenant", "deployment"}:
+                out.refusal = "error_rate ranks services, tenants or deployments (by: service, tenant or deployment)"
                 return out
-            levels = args.level or list(FAILURE_LEVELS)
-            base = [_kind("log_day"), *common, _deterministic()]
-            out.scopes["main"] = ScopeSpec(predicates=[*base, *_in("level", levels)], group_by=[args.by], measure=_sum())
-            out.scopes["total"] = ScopeSpec(predicates=base, group_by=[args.by], measure=_sum())
-            out.notes.append("error rate = lines at " + ", ".join(lv.upper() for lv in levels) + " / all lines of the group (deterministic rows)")
+            levels = sorted({lv.casefold() for lv in args.level or FAILURE_LEVELS})
+            names, missing = count_fields(levels, ctx.count_queries)
+            if missing:
+                # the pulled lines are only the pulled strata (capped): never a denominator
+                out.refusal = (
+                    "error_rate needs the source's own counts: no count query of the source counts exactly "
+                    + ", ".join(lv.upper() for lv in missing)
+                    + " (declare one per level under sources.<name>.counts); the pulled lines are not a denominator"
+                )
+                return out
+            group = DEPLOYMENT_GROUP if args.by == "deployment" else [args.by]
+            base = [_kind("unit_day"), *common]
+            # a unit counts only with its source total and every count it needs; the others are
+            # listed as excluded (``units`` vs ``units_complete``), never divided by pulled lines
+            complete = [*base, Predicate(field="lines_total", op="range", lower=0), *(Predicate(field=f"count_{n}", op="range", lower=0) for n in names)]
+            for i, name in enumerate(names):
+                out.scopes["main" if i == 0 else f"count_{name}"] = ScopeSpec(predicates=complete, group_by=group, measure=_sum(f"count_{name}"))
+            out.scopes["total"] = ScopeSpec(predicates=complete, group_by=group, measure=_sum("lines_total"))
+            out.scopes["units"] = ScopeSpec(predicates=base, group_by=group, measure=Measure(kind="count"))
+            out.scopes["units_complete"] = ScopeSpec(predicates=complete, group_by=group, measure=Measure(kind="count"))
+            for name in names:
+                out.scopes[f"basis_{name}"] = ScopeSpec(predicates=complete, group_by=[group[0], f"basis_{name}"], measure=Measure(kind="count"))
+            out.notes.append(
+                "error rate = source lines at "
+                + ", ".join(lv.upper() for lv in levels)
+                + f" (count queries {', '.join(names)}) / source total lines (unit_day lines_total), per unit summed by {args.by}"
+            )
         else:
-            field = {"service": "service", "tenant": "tenant", "signature": "signature_id"}[args.by]
+            field = {"service": "service", "tenant": "tenant", "signature": "signature_id"}.get(args.by)
+            group = DEPLOYMENT_GROUP if args.by == "deployment" else [field]
             preds = [_kind("log_day"), *common, *_in("level", args.level)]
             if args.by == "signature":
                 preds.append(_signed())
@@ -293,7 +344,7 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
                 preds.append(_deterministic())
             if args.owner == "reviewed":
                 preds.append(Predicate(field="pattern_owner", op="eq", value="user"))
-            out.scopes["main"] = ScopeSpec(predicates=preds, group_by=[field], measure=_sum(), order="desc", top_n=args.top_n)
+            out.scopes["main"] = ScopeSpec(predicates=preds, group_by=group, measure=_sum(), order="desc", top_n=args.top_n)
     elif call.intent == "log_new":
         assert isinstance(args, LogNewInput)
         window = out.window = resolve_window(args, ctx)
@@ -319,7 +370,7 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         assert isinstance(args, LogTrendInput)
         window = out.window = resolve_window(args, ctx)
         kind, key = ("log_hour", "ts_hour") if args.granularity == "hour" else ("log_day", "date")
-        preds = [_kind(kind), window.predicate(), *_eq("service", args.service), *_in("level", args.level)]
+        preds = [_kind(kind), window.predicate(), *_eq("service", args.service), *_eq("deployment_id", args.deployment_id), *_in("level", args.level)]
         if args.signature_id:
             preds += [_signed(), Predicate(field="signature_id", op="eq", value=args.signature_id)]
         else:
@@ -346,18 +397,20 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         window = out.window = resolve_window(args, ctx)
         level = args.level.casefold()
         query = next((name for name, levels in sorted(ctx.count_queries.items()) if levels == [level]), None)
+        group = DEPLOYMENT_GROUP if args.by == "deployment" else ["tenant"]
+        filters = [window.predicate(), *_eq("service", args.service), *_eq("deployment_id", args.deployment_id)]
         if query is not None:
             out.scopes["main"] = ScopeSpec(
-                predicates=[_kind("unit_day"), window.predicate(), *_eq("service", args.service), Predicate(field=f"count_{query}", op="range", lower=1)],
-                group_by=["tenant"],
+                predicates=[_kind("unit_day"), *filters, Predicate(field=f"count_{query}", op="range", lower=1)],
+                group_by=group,
                 measure=_sum(f"count_{query}"),
                 order="desc",
             )
             out.notes.append(f"source counts of the {query!r} count query (basis per row)")
         else:
             out.scopes["main"] = ScopeSpec(
-                predicates=[_kind("log_day"), window.predicate(), *_eq("service", args.service), Predicate(field="level", op="eq", value=level), _deterministic()],
-                group_by=["tenant"],
+                predicates=[_kind("log_day"), *filters, Predicate(field="level", op="eq", value=level), _deterministic()],
+                group_by=group,
                 measure=_sum(),
                 order="desc",
             )
@@ -476,9 +529,14 @@ def _window_text(question: str, anchor: date | None) -> str | None:
     return windows[0].text.strip() if windows else None
 
 
-def detect(question: str, *, as_of: date | None, values: Callable[[str], list[str]]) -> LogIntentCall | None:
+def detect(question: str, *, as_of: date | None, values: Callable[[str], list[str]], pin: bool = True) -> LogIntentCall | None:
     """The ``LogIntentCall`` a plain-language log question asks, or ``None``. ``values(field)``
-    lists the known values of a listable field (services, tenants, signatures)."""
+    lists the known values of a listable field (services, tenants, signatures).
+
+    ``pin``: ``as_of`` was named by the caller and is stored in the call's arguments. With
+    ``pin=False`` (``as_of`` is the engine's clock default) it only reads the question's window
+    words; the call carries none, so a relative window ("yesterday") resolves against the clock at
+    execution and a question without any date anchors on the latest served day."""
     q = question.strip()
     low = q.casefold()
     services = _known(q, values("service"))
@@ -490,7 +548,7 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
         words = words.replace(value.casefold(), " ")
     levels = sorted({lv for w in re.findall(r"[a-z]+", words) if w in _LEVEL_WORDS for lv in _LEVEL_WORDS[w]})
     window = _window_text(q, as_of)
-    base: dict[str, Any] = {"as_of": as_of.isoformat()} if as_of else {}
+    base: dict[str, Any] = {"as_of": as_of.isoformat()} if as_of and pin else {}
 
     def call(intent: str, **args: Any) -> LogIntentCall:
         return LogIntentCall(intent=intent, args={**base, **{k: v for k, v in args.items() if v is not None}})  # type: ignore[arg-type]
@@ -539,6 +597,8 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
     if re.search(r"\b(which|top|most|what)\b", low) and (levels or re.search(r"\b(signatures?|errors?|exceptions?|services?)\b", low)):
         if re.search(r"\bexceptions?\b", low):
             by = "exception_class"
+        elif re.search(r"\b(?:deployments?|instances?)\b", low):
+            by = "deployment"
         elif re.search(r"\btenants?\b", low):
             by = "tenant"
         elif re.search(r"\bservices?\b", low) and not services:
@@ -547,7 +607,7 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
             by = "signature"
         top = re.search(r"\btop\s+(\d{1,3})\b", low)
         rate = bool(re.search(r"\b(?:error|failure|fail)\s+rates?\b|\brates?\s+of\s+(?:errors|failures)\b", low))
-        if rate and by not in {"service", "tenant"}:
+        if rate and by not in {"service", "tenant", "deployment"}:
             by = "service"
         return call(
             "log_top",

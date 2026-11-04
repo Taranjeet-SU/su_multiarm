@@ -921,28 +921,60 @@ log kinds is refused (`intent_required`). The engine executes an intent step wit
 `runtime/log_tools.run_intent`, the function behind `Engine.call_tool`, `POST /v2/tools/{name}` and
 the MCP tools, so every surface returns the same rows and rendering.
 
-**Level questions against the source's counts.** A level question (`log_top` by service, tenant
-or signature with `level`, `log_trend`/`log_compare` with `level`, `log_tenants`) also reads the
-source's own per-unit counts (`unit_day` `count_<query>` of a single-level count query) in the same
-window and filters. The output's `source_counts` lists, per (service, tenant, level),
-`lines_source` with its `basis` (`level_field` exact; `token_match` labelled approximate),
-`lines_answered` (what the rows count), `lines_parsed` and `lines_unparsed`. When the source counts
+**Level questions against the source's counts.** A level question (`log_top` by service, tenant,
+signature or deployment with `level`, `log_trend`/`log_compare` with `level`, `log_tenants`) also
+reads the source's own per-unit counts (`unit_day` `count_<query>`) in the same window and filters.
+Every asked level is cross-checked (`runtime/log_tools.count_plan`): by its single-level count query
+(`coverage: level`); the remaining levels together by a query over exactly that set (`levels`);
+otherwise by the smallest query that includes the level (`superset`, e.g. FATAL against a query that
+counts ERROR and FATAL together: the rows are then compared at all of that query's levels, since its
+FATAL share is not separable). The output's `source_counts` lists, per (service, tenant), or
+(service, deployment_id) for a question by deployment, `lines_source` with its `basis`
+(`level_field` exact; `token_match` labelled approximate), `query`, `coverage`, `lines_answered`
+(what the rows count at those levels), `lines_parsed` and `lines_unparsed`. When the source counts
 more lines than the rows do, the answer is `bounded` with that reason and the rendering lists the
 source counts ("No FATAL-level lines in the parsed rows …; source counts: svc-x t01: 3 lines
 containing 'fatal' (token_match, approximate), 3 unparsed; bounded: …"): never "none … exact" when
-the parse missed lines the source counted. A level without a single-level count query is named in
-`notes` (not cross-checked).
+the parse missed lines the source counted. A level that no count query covers at all (WARN without a
+WARN query) is checked against the lines of the same units whose level the parse could not read
+(`level: unknown`): any such line could be at that level, so the answer is `bounded` with that share
+("no source count query covers WARN: 3 lines in 2 service/tenant units have no parsed level (12.0% of
+their 25 source lines)") and `unknown_level` carries the numbers; with none it stays exact and the
+note says the rows were not cross-checked.
 
 **Vocabulary, error rate and the default day.** In the rules grammar a named level ("ERROR",
 "FATAL", "warnings") is that level, while words for failure in general ("errors", "failing",
 "failures", "issues", "problems", "broken") mean ERROR and FATAL; a level word inside a named value
-(`dependency.connect_failed`) is not a level. `log_top` takes `metric: error_rate` (by service or
-tenant): lines at the levels (default ERROR and FATAL) over all deterministic lines of the group,
-ranked by the share, with the source counts of those levels ("which service has the highest error
-rate"). A question that names no date (no window, start/end or `as_of`) is anchored on the
-**latest served day** when today has no composed data yet, and the rendering says so ("latest
-available day: …"); a named window ("yesterday") stays relative to today, and its days that are not
-composed yet are `source_unavailable` (a window with no composed day at all is `bounded`).
+(`dependency.connect_failed`) is not a level. `log_top` takes `metric: error_rate` (by service,
+tenant or deployment): the **source's** lines at the levels (default ERROR and FATAL, from the
+unit's count queries: one query over exactly that level set, else one single-level query per
+level) over the **source's** total lines of the unit (`unit_day` `lines_total`), summed per group
+and ranked by the share ("which service has the highest error rate"). The pulled lines are never
+the denominator: they are only the pulled strata, capped. A unit without its source total or one of
+the counts is excluded and named in a note; a level no count query counts exactly refuses the rate.
+Each row states its `basis`; a `token_match` unit makes the rate approximate (`rate_exactness`,
+rendering "…, token_match, approximate"). Because the inputs are source counts, a capped unit does
+not make the rate approximate.
+
+**The day of a log question.** The engine fills the decision request's `as_of` from the request,
+else from the clock, and records which (`as_of_source: request | clock`, trace `time_anchor`). Only
+a caller-named `as_of` is pinned into a log intent's arguments (rules `detect(pin=...)`, the llm
+planner's `log_args`; a planner that copies the clock `time_anchor` into `as_of` has it dropped).
+So on every surface (`/v2/search`, `/v2/answer`, the stream, tools, MCP) and every agent (rules,
+cascade, llm): a question that names no date (no window, start/end or caller `as_of`) is anchored on
+the **latest served day** when today has no composed data yet, and the rendering says so ("latest
+available day: …"); a relative word ("today", "yesterday") reads the clock (`logs.timezone`), and a
+day of it that is not served is `source_unavailable` with "latest available day: …" in the
+rendering and `latest_available_day` in the output, never silently shifted onto the served day
+("No composed data for index date … , so … cannot be counted"; a window with no composed day at all
+is `bounded`).
+
+**Deployments.** With `index_name.service_suffix: numeric` the unit's `deployment_id` (the numeric
+service suffix, `none` without one) is carried on `unit_day`, `signature_day`, `log_day`,
+`log_hour`, `endpoint_day`, `exception_day` and `coverage_day` (the profile declares it groupable
+and listable). `log_top` and `log_tenants` take `deployment_id` as a filter and `by: deployment`
+(one row per service and deployment id, "svc (deployment 1658254295): …"); `log_trend` filters on
+it; the rules grammar reads "deployments"/"instances" as `by: deployment`.
 
 **Logs planner context pack.** Under the logs profile the llm planner (alone, or reached by a
 cascade whose rules found no log intent; `logs.intents.cascade_to_planner`) gets `log_context`

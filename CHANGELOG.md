@@ -7,6 +7,35 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Fixed (second real-deployment smoke test; synthetic reproductions)
+
+- **Wrong day on the Ask path.** `/v2/answer`, the stream and the llm planner filled the log
+  intent's `as_of` from the clock, which switched off the latest-served-day anchor, so undated
+  questions were answered for today with no data. The decision request now records
+  `as_of_source` (`request` or `clock`); only a caller-named `as_of` is pinned into a log intent
+  (a planner copying the clock `time_anchor` has it dropped). Undated questions anchor on the latest
+  served day and say so; "today"/"yesterday" read the clock, and a day that is not served is
+  `source_unavailable` with "latest available day: …" (rendered "No composed data for index date …").
+- **FATAL-only questions answered "none … exact".** Source counts were read only from a
+  single-level count query, so a source whose failure query counts ERROR and FATAL together never
+  cross-checked FATAL. Every level and mix is now cross-checked: single-level query, a query over
+  exactly the asked levels, or the smallest query that includes the level (`coverage: superset`).
+  A level no query covers is `bounded` when lines of the same units have no parsed level
+  (`unknown_level`, with their share of the source total). A WARN question on a unit whose raw lines
+  have no parsed level is therefore `bounded` now (was exact).
+- **`error_rate` divided by the pulled lines** (only the pulled E/F/W strata, capped: 94.5% for a
+  33% service, some 100%). It is now the source's level counts over the source's total lines
+  (`unit_day` `lines_total`) per unit, with the counting basis per row (`token_match` →
+  approximate); units without a source total are excluded and named, and a level set no count
+  query counts exactly refuses the rate.
+- **`deployment_id` on the served rows.** The numeric index-name suffix is now carried on
+  `unit_day`, `signature_day`, `log_day`, `log_hour`, `endpoint_day`, `exception_day` and
+  `coverage_day` (declared groupable/listable in the logs profile); `log_top` and `log_tenants` take
+  `deployment_id` and `by: deployment`, `log_trend` takes `deployment_id`. The attribute is read from
+  the partition's unit attributes at compose time, so partitions pulled with the suffix rule need a
+  recompose, not a reparse; the compose format is now 2, so the next compose rebuilds the day
+  documents once instead of reusing cached format-1 documents without the attribute.
+
 ### Fixed (defects found on a real log deployment; synthetic reproductions)
 
 - **Level questions read the source's counts.** A FATAL (or ERROR/WARN) question was answered

@@ -53,7 +53,9 @@ OTHER_ENDPOINT = "__other__"
 
 def _unit_dims(row: dict[str, Any]) -> dict[str, Any]:
     attrs = row["attributes"]
-    return {"tenant": attrs.get("tenant"), "env": attrs.get("env"), "service": attrs.get("service"), "deployment": attrs.get("deployment")}
+    # ``deployment_id``: the index-name grammar's numeric service suffix (``service_suffix: numeric``),
+    # so two instances of one service stay apart; absent (dropped) when the grammar has none
+    return {"tenant": attrs.get("tenant"), "env": attrs.get("env"), "service": attrs.get("service"), "deployment": attrs.get("deployment"), "deployment_id": attrs.get("deployment_id")}
 
 
 def _basis_of(level_source: str | None) -> str | None:

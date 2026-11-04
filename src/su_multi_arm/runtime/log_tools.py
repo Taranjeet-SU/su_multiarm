@@ -28,7 +28,7 @@ from pydantic import Field
 from ..core.component import Dependencies, Diagnostic, Environment
 from ..core.errors import BackendError
 from ..core.types import Document, EdgeKind, ScopeResult, ScopeSpec
-from ..decision.log_intents import INPUT_MODELS, CompileContext, CompiledIntent, LogIntentCall, compile_intent
+from ..decision.log_intents import DEPLOYMENT_GROUP, INPUT_MODELS, CompileContext, CompiledIntent, LogIntentCall, compile_intent
 from ..models import StrictModel
 from .tools import ToolResult
 
@@ -71,6 +71,14 @@ class LogToolOutput(StrictModel):
     # rows, per (service, tenant, level): lines_source, basis, source_exactness, lines_answered
     # (what the rows above count), lines_parsed (parsed at that level) and lines_unparsed.
     source_counts: list[dict[str, Any]] = Field(default_factory=list)
+    # A level no source count query covers: the lines of the same units the parse found no level
+    # for (they may be at the asked level) with the units' source total (``source_counts``).
+    unknown_level: dict[str, Any] | None = None
+    # Why the answer is bounded (each reason; the rendering lists them all).
+    bounded_by: list[str] = Field(default_factory=list)
+    # The latest served day: set when the window was anchored on it (a question without a date) or
+    # when a requested day lies after it (source_unavailable; never silently shifted onto it).
+    latest_available_day: str | None = None
 
 
 # --- execution -------------------------------------------------------------------------------------
@@ -194,7 +202,7 @@ def _levels_of(compiled: CompiledIntent) -> list[str]:
     """The levels a level question asks about (lower case); empty for any other question."""
     if compiled.intent not in LEVEL_INTENTS or compiled.window is None:
         return []
-    if compiled.intent == "log_top" and compiled.args.get("by") not in {"service", "tenant", "signature"}:
+    if compiled.intent == "log_top" and compiled.args.get("by") not in {"service", "tenant", "signature", "deployment"}:
         return []
     level = compiled.args.get("level")
     if compiled.intent == "log_top" and compiled.args.get("metric") == "error_rate" and not level:
@@ -209,49 +217,96 @@ def _grouped(ops: Any, ctx: Any, spec: ScopeSpec) -> dict[tuple, Any]:
     return {tuple(g.key.get(k) for k in spec.group_by): _value(g) for g in result.groups}
 
 
-def source_counts(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[dict[str, Any]], list[str]]:
-    """The source's own per-unit level counts (``unit_day`` ``count_<query>``) next to what the
-    parsed rows count, per (service, tenant, level) of the question's window and filters
-    (real-run fix: FATAL lines in mostly unparsed units were answered "none, exact").
+def count_plan(levels: list[str], queries: dict[str, list[str]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Which source count query cross-checks which asked levels (lower case), and the levels no
+    query covers. Per level, a single-level query (``coverage: level``); the remaining levels
+    together, a query over exactly that set (``levels``); else, per remaining level, the smallest
+    query that includes it (``superset``: its count also holds lines at its other levels, so the
+    parsed rows are compared at all of them)."""
+    items: list[dict[str, Any]] = []
+    rest: list[str] = []
+    for level in levels:
+        name = next((n for n, lv in sorted(queries.items()) if lv == [level]), None)
+        if name is None:
+            rest.append(level)
+        else:
+            items.append({"label": level.upper(), "levels": [level], "query": name, "coverage": "level"})
+    if not rest:
+        return items, []
+    exact = next((n for n, lv in sorted(queries.items()) if len(rest) > 1 and sorted(lv) == sorted(rest)), None)
+    if exact is not None:
+        items.append({"label": "+".join(lv.upper() for lv in sorted(rest)), "levels": sorted(rest), "query": exact, "coverage": "levels"})
+        return items, []
+    supersets: dict[str, list[str]] = {}
+    uncovered: list[str] = []
+    for level in rest:
+        candidates = sorted((len(lv), n) for n, lv in queries.items() if level in lv)
+        if not candidates:
+            uncovered.append(level)
+            continue
+        supersets.setdefault(candidates[0][1], []).append(level)
+    for name, asked in sorted(supersets.items()):
+        counted = sorted(queries[name])
+        items.append({"label": "+".join(lv.upper() for lv in counted), "levels": counted, "query": name, "coverage": "superset", "asked": [lv.upper() for lv in asked]})
+    return items, uncovered
 
-    Returns the rows and notes. A level without a single-level count query of the source is
-    named in a note (its parsed rows cannot be cross-checked). ``lines_answered`` is the main
-    scope regrouped by (service, tenant); ``lines_parsed`` counts parsed lines at that level;
+
+def source_counts(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[dict[str, Any]], list[str], dict[str, Any] | None]:
+    """The source's own per-unit level counts (``unit_day`` ``count_<query>``) next to what the
+    parsed rows count, per (service, tenant[, deployment_id]) of the question's window and filters
+    (real-run fixes: FATAL lines in mostly unparsed units were answered "none, exact"; a level
+    without a single-level count query was not cross-checked at all).
+
+    Every asked level is checked (``count_plan``): by its single-level query, by a query over
+    exactly the asked set, or by the smallest query that includes it (``superset``: the parsed rows
+    are compared at all of that query's levels). ``lines_answered`` is the main scope regrouped per
+    unit at the row's levels; ``lines_parsed`` counts parsed lines at those levels;
     ``lines_unparsed = lines_source - lines_parsed`` (never below 0). A ``token_match`` basis is
-    ``source_exactness: approximate``: a line containing the word is not always at that level."""
+    ``source_exactness: approximate``: a line containing the word is not always at that level.
+
+    A level no query covers returns ``unknown``: the lines of the same units whose level the parse
+    could not read (``level: unknown``) with the units' source total; any such line may be at the
+    asked level, so the answer cannot be exact."""
     from ..core.types import Measure, Predicate
 
     levels = _levels_of(compiled)
     if not levels:
-        return [], []
+        return [], [], None
     queries = ops.log_context(ctx).count_queries
     main = compiled.scopes["main"]
-    filters = [p for p in main.predicates if p.field in {"service", "tenant"} and not p.negate]
+    dims = {"service", "tenant", "deployment_id"}
+    filters = [p for p in main.predicates if p.field in dims and not p.negate]
     window = compiled.window.predicate()  # type: ignore[union-attr]
     from_counts = any(p.field == "kind" and p.value == "unit_day" for p in main.predicates)
+    # per unit: (service, tenant), or (service, deployment_id) for a question by deployment
+    # (a scope groups by two fields at most)
+    pair = list(DEPLOYMENT_GROUP) if "deployment_id" in main.group_by else ["service", "tenant"]
     rows: list[dict[str, Any]] = []
     notes: list[str] = []
-    pair = ["service", "tenant"]
-    for level in levels:
-        query = next((name for name, lv in sorted(queries.items()) if lv == [level]), None)
-        if query is None:
-            notes.append(f"no single-level source count query for {level.upper()}: the parsed rows are not cross-checked against source counts")
-            continue
-        field = f"count_{query}"
+    items, uncovered = count_plan(levels, queries)
+    for item in items:
+        field = f"count_{item['query']}"
+        counted = item["levels"]
         base = [Predicate(field="kind", op="eq", value="unit_day"), window, *filters, Predicate(field=field, op="range", lower=1)]
         source = _grouped(ops, ctx, ScopeSpec(predicates=base, group_by=pair, measure=Measure(kind="sum", field=field)))
+        if item["coverage"] == "superset":
+            notes.append(
+                f"no single-level source count query for {'/'.join(item['asked'])}: cross-checked with {item['query']!r}, "
+                f"which counts {item['label']} together (the {'/'.join(item['asked'])} share of it is not separable)"
+            )
         if not source:
             continue
         bases: dict[str, set[str]] = {}
-        for (service, basis), _n in _grouped(ops, ctx, ScopeSpec(predicates=base, group_by=["service", f"basis_{query}"], measure=Measure(kind="sum", field=field))).items():
+        for (service, basis), _n in _grouped(ops, ctx, ScopeSpec(predicates=base, group_by=["service", f"basis_{item['query']}"], measure=Measure(kind="sum", field=field))).items():
             if basis:
                 bases.setdefault(service, set()).update(str(basis).split(","))
+        at_levels = Predicate(field="level", op="eq", value=counted[0]) if len(counted) == 1 else Predicate(field="level", op="in", value=list(counted))
         parsed_spec = ScopeSpec(
             predicates=[
                 Predicate(field="kind", op="eq", value="log_day"),
                 window,
                 *filters,
-                Predicate(field="level", op="eq", value=level),
+                at_levels,
                 Predicate(field="extraction_source", op="eq", value="deterministic"),
                 Predicate(field="status", op="eq", value="parsed"),
             ],
@@ -260,22 +315,24 @@ def source_counts(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[di
         )
         parsed = _grouped(ops, ctx, parsed_spec)
         if from_counts:
-            answered = dict(source)
+            answered = dict(source)  # the rows are the source counts themselves
         else:
-            predicates = [p for p in main.predicates if p.field != "level"] + [Predicate(field="level", op="eq", value=level)]
+            predicates = [p for p in main.predicates if p.field != "level"] + [at_levels]
             answered_spec = main.model_copy(
                 update={"predicates": predicates, "group_by": pair, "measure": Measure(kind="sum", field="lines"), "order": None, "top_n": None, "nth": None, "sort": None, "limit": None, "periods": [], "time_basis": None}
             )
             answered = _grouped(ops, ctx, answered_spec)
-        for key, n in sorted(source.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+        for key, n in sorted(source.items(), key=lambda kv: tuple(str(k) for k in kv[0])):
             n = int(n or 0)
             basis = ",".join(sorted(bases.get(key[0], set()))) or "unknown"
             got = int(parsed.get(key) or 0)
-            rows.append(
+            row = dict(zip(pair, key))
+            row.update(
                 {
-                    "service": key[0],
-                    "tenant": key[1],
-                    "level": level.upper(),
+                    "level": item["label"],
+                    "levels": [lv.upper() for lv in counted],
+                    "query": item["query"],
+                    "coverage": item["coverage"],
                     "lines_source": n,
                     "basis": basis,
                     "source_exactness": "exact" if basis == "level_field" else "approximate",
@@ -284,18 +341,55 @@ def source_counts(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[di
                     "lines_unparsed": max(0, n - got),
                 }
             )
-    return rows, notes
+            rows.append(row)
+    unknown = None
+    if uncovered:
+        label = "/".join(lv.upper() for lv in uncovered)
+        unknown_spec = ScopeSpec(
+            predicates=[
+                Predicate(field="kind", op="eq", value="log_day"),
+                window,
+                *filters,
+                Predicate(field="level", op="eq", value="unknown"),
+                Predicate(field="extraction_source", op="eq", value="deterministic"),
+            ],
+            group_by=pair,
+            measure=Measure(kind="sum", field="lines"),
+        )
+        unknown_lines = {k: int(v or 0) for k, v in _grouped(ops, ctx, unknown_spec).items() if v}
+        totals = _grouped(ops, ctx, ScopeSpec(predicates=[Predicate(field="kind", op="eq", value="unit_day"), window, *filters], group_by=pair, measure=Measure(kind="sum", field="lines_total")))
+        lines = sum(unknown_lines.values())
+        total = sum(int(totals.get(k) or 0) for k in unknown_lines)
+        unknown = {"levels": [lv.upper() for lv in uncovered], "lines_unknown_level": lines, "units": len(unknown_lines), "lines_source_total": total}
+        if lines:
+            share = f" ({lines / total:.1%} of their {total} source lines)" if total else ""
+            notes.append(
+                f"no source count query covers {label}: {lines} lines in {len(unknown_lines)} service/tenant units have no parsed level{share}; "
+                f"{label} lines among them are not counted (declare a {label} count query under sources.<name>.counts)"
+            )
+        else:
+            notes.append(f"no source count query covers {label}: every pulled line of these units has a parsed level, so the rows are not cross-checked against source counts")
+    return rows, notes, unknown
+
+
+def _unit_label(row: dict[str, Any]) -> str:
+    if "deployment_id" in row:
+        return f"{row['service']} (deployment {row.get('deployment_id') or 'none'})"
+    return f"{row['service']} {row['tenant']}"
 
 
 def _source_phrase(row: dict[str, Any]) -> str:
     level = row["level"]
+    words = " or ".join(f"'{lv.lower()}'" for lv in row.get("levels") or [level])
     if row["basis"] == "level_field":
         what = f"{level}-level lines (level_field)"
     elif row["basis"] == "token_match":
-        what = f"lines containing '{level.lower()}' (token_match, approximate)"
+        what = f"lines containing {words} (token_match, approximate)"
     else:
         what = f"{level} lines ({row['basis']}, approximate)"
-    return f"{row['service']} {row['tenant']}: {row['lines_source']} {what}, {row['lines_unparsed']} unparsed"
+    if row.get("coverage") == "superset":
+        what += f" (count query {row['query']!r} counts {level} together)"
+    return f"{_unit_label(row)}: {row['lines_source']} {what}, {row['lines_unparsed']} unparsed"
 
 
 def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogToolOutput:
@@ -309,6 +403,14 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
     if window is not None and compiled.window is not None and compiled.window.latest_anchor is not None:
         window["latest_available_day"] = compiled.window.latest_anchor.isoformat()
     unavailable = _days_unavailable(compiled.window, manifest) if compiled.intent != "log_around" else []
+    served = sorted(logs.get("days") or [])
+    latest = None
+    if compiled.window is not None and compiled.window.latest_anchor is not None:
+        latest = compiled.window.latest_anchor.isoformat()
+    elif served and any(day > served[-1] for day in unavailable):
+        # a relative or named day after the latest served one ("yesterday" before it is composed):
+        # source_unavailable plus the latest day there is, never silently shifted onto it
+        latest = served[-1]
     if compiled.refusal is not None:
         return LogToolOutput(intent=call.intent, args=call.args, status="refused", exactness="bounded", refusal=compiled.refusal, window=window, rendering=f"Not answered: {compiled.refusal}.", notes=compiled.notes)
     results: dict[str, ScopeResult] = {}
@@ -336,13 +438,23 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
             exactness = "bounded"
         elif result.exactness == "approximate" and exactness == "exact":
             exactness = "approximate"
-    methods = _methods(ops, ctx, compiled.scopes["main"]) if exactness == "approximate" else []
+    rate = _is_error_rate(compiled)
+    if rate and exactness != "bounded":
+        # the rate reads the source's own counts (exact, also for a capped unit): its exactness is
+        # its counting basis, approximate when a unit counts by token match
+        exactness = "approximate" if any("token_match" in str(r.get("basis")) for r in rows) else "exact"
+    methods = _methods(ops, ctx, compiled.scopes["main"]) if exactness == "approximate" and not rate else []
+    if rate and exactness == "approximate":
+        methods = ["token_match"]
     unsupported = [u for r in results.values() for u in r.unsupported]
     try:
-        counted, count_notes = source_counts(ops, ctx, compiled)
+        counted, count_notes, unknown = source_counts(ops, ctx, compiled)
     except BackendError as exc:
-        counted, count_notes = [], [f"source counts unavailable: {exc}"]
+        counted, count_notes, unknown = [], [f"source counts unavailable: {exc}"], None
+        if _levels_of(compiled):
+            exactness = "bounded"  # a level answer that cannot be cross-checked is never exact
     compiled.notes.extend(count_notes)
+    bounded_by: list[str] = []
     short = [r for r in counted if r["lines_source"] > r["lines_answered"]]
     if short:
         # never "none ... exact" while the source counts lines at this level that the parse missed
@@ -350,13 +462,17 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
         missing = sum(r["lines_source"] - r["lines_answered"] for r in short)
         unparsed = sum(r["lines_unparsed"] for r in short)
         levels = "/".join(sorted({r["level"] for r in short}))
-        compiled.notes.append(
+        bounded_by.append(
             f"the source counts {missing} more {levels} lines than the parsed rows in {len(short)} service/tenant units "
             f"({unparsed} of their source-counted lines are unparsed; parse coverage below 100%)"
         )
+    if unknown is not None and unknown["lines_unknown_level"]:
+        exactness = "bounded"  # lines of unknown level may be at the asked level: not exact
+        bounded_by.append(next(n for n in count_notes if n.startswith("no source count query covers")))
     if compiled.window is not None and unavailable and len(unavailable) == len(compiled.window.days()) and not rows:
         exactness = "bounded"  # nothing of the window is composed: no answer, not zero
-        compiled.notes.append("no requested day has composed data")
+        bounded_by.append("no requested day has composed data")
+    compiled.notes.extend(n for n in bounded_by if n not in compiled.notes)
     status = "bounded" if exactness == "bounded" else ("empty" if not rows else "answered")
     output = LogToolOutput(
         intent=call.intent,
@@ -368,6 +484,7 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
         result=main,
         window=window,
         source_unavailable=unavailable,
+        latest_available_day=latest,
         basis=sorted({b for r in results.values() for b in r.applied_basis}),
         methods=methods,
         notes=[*compiled.notes, *(f"{u.reason}: {u.suggestion or u.constraint_text}" for u in unsupported)],
@@ -375,9 +492,69 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
         document_ids=documents,
         truncated=bool(main.ties) or any(r.matched_ids_truncated for r in results.values()),
         source_counts=counted,
+        unknown_level=unknown,
+        bounded_by=bounded_by,
     )
     output.rendering = render(output, basis_note, ops, ctx, compiled)
     return output
+
+
+def _is_error_rate(compiled: CompiledIntent) -> bool:
+    return compiled.intent == "log_top" and compiled.args.get("metric") == "error_rate"
+
+
+def _group_key(row: dict[str, Any], group: list[str]) -> str:
+    """The label of a row's group: a deployment is its service and deployment id."""
+    if group == DEPLOYMENT_GROUP:
+        return f"{row.get('service')} (deployment {row.get('deployment_id') or 'none'})"
+    return str(row.get(group[0]))
+
+
+def _error_rate_rows(compiled: CompiledIntent, results: dict[str, ScopeResult]) -> list[dict[str, Any]]:
+    """Source error lines / source total lines per group, from the ``unit_day`` source counts
+    only. A unit without its source total or one of the counts is excluded and named in a note."""
+    group = compiled.scopes["main"].group_by
+
+    def by_key(result: ScopeResult) -> dict[tuple, Any]:
+        return {tuple(g.key.get(k) for k in group): _value(g) for g in result.groups}
+
+    failing: dict[tuple, int] = {}
+    for name, result in results.items():
+        if name == "main" or name.startswith("count_"):
+            for key, value in by_key(result).items():
+                failing[key] = failing.get(key, 0) + int(value or 0)
+    totals = by_key(results["total"])
+    units, complete = by_key(results["units"]), by_key(results["units_complete"])
+    bases: dict[Any, set[str]] = {}  # by the group's first field (the service for a deployment)
+    for name, result in results.items():
+        if name.startswith("basis_"):
+            for g in result.groups:
+                basis = g.key.get(name)
+                if basis:
+                    bases.setdefault(g.key.get(group[0]), set()).update(str(basis).split(","))
+    excluded = {key: int(n or 0) - int(complete.get(key) or 0) for key, n in units.items() if int(n or 0) > int(complete.get(key) or 0)}
+    if excluded:
+        compiled.notes.append(
+            f"{sum(excluded.values())} units excluded from the error rate (no source total or count for them; the pulled lines are never a denominator): "
+            + ", ".join(_group_key(dict(zip(group, key)), group) + f" {n}" for key, n in sorted(excluded.items(), key=lambda kv: tuple(str(k) for k in kv[0])))
+        )
+    rows = []
+    for key, total in totals.items():
+        total = int(total or 0)
+        lines = failing.get(key, 0)
+        basis = ",".join(sorted(bases.get(key[0], set()))) or "unknown"
+        rows.append(
+            {
+                **dict(zip(group, key)),
+                "lines": lines,
+                "lines_total": total,
+                "error_rate": round(lines / total, 4) if total else None,
+                "basis": basis,
+                "rate_exactness": "exact" if basis == "level_field" else "approximate",
+            }
+        )
+    rows.sort(key=lambda r: (-(r["error_rate"] or 0), -r["lines"], _group_key(r, group)))
+    return [r for r in rows if r["lines"]][: compiled.args.get("top_n", 10)]
 
 
 def _rows(compiled: CompiledIntent, results: dict[str, ScopeResult], ops: Any, ctx: Any) -> list[dict[str, Any]]:
@@ -422,16 +599,8 @@ def _rows(compiled: CompiledIntent, results: dict[str, ScopeResult], ops: Any, c
             m = docs[r.id].metadata if r.id in docs else {}
             out.append({k: m.get(k) for k in ("date", "tenant", "endpoint", "http_method", "status_class", "latency_ms_p95", "lines", "row_exactness")})
         return out
-    if intent == "log_top" and "total" in results:  # error_rate
-        by = compiled.scopes["main"].group_by[0]
-        failing = {g.key[by]: _value(g) or 0 for g in main.groups}
-        rows = []
-        for g in results["total"].groups:
-            total = _value(g) or 0
-            lines = failing.get(g.key[by], 0)
-            rows.append({by: g.key[by], "lines": lines, "lines_total": total, "error_rate": round(lines / total, 4) if total else None})
-        rows.sort(key=lambda r: (-(r["error_rate"] or 0), -r["lines"], str(r[by])))
-        return [r for r in rows if r["lines"]][: compiled.args.get("top_n", 10)]
+    if _is_error_rate(compiled):
+        return _error_rate_rows(compiled, results)
     if intent == "log_new":
         return [{"signature_id": g.key["signature_id"], "first_seen": g.key["first_seen"], "lines_history": _value(g)} for g in main.groups]
     measure = "lines"
@@ -514,26 +683,37 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
     if share:
         tail.append(f"includes {share[0]} model-assisted lines ({share[0] / share[1]:.0%} of {share[1]}; extracted by the fallback, labelled extraction_source=model_assisted)")
     if output.source_unavailable:
-        tail.append("source_unavailable (no composed data, not zero): " + ", ".join(output.source_unavailable))
+        text = "source_unavailable (no composed data, not zero): " + ", ".join(output.source_unavailable)
+        if output.latest_available_day and (compiled.window is None or compiled.window.latest_anchor is None):
+            text += f"; latest available day: {output.latest_available_day}"
+        tail.append(text)
     shown = [r for r in output.source_counts if r["lines_unparsed"] or r["lines_source"] > r["lines_answered"]]
     if shown:
         tail.append("source counts: " + "; ".join(_source_phrase(r) for r in shown))
-    if output.status == "bounded":
-        tail.append("bounded: " + "; ".join(output.notes[-1:]) if output.notes else "bounded")
+    if output.status == "bounded":  # the reasons include the unknown-level share of a level no count query covers
+        reasons = output.bounded_by or output.notes[-1:]
+        tail.append("bounded: " + "; ".join(reasons) if reasons else "bounded")
     tail.append(_exactness_text(output) + ".")
     counted = _counted(output, compiled)
     rows = output.rows
     intent = compiled.intent
-    short = any(r["lines_source"] > r["lines_answered"] for r in output.source_counts)
-    if not rows:
+    short = any(r["lines_source"] > r["lines_answered"] for r in output.source_counts) or bool(output.unknown_level and output.unknown_level["lines_unknown_level"])
+    nothing_composed = compiled.window is not None and bool(output.source_unavailable) and len(output.source_unavailable) == len(compiled.window.days())
+    if not rows and nothing_composed:
+        head = f"No composed data{where}, so {counted} cannot be counted"  # not "none": the day is not served
+    elif not rows:
         head = f"No {counted} in the parsed rows{where}" if short else f"No {counted}{where}"
     elif intent == "log_top" and "error_rate" in rows[0]:
-        key = compiled.scopes["main"].group_by[0]
+        group = compiled.scopes["main"].group_by
+        label = "deployment" if group == DEPLOYMENT_GROUP else group[0]
         levels = ", ".join(lv.upper() for lv in compiled.args.get("level") or ["error", "fatal"])
-        head = f"Top {len(rows)} {key} by error rate ({levels} lines / all lines){where}: " + "; ".join(f"{r[key]}: {r['error_rate']:.2%} ({r['lines']} of {r['lines_total']})" for r in rows)
+        head = f"Top {len(rows)} {label} by error rate (source {levels} lines / source total lines, unit_day source counts){where}: " + "; ".join(
+            f"{_group_key(r, group)}: {r['error_rate']:.2%} ({r['lines']} of {r['lines_total']}" + (", token_match, approximate" if r["rate_exactness"] == "approximate" else "") + ")" for r in rows
+        )
     elif intent == "log_top":
-        key = compiled.scopes["main"].group_by[0]
-        head = f"Top {len(rows)} {key} by {counted}{where}: " + "; ".join(f"{r[key]}: {r['lines']}" for r in rows)
+        group = compiled.scopes["main"].group_by
+        label = "deployment" if group == DEPLOYMENT_GROUP else group[0]
+        head = f"Top {len(rows)} {label} by {counted}{where}: " + "; ".join(f"{_group_key(r, group)}: {r['lines']}" for r in rows)
     elif intent == "log_new":
         head = f"{len(rows)} signatures first seen{where} (across all composed history): " + "; ".join(f"{r['signature_id']} (first seen {r['first_seen']}, {r['lines_history']} lines)" for r in rows)
     elif intent == "log_affected":
@@ -552,7 +732,9 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
             head += f" (change {rows[1]['lines'] - rows[0]['lines']:+d})" if isinstance(rows[1]["lines"] - rows[0]["lines"], int) else ""
     elif intent == "log_tenants":
         service = compiled.args.get("service")
-        head = f"{len(rows)} tenants with {counted}" + (f" in {service}" if service else "") + f"{where}: " + "; ".join(f"{r['tenant']}: {r['lines']}" for r in rows)
+        group = compiled.scopes["main"].group_by
+        label = "deployments" if group == DEPLOYMENT_GROUP else "tenants"
+        head = f"{len(rows)} {label} with {counted}" + (f" in {service}" if service else "") + f"{where}: " + "; ".join(f"{_group_key(r, group)}: {r['lines']}" for r in rows)
     elif intent == "log_around":
         head = f"Signatures between {window['label'].replace(' to ', ' and ')}" + (f" for tenant {compiled.args['tenant']}" if compiled.args.get("tenant") else "") + ": " + "; ".join(f"{r['signature_id']}: {r['lines']}" for r in rows)
         if output.document_ids:

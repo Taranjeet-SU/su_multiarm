@@ -774,6 +774,7 @@ class Engine:
             scope=explicit,
             canonical_record=canonical,
             as_of=self._anchor(ctx, request),
+            as_of_source="request" if request.as_of else "clock",
         )
         # The deployment's structured targets bound the aggregate grammar (QA-03): without them the
         # schema-less permissive grammar turns ordinary questions ("the latest release notes") into
@@ -781,6 +782,11 @@ class Engine:
         intents = detect_intents(request.query, capabilities.id_patterns, capabilities.structured_targets())
         decision = pipe.decisions[mode].decide(ctx, decision_request, intents, capabilities)
         return decision_request, capabilities, decision, intents, unresolved
+
+    @staticmethod
+    def _clock(zone: Any) -> datetime:
+        """The wall clock in ``zone`` (one place, so tests can pin it)."""
+        return datetime.now(zone)
 
     def _anchor(self, ctx: RunContext, request: SearchRequest) -> date:
         """The anchor day for relative calendar expressions in ``metadata_schema.timezone``: the
@@ -791,7 +797,7 @@ class Engine:
 
         zone = zone_of(self.config.metadata_schema)
         source = "request" if request.as_of else "clock"
-        moment = datetime.fromisoformat(request.as_of.strip()) if request.as_of else datetime.now(timezone.utc)
+        moment = datetime.fromisoformat(request.as_of.strip()) if request.as_of else self._clock(timezone.utc)
         day = anchor_date(moment, zone)
         ctx.trace.event("time_anchor", as_of=day.isoformat(), timezone=self.config.metadata_schema.timezone or "UTC", source=source)
         return day
@@ -1465,7 +1471,7 @@ class Engine:
             raise RequestRejected("log tools need logs.intents.enabled")
         source = self.config.sources.get(logs.source)
         counts = {name: [lv.casefold() for lv in q.levels] for name, q in (source.counts.items() if source is not None else [])}
-        today = datetime.now(ZoneInfo(logs.timezone)).date()
+        today = self._clock(ZoneInfo(logs.timezone)).date()
         days = sorted((self.log_manifest(ctx).get("logs") or {}).get("days") or [])
         latest = date.fromisoformat(days[-1]) if days else None
         fallback = latest if latest is not None and latest < today and today.isoformat() not in days else None

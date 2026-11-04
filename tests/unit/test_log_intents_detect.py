@@ -100,14 +100,96 @@ def test_a_level_word_inside_a_named_value_is_not_a_level():
     assert found.intent == "log_trend" and "level" not in found.args
 
 
-def test_error_rate_compiles_two_deterministic_scopes_and_refuses_signatures():
-    ctx = CompileContext(today=AS_OF)
+COUNTS = {"errors": ["error"], "fatal": ["fatal"]}
+
+
+def test_error_rate_compiles_source_count_scopes_over_unit_day_and_refuses_signatures():
+    """Real-run fix: the rate is the source's own level counts over the source's total lines
+    (``unit_day``), never the pulled lines (only the pulled strata, capped)."""
+    ctx = CompileContext(today=AS_OF, count_queries=COUNTS)
     compiled = compile_intent(LogIntentCall(intent="log_top", args={"by": "service", "metric": "error_rate", "window": "yesterday"}), ctx)
-    assert set(compiled.scopes) == {"main", "total"} and all(log_scope_guard(s) is None for s in compiled.scopes.values())
-    assert any(p.field == "level" and p.value == ["error", "fatal"] for p in compiled.scopes["main"].predicates)
-    assert not any(p.field == "level" for p in compiled.scopes["total"].predicates)
+    assert set(compiled.scopes) == {"main", "count_fatal", "total", "units", "units_complete", "basis_errors", "basis_fatal"}
+    assert all(log_scope_guard(s) is None for s in compiled.scopes.values())
+    assert all(any(p.field == "kind" and p.value == "unit_day" for p in s.predicates) for s in compiled.scopes.values())
+    assert compiled.scopes["main"].measure.field == "count_errors" and compiled.scopes["count_fatal"].measure.field == "count_fatal"
+    assert compiled.scopes["total"].measure.field == "lines_total"
+    assert any(p.field == "lines_total" for p in compiled.scopes["total"].predicates) and not any(p.field == "lines_total" for p in compiled.scopes["units"].predicates)
+    assert not any(p.field in {"level", "extraction_source"} for s in compiled.scopes.values() for p in s.predicates)
     refused = compile_intent(LogIntentCall(intent="log_top", args={"by": "signature", "metric": "error_rate"}), ctx)
     assert refused.refusal and "error_rate" in refused.refusal
+
+
+def test_error_rate_without_source_counts_for_a_level_is_refused_never_divided_by_pulled_lines():
+    only_errors = CompileContext(today=AS_OF, count_queries={"errors": ["error"]})
+    refused = compile_intent(LogIntentCall(intent="log_top", args={"by": "service", "metric": "error_rate"}), only_errors)
+    assert refused.refusal and "FATAL" in refused.refusal and "not a denominator" in refused.refusal and not refused.scopes
+    superset = CompileContext(today=AS_OF, count_queries={"failures": ["error", "fatal", "warn"]})  # would over-count
+    assert compile_intent(LogIntentCall(intent="log_top", args={"by": "service", "metric": "error_rate"}), superset).refusal
+    combined = CompileContext(today=AS_OF, count_queries={"failures": ["error", "fatal"]})
+    compiled = compile_intent(LogIntentCall(intent="log_top", args={"by": "tenant", "metric": "error_rate"}), combined)
+    assert compiled.refusal is None and compiled.scopes["main"].measure.field == "count_failures" and compiled.scopes["main"].group_by == ["tenant"]
+    errors_only = compile_intent(LogIntentCall(intent="log_top", args={"by": "service", "metric": "error_rate", "level": ["error"]}), only_errors)
+    assert errors_only.refusal is None and "count_fatal" not in errors_only.scopes
+
+
+def test_count_fields_prefers_an_exact_level_set_then_single_levels():
+    from su_multi_arm.decision.log_intents import count_fields
+
+    assert count_fields(["fatal", "error"], {"failures": ["error", "fatal"], "errors": ["error"], "fatal": ["fatal"]}) == (["failures"], [])
+    assert count_fields(["fatal", "error"], COUNTS) == (["errors", "fatal"], [])
+    assert count_fields(["warn"], COUNTS) == ([], ["warn"])
+
+
+@pytest.mark.parametrize(
+    "levels,queries,expected,uncovered",
+    [
+        (["fatal"], COUNTS, [("FATAL", "fatal", "level")], []),
+        (["error"], COUNTS, [("ERROR", "errors", "level")], []),
+        (["warn"], COUNTS, [], ["warn"]),
+        (["error", "fatal", "warn"], COUNTS, [("ERROR", "errors", "level"), ("FATAL", "fatal", "level")], ["warn"]),
+        # the real-run case: no single-level FATAL query, one query over ERROR and FATAL
+        (["fatal"], {"failures": ["error", "fatal"]}, [("ERROR+FATAL", "failures", "superset")], []),
+        (["error", "fatal"], {"failures": ["error", "fatal"]}, [("ERROR+FATAL", "failures", "levels")], []),
+        (["fatal"], {"failures": ["error", "fatal"], "severe": ["critical", "error", "fatal"]}, [("ERROR+FATAL", "failures", "superset")], []),
+        (["warn", "fatal"], {"failures": ["error", "fatal"], "warn": ["warn"]}, [("WARN", "warn", "level"), ("ERROR+FATAL", "failures", "superset")], []),
+    ],
+)
+def test_every_level_combination_has_a_source_count_plan(levels, queries, expected, uncovered):
+    from su_multi_arm.runtime.log_tools import count_plan
+
+    items, missing = count_plan(levels, queries)
+    assert [(i["label"], i["query"], i["coverage"]) for i in items] == expected and missing == uncovered
+
+
+def test_deployment_is_a_filter_and_a_grouping():
+    from su_multi_arm.decision.log_intents import DEPLOYMENT_GROUP
+
+    ctx = CompileContext(today=AS_OF, count_queries=COUNTS)
+    top = compile_intent(LogIntentCall(intent="log_top", args={"by": "deployment", "level": ["error"], "deployment_id": ["1658254295"]}), ctx)
+    assert top.scopes["main"].group_by == DEPLOYMENT_GROUP
+    assert any(p.field == "deployment_id" and p.value == ["1658254295"] for p in top.scopes["main"].predicates)
+    tenants = compile_intent(LogIntentCall(intent="log_tenants", args={"by": "deployment", "service": "svc-api", "deployment_id": "1658254295"}), ctx)
+    assert tenants.scopes["main"].group_by == DEPLOYMENT_GROUP and any(p.field == "deployment_id" for p in tenants.scopes["main"].predicates)
+    rate = compile_intent(LogIntentCall(intent="log_top", args={"by": "deployment", "metric": "error_rate"}), ctx)
+    assert rate.scopes["total"].group_by == DEPLOYMENT_GROUP
+    assert call("which deployments of svc-api had FATAL yesterday").args["by"] == "deployment"
+    rate_call = call("which instance has the highest error rate").args
+    assert rate_call["by"] == "deployment" and rate_call["metric"] == "error_rate" and "level" not in rate_call
+
+
+def test_a_clock_anchor_is_not_pinned_into_the_call():
+    """Real-run fix: the engine's clock default is not a day the caller named. Unpinned, the call
+    carries no ``as_of``: relative words resolve against the clock at execution and an undated
+    question keeps the latest-served-day anchor."""
+    values = lambda f: VALUES.get(f, [])  # noqa: E731
+    clock = detect("which services had FATAL", as_of=date(2026, 11, 4), values=values, pin=False)
+    assert "as_of" not in clock.args and "window" not in clock.args
+    relative = detect("which services had FATAL yesterday", as_of=date(2026, 11, 4), values=values, pin=False)
+    assert relative.args["window"] == "yesterday" and "as_of" not in relative.args
+    named = detect("which services had FATAL yesterday", as_of=date(2026, 11, 4), values=values)
+    assert named.args["as_of"] == "2026-11-04"
+    around = detect("what else broke around 14:00 for t02", as_of=date(2026, 11, 4), values=values, pin=False)
+    assert around.args["at"].startswith("2026-11-04T14:00")  # a time without a day is read on the clock's day
 
 
 def test_an_undated_question_is_anchored_on_the_latest_served_day_when_today_is_not_composed():
