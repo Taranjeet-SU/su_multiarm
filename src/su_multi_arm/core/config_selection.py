@@ -42,6 +42,10 @@ class PackingConfig(StrictModel):
     field_priority: list[str] = Field(default_factory=list)  # configured order beats any field name
     fairness: Literal["fair_share", "greedy"] = "fair_share"
     min_per_record: int = Field(default=200, ge=0)  # floor of the fair share before a record is omitted
+    # Largest fraction of ``budget_chars`` reserved for aggregate evidence before documents are
+    # allocated; an aggregate that does not fit under it is omitted (and reported), so aggregates
+    # can never starve every document. 1.0 restores the uncapped reservation.
+    aggregate_reserve_max: float = Field(default=0.5, gt=0, le=1)
 
     @field_validator("field_priority")
     @classmethod

@@ -5,6 +5,123 @@ All notable changes to this project are documented here. The format follows
 [PEP 440](https://peps.python.org/pep-0440/) version numbers. Evidence for each release (synthetic,
 mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
+## [Unreleased]
+
+## [2.0.0a3] - 2026-11-04
+
+Owner decisions on the answer contract and Anthropic defaults, fixes for the local-model QA findings
+(QQ-01 to QQ-06), and the first real Anthropic run (a small, spend-capped smoke; see
+docs/VALIDATION.md).
+
+The release also folds in the parity work on precomputed vectors, source ordering, the typed query
+compiler, the Kuzu graph backend and the BM25 lexical engine.
+
+### Changed
+
+- **`pipeline.generation.contract.on_violation` defaults to `strip`.** A narrative answer (the
+  question asks no count, list, total, earliest/latest or absence) loses only the sentences that
+  carry an unbacked count, list or absence statement, and each removal is recorded
+  (`contract: stripped`, `action: strip`). An unbacked statement that answers an aggregate question
+  still abstains, as do unknown evidence, missing citations, empty answers and stated numbers that
+  differ from the cited exact aggregate. Set `on_violation: abstain_with_reason` for the 2.0.0a2
+  behaviour.
+- **Anthropic roles default to native structured output** when the registry declares the model
+  capable (every Claude 3 and later family) and the role does not set `structured_output`. Set
+  `structured_output: none` to keep prompt mode. `capabilities.structured_output` is now unset
+  (`null`) in the schema until the role resolves it.
+- Haiku 5.x and Sonnet 5.x use `output_config.format` as their native form. The wire schema drops
+  the numeric bounds and `maxItems` the API refuses, and the reply is still validated with the full
+  schema. Other Claude families keep forced tool use.
+- Models that think by default (Haiku 5.x) need `max_tokens` of at least 1024. A smaller value is
+  rejected. A v1 file is upgraded with the value raised and a `max_tokens_raised` warning
+  (`--strict` refuses). `examples/anthropic.yaml` sets its reviewer to 1024.
+- The answer contract checks the text of an answer flagged `insufficient_evidence` too (QQ-06).
+- Packing reserves the evidence budget for aggregate evidence before documents (documents are still
+  emitted first); an aggregate larger than the whole budget is reported in `omitted_ids`.
+- `count_distinct` named by `field` counts distinct values of that field; `field` with a different
+  `unit` is rejected.
+- The v1 downgrade refuses non-empty `source_order` / `source_slots` and `precomputed`.
+
+### Added
+
+- `ProviderLimitIgnored` (category `output_limit_ignored`): a reply that reports more output tokens
+  than the role's `max_tokens` fails instead of being used (QQ-01). The docs make
+  `max_tokens_parameter: max_tokens` required for Ollama.
+- Total/sum statements of an amount, with or without a currency or unit, are count statements in the
+  answer-text check even without a numeric field (QQ-03).
+- `Intents.untargeted`: "list all/every", "show me all" or "enumerate" applied to a common record
+  noun that is not a declared target. The text is checked as a list answer. The unsupported constraint
+  and a planner's bounded structured step name the undeclared noun, instead of saying the question
+  asks for no list (QQ-04).
+- Anthropic usage records thinking tokens (`output_tokens_details.thinking_tokens`) as
+  `reasoning_tokens`. A truncation names the thinking share, and `stop_details` is recorded.
+  OpenAI-compatible calls record the size of a server's separate thinking text as `reasoning_chars`
+  (QQ-05; Ollama's thinking attribution is documented).
+- `providers.output_format_schema`. The `capabilities` registry gains `thinks_by_default` and
+  `min_max_tokens`.
+- `models.roles.embedder.precomputed`: import document vectors computed elsewhere (`vectors` .npy +
+  `keys` JSONL of `{document_id, field, text_sha256}`). Both files are pinned by required digests
+  (`sha256`, `keys_sha256`), audited before any write (counts, dimension, finite, non-zero, unique
+  keys) and matched to chunks by document, field and exact-text digest. The row/key pairing is
+  positional; the optional `verify` spot check (`sample`, `min_cosine`, `seed`) re-embeds sampled
+  chunks with the configured provider and detects a mispaired or foreign keys file. Index identity
+  and the embedding recipe use the digests, never the file paths. The manifest records
+  `precomputed_vectors` (digests, pairing, matched/embedded/unused rows, spot check) and
+  `embedding_recipe`.
+- `selection.source_order`: strict, stable source order of the selected union, applied before
+  exact-id pins; membership unchanged.
+- `selection.source_slots`: reserved source positions inside each arm's `per_arm` budget, then fill by
+  score. Pinned (exact-id) candidates are kept first and never displaced. Recorded in the selection
+  trace.
+- Query-compiler operations on every records adapter (shared `backends/_scope.py` semantics):
+  group ranking (`order`, `top_n`, `nth`, boundary `ties`), calendar group buckets (`granularity`),
+  cross-tab, period comparison (`periods`), group shares and share numerators, record lists with
+  `total`, `unknown` null counts under negated predicates, `basis` labels.
+- Literal topic counts (`ScopeSpec.text`) resolved by the structured arm through the lexical index
+  over the whole eligible corpus (`pipeline.arms.structured.text_backend`).
+- Calendar expressions against a request anchor (`as_of`) in `metadata_schema.timezone`
+  (`decision/windows.py`, `ValueResolver.window`); declared value sets (`fields[].states`).
+- `rules` query grammar (`decision/grammar.py`) and planner scope drafts (`windows`, `periods`, ...)
+  for these operations; new intent kinds `rank`, `breakdown`, `measure`, `share`, `compare`.
+- `pipeline.selection.packing.aggregate_reserve_max` (default 0.5) caps the aggregate reservation.
+- **Embedded Kuzu graph backend** (extra `kuzu`): `mode: native`, with the same contract as `neo4j`,
+  and `mode: attach`, which opens an existing Kuzu store read-only through a declared mapping file.
+  An edge without a quote or document id, or without a verified quote under
+  `require_verified`, is never surfaced. Writes to an attached store are refused.
+- **Typed graph traversal templates** (`pipeline.arms.graph.templates`): `neighbors`, `chain`,
+  `connect`, `mentioned_in`. A decision agent selects a declared template by name, never by writing
+  Cypher. A conformance test checks identical results on sqlite, kuzu and the in-memory backend; the
+  neo4j case is in the same test but needs a service and has not been run for this release.
+- `communities.strategy: louvain_hierarchical` (extra `communities`): a seeded multi-level Louvain
+  dendrogram with deterministic per-community stats (size, trend, top entities).
+- **SQLite `lexical_engine: bm25`**: an Okapi BM25 inverted index built at ingest into each
+  generation and read through memory maps. It scores like `rank_bm25.BM25Okapi`, including the idf
+  epsilon floor, and applies scope as a document bitset. FTS5 stays the default.
+- Lexical arm options `verbatim_boost` and `pin_identifiers` (both off by default; `verbatim_boost`
+  needs `lexical_engine: bm25`). A selection `Candidate.leads` flag keeps an arm's front records ahead
+  of `source_slots`.
+
+### Fixed
+
+- A number directly after a declared field name ("priority 3 tickets") is no longer read as a count.
+  Before, such a number made a correct exact answer fail `answer_number_mismatch` (QQ-02).
+- A count whose nearest following word was a question noun read as a label was missed ("111 open
+  CloudTax tickets" when the question made "open" a unit). The farther unit is now checked.
+- SQLite lexical index: FTS rows are replaced with one scan (the per-chunk delete was quadratic) and a
+  chunk id repeated within one `index()` call is indexed once.
+- SQLite vector index: block-append upserts with a persistent id set (no per-batch restack or set
+  rebuild); the Faiss index is cached per generation; a scope filter is applied as a row bitset before
+  the top-k, so the search depth never has to grow.
+- `count_distinct` over a declared field excluded neither missing nor null values (each counted as
+  a distinct value); they are now excluded and reported in `missing_or_invalid` (parity review B1).
+- With sqlite `lexical_engine: bm25` and `tokenizer: ascii_alnum`, a required or phrase word the
+  analyzer drops now matches nothing, and a topic count with such a word is reported as bounded with
+  the reason instead of exact (release review a3 B3). Topic-count evidence names the generation's
+  recorded analyzer.
+- Vector search applies scope as a document bitset (Faiss `IDSelectorBitmap`). Arms no longer parse
+  whole documents to build hits, and selection no longer deep-copies candidates (lower retrieval
+  latency).
+
 ## [2.0.0a2] - 2026-11-04
 
 Fixes for the 2.0.0a1 QA findings (`docs/plans/reviews/qa_2.0.0a1.md`, QA-01 to QA-16), the
@@ -95,5 +212,6 @@ First alpha of the v2 rewrite: Phase 0 and Phase 1 of `docs/plans/v2_implementat
 - Sessions, read-only tools, audited actions, HTTP with SSE streaming, and MCP (stdio and streamable
   HTTP).
 
+[2.0.0a3]: https://github.com/Taranjeet-SU/su_multiarm/compare/v2.0.0a2...v2.0.0a3
 [2.0.0a2]: https://github.com/Taranjeet-SU/su_multiarm/compare/v2.0.0a1...v2.0.0a2
 [2.0.0a1]: https://github.com/Taranjeet-SU/su_multiarm/releases/tag/v2.0.0a1

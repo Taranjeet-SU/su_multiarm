@@ -13,3 +13,4 @@ state/
 *.faiss
 *.npy
 /.astra_recommendations.md
+.claude/worktrees/

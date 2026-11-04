@@ -24,6 +24,7 @@ ADAPTERS = [
     "memory",
     "sqlite",
     "sqlite_faiss",
+    "sqlite_bm25",
     pytest.param("opensearch", marks=pytest.mark.external),
     pytest.param("opensearch_hnsw", marks=pytest.mark.external),
     pytest.param("elasticsearch", marks=pytest.mark.external),
@@ -59,6 +60,8 @@ def adapter_factory(request, tmp_path):
         if request.param == "sqlite_faiss":
             pytest.importorskip("faiss")
             return SqliteBackend(tmp_path / f"faiss{counter['n']}", vector_engine="faiss", clock=lambda: clock["now"])
+        if request.param == "sqlite_bm25":
+            return SqliteBackend(tmp_path / f"bm25{counter['n']}", clock=lambda: clock["now"], lexical_engine="bm25")
         if request.param.startswith("opensearch"):
             backend = opensearch_backend(f"{prefix}_{counter['n']}", "hnsw" if request.param.endswith("hnsw") else "exact", clock=lambda: clock["now"])
             created.append(backend)

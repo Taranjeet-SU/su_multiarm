@@ -70,7 +70,7 @@ generation-scoped, reads are paged or bounded by `k`, cache keys start with the 
 generation. `backends/capabilities.py` is the static matrix (kind → declared capabilities, flags,
 and an honest `status` per capability: `contracts` for what passed the conformance kit (memory,
 sqlite, mongodb except vector, opensearch and elasticsearch for catalog/lexical/vector/records, neo4j
-graph, postgres except graph, sqlalchemy for catalog/records/cache/ledger/session), `planned` for
+and kuzu graph, postgres except graph, sqlalchemy for catalog/records/cache/ledger/session), `planned` for
 everything else, which configuration rejects). `backends/memory.py`
 is the in-memory adapter that satisfies every protocol and anchors the conformance kit.
 
@@ -141,6 +141,26 @@ first, so filters and ACL constraints are never dropped. The v1 `adapters/neo4j.
 Conformance and engine runs against `neo4j:5.26` are `external` (`tests/conformance/
 test_neo4j_conformance.py`, `tests/services/test_neo4j_engine.py`).
 
+`backends/kuzu/` serves the same `graph` capability on an **embedded** Kuzu database (extra `kuzu`).
+`mode: native` mirrors the neo4j adapter (fixed parameterised Cypher in `_cypher.py`, one relationship
+table per edge kind, `g`-keyed rows, `MERGE`-idempotent loads in one explicit transaction, a
+compare-and-set pointer row, `predicate_scope: false`) and passes the conformance kit in-process, so
+the graph contract is exercised without a service. `mode: attach` (`attach.py`) opens an existing
+Kuzu database read-only and maps its own node/relationship tables onto the contract through a
+declared mapping file: entity ids `<Table>:<key>`, edge spans over the stored quote, document ids
+derived in Python from source ids by a declared pattern/template, quote-less/unverified edges never
+surfaced, eligibility applied per row with per-node paging, communities read once. The mapping is
+validated against the store's catalog at open; only statements built from it run; writes are refused.
+It exists so evidence from graph stores built outside the package can be measured through the same
+arms (parity), not as a write target.
+
+`arms/traversal.py` executes **typed traversal templates** (`core/config_graph.py`): declared,
+parameterised read-only patterns (`neighbors`, `chain`, `connect`, `mentioned_in`) selected by name
+through a `GraphIntent{template, seeds}` on a graph plan step. A template only fills
+`TraversalSpec`s and graph lookups, so it has identical semantics on every conformant graph backend;
+an optional `GraphOntology` (arm config, or an attached mapping) validates predicates, entity types
+and chain continuity statically. No model-written query text exists anywhere in the path.
+
 `backends/postgres/` (Phase 1) serves seven facets (catalog, FTS lexical, pgvector, typed records,
 cache, ledger, sessions) with **one schema per generation** (`delete_generation` = `DROP SCHEMA ...
 CASCADE`), a runtime schema `<prefix>` holding the generation list, the registry's `meta` rows
@@ -159,9 +179,15 @@ a broken postgres connection is discarded and the next operation reconnects.
 reports, diagnostics, incomplete}`. An arm receives the already-applied eligibility scope (request
 filters, exclusions, ACL predicates) and never widens it; it reads the catalog only for the chunks it
 hit. `graph` seeds on stored entities whose name tokens all occur in the query, traverses `fact` edges
-only through a minimal `TraversalSpec` and returns mention passages with depth and edge provenance;
+only through a minimal `TraversalSpec` and returns mention passages with depth and edge provenance; with
+a graph intent it runs the named template and returns one hit per evidence document carrying each
+path edge's quote, predicate, kind, support and provenance;
 `structured` executes a typed `ScopeSpec` and returns the `ScopeResult` exactness metadata;
-`community` returns membership passages and report claims whose cited records are all eligible. An
+`community` returns membership passages and report claims whose cited records are all eligible;
+`lexical` optionally front-orders documents named by an identifier in the query or holding verbatim
+query windows (`pin_identifiers`, `verbatim_boost`, both off by default). Chunk hits become document
+hits through the catalog's optional `hit_parts` read (chunk references, the first chunk's text and
+document heads; no whole-document parse) where the backend has it. An
 arm whose stage is incomplete in a `partial` generation refuses with a typed error unless
 `pipeline.allow_incomplete_arms` is set, in which case its results are flagged.
 
@@ -217,19 +243,22 @@ before the request and commits the reported usage afterwards; the `classifier` a
 `validate()` and needs an injected runtime (nothing executable comes from configuration).
 
 `providers/` (plan §3.6) holds the `ChatProvider` protocol (`complete_json`, `complete_json_raw`,
-`complete_text`) and its implementations `anthropic` (Messages API; native structured output as one
-forced tool; `cache_control` on system and tool blocks), `openai` (Chat Completions; native = strict
+`complete_text`) and its implementations `anthropic` (Messages API; native structured output as
+`output_config.format` or one forced tool, per the registry, and the default for capable models since
+2.0.0a3; thinking tokens recorded as reasoning usage; `cache_control` on system and tool blocks), `openai` (Chat Completions; native = strict
 `json_schema`; passive caching read from usage; `base.strict_schema` converts a schema to strict
 form or raises `StrictSchemaError` listing every refused construct, and config validation and
 `doctor --probe` run it on the schemas each native OpenAI role sends), `openai_compatible` (local servers; request hints
 only as the role declares) and `none`; `JsonModel` is the stage-facing facade and `Embedder` the
 embedding facade (`hash`, `sentence_transformers`, `openai`, `openai_compatible`).
 `providers/capabilities.py` is the per-`(provider, model-pattern)` registry (native structured output
-and how, request modes, prompt caching, output-token and reasoning parameter names) that config
-validation and provider construction both consult. Providers make exactly one request per call,
+and how, request modes, prompt caching, output-token and reasoning parameter names, thinking by
+default and the minimum `max_tokens` that implies) that config validation and provider construction
+both consult. A reply reporting more output tokens than the role's `max_tokens` is
+`output_limit_ignored` (2.0.0a3, QQ-01). Providers make exactly one request per call,
 never retry, repair or downgrade, map failures to typed `ProviderError` categories (`auth`,
 `rate_limited`, `server_error`, `bad_request`, `timeout`, `connection`, `bad_response`,
-`incomplete`, `refusal`, `capability_mismatch`, `missing_secret`, `unavailable`) or
+`incomplete`, `output_limit_ignored`, `refusal`, `capability_mismatch`, `missing_secret`, `unavailable`) or
 `SchemaViolation`, and record normalised usage (input incl. cached and cache-write tokens, output,
 reasoning) for every call, successful or not.
 
@@ -249,10 +278,15 @@ model has no such field); factual answers need citations and text. `generation/s
 count, exhaustive-list and absence statements in the answer text itself (deterministic,
 English-scoped) and each needs a matching typed claim backed by an exact scope
 (`answer_text_without_exact_scope`); a backed count statement must state the cited aggregate's value
-(`answer_number_mismatch`, 2.0.0a2). Violations abstain with the rules recorded, strip (an unbacked
-non-narrative claim on an answer whose text states no aggregate is always stripped rather than
-abstained; `on_violation: strip` also removes unbacked sentences; `contract: stripped`) or raise, per
-configuration. With native structured output the engine sends a per-request `Answer` schema whose
+(`answer_number_mismatch`, 2.0.0a2). 2.0.0a3: total/sum statements of an amount are count statements
+(QQ-03), a number after a declared field name is a value label (QQ-02), the model's
+`insufficient_evidence` flag no longer exempts the text (QQ-06), and a list operator on an undeclared
+record noun is an untargeted list intent (`Intents.untargeted`, QQ-04). Violations are handled per
+`on_violation`: `strip` (default since 2.0.0a3) removes unbacked non-narrative claims and, when the
+question asks no aggregate, the unbacked count/list/absence sentences of a narrative answer
+(`contract: stripped`, each removal recorded); an unbacked statement answering an aggregate question
+abstains. `abstain_with_reason` abstains (stripping only claims when the text states no aggregate);
+`fail` raises. With native structured output the engine sends a per-request `Answer` schema whose
 cited ids are an enum of the supplied evidence ids and whose claim kinds are narrative-only unless
 aggregate evidence was supplied (`contract.answer_schema`). `pipeline/review.py::ReviewStage` is the bounded review loop with the
 stop reasons listed in CONFIGURATION.md; it re-plans only through the decision agent and merges new
@@ -313,7 +347,8 @@ state/
   failures/<generation>.json  # failure manifest of a build that did not activate
   snapshots/<generation>/
     manifest.json             # schema_version 2, recipe fingerprint, policy, status, counts, coverage, projections
-    catalog.sqlite            # docs, chunks, FTS5, typed field rows, records, mentions, relations, memberships, communities
+    catalog.sqlite            # docs, chunks, FTS5 (or the bm25 vocabulary), typed field rows, records, mentions, relations, memberships, communities
+    bm25/                      # lexical_engine: bm25 only: memory-mapped postings, idf, row lengths, row -> document ordinals
     chunk_ids.json             # vector row mapping
     vectors.npy                # normalized vectors, safe NumPy format
     vectors.faiss              # only when Faiss is selected
@@ -436,7 +471,31 @@ strategy or backend address invalidates the fingerprint. Use a separate state di
 recipes. `--replace --rebuild` explicitly permits a new recipe. Model identifiers should be pinned
 when reproducibility matters; a provider changing weights behind a stable alias is not detectable.
 
+### Imported vectors (`models.roles.embedder.precomputed`)
+
+An operator can import document vectors produced elsewhere instead of embedding the corpus. The
+import is two files: a float32 `.npy` matrix and a JSONL keys file whose line `i` names the chunk
+(`document_id`, `field`, `text_sha256` of the exact chunk text) that row `i` embeds. Both files are
+pinned by required digests (`sha256`, `keys_sha256`) and audited before the first write (row/key
+count, dimension, finite, non-zero rows, unique keys); every chunk is matched to a key by document,
+field and exact-text digest, and a chunk without a key fails the build unless `on_missing: embed`.
+The row-to-key pairing is positional and cannot be proven from the files: the digests fix the pair as
+published, and the optional `verify` spot check re-embeds `sample` chunks with the configured
+provider (its `document_prefix`, the chunk text as keyed) and requires cosine `>= min_cosine`, which
+detects a permuted or foreign keys file and tests that the rows come from the configured model.
+Queries are always encoded by the configured provider. The import's identity in the index
+fingerprint and the embedding recipe is its digests (`PrecomputedVectors.identity()`), never its
+paths, so relocated files keep the index and changed content changes it; the recipe's `input` is
+`imported: …` because the engine's `{title}\n{field}: {text}` template does not apply to imported rows.
+
 ## Retrieval and selection semantics
+
+Selection order of stages: collapse, per-arm limits (optionally with `selection.source_slots`:
+pinned candidates first, then the best remaining record of each named source per slot, then fill by
+score; the arm keeps that order, so slots also reorder it), union, ordering, optional diversity,
+optional strict `selection.source_order` (stable sort by the listed sources, unlisted sources after
+them; membership unchanged), then exact-id pins. Packing reserves the budget for aggregate evidence
+before allocating documents.
 
 Every request runs inside one `RunContext`: the generation pinned at request start (review hops and
 cached answers read the same snapshot), the principal and its access policy, the budget (calls,
@@ -495,6 +554,23 @@ same filters, exclusions and ACL predicates, never model-generated SQL; aggregat
 contributing document IDs, the exactness and the denominator. The query string alone is never a
 hidden filter.
 
+Query-compiler operations (2.0.0a3) are computed once, in `backends/_scope.py::scope_result`, over the
+rows each records adapter matched with its own predicate pushdown, so memory, sqlite, SQLAlchemy,
+PostgreSQL, MongoDB, OpenSearch and Elasticsearch share one semantics (held by
+`testing/backend_conformance.py::check_query_operations`): group ranking by measure value with dense
+ranks, `nth`, `top_n` and reported boundary `ties`; calendar buckets of temporal group keys in
+`metadata_schema.timezone`; two-field cross-tabs; period comparison; group shares and share
+numerators; distinct counts that exclude and report null values; numeric measures with null
+coverage; the null count a negated predicate included (`unknown`); record lists with `total`; and
+human-readable `basis` labels. Calendar expressions never reach a backend: `decision/windows.py`
+resolves them against the request anchor (`as_of`) into half-open `date_interval` predicates. A
+literal topic (`ScopeSpec.text`) is resolved by the structured arm through the lexical index
+(`arms/structured.py::text_match_ids`, paging `LexicalIndex.search` to exhaustion under the
+eligibility scope) into an `id in` predicate or share numerator; a record store that receives an
+unresolved text condition reports it (`not_supported_by_backend`, `bounded`). The `rules` grammar
+(`decision/grammar.py`) is schema-driven: only field names, `time_basis` labels, declared `states`
+and enum/observed values bind; every other content word stays an `UnsupportedConstraint`.
+
 ## Model flow
 
 - `pipeline.decision.kind: rules` (v1 `raw`): no model call for planning; the original query goes
@@ -518,8 +594,9 @@ hidden filter.
   evidence; count, exhaustive-list and absence claims need an exact (for absence, exhaustive)
   `ScopeResult`; an aggregate intent without an exact scope forbids count/list claims and guarantees
   a non-empty `unsupported_constraints` (populated from the decision and the scope results — the
-  generator cannot set it); a factual answer needs citations. Violations abstain with the rules
-  recorded (`AnswerResult.violations`, `contract: abstained`) or raise under `on_violation: fail`.
+  generator cannot set it); a factual answer needs citations. Violations strip or abstain with the
+  rules recorded (`AnswerResult.violations`, `contract: stripped|abstained`) or raise under
+  `on_violation: fail` (policy details above; `strip` is the default since 2.0.0a3).
   Prose numerals are not screened yet (the Phase 2 `exact_set` guard).
 
 Planner, reviewer, extractor and generator use independent model configurations. One request budget

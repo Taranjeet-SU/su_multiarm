@@ -39,7 +39,7 @@
       "additionalProperties": false,
       "properties": {
         "on_violation": {
-          "default": "abstain_with_reason",
+          "default": "strip",
           "enum": [
             "abstain_with_reason",
             "strip",
@@ -134,6 +134,59 @@
         }
       },
       "title": "ArmsConfig",
+      "type": "object"
+    },
+    "Bm25Settings": {
+      "additionalProperties": false,
+      "description": "Okapi BM25 lexical engine (``lexical_engine: bm25``), the formula of ``rank_bm25.BM25Okapi``:\nATIRE idf ``log(N - df + 0.5) - log(df + 0.5)`` with negative idf replaced by\n``epsilon * mean(idf)``. ``tokenizer``: ``unicode_word`` = ``\\w+`` runs, ``ascii_alnum`` =\n``[a-z0-9]+`` runs of the lower-cased text. ``stemming``: ``none`` or a Snowball algorithm name.\n``include_title``: the document title's tokens are prepended to every chunk of the document.\nAll of it is index recipe: changing any value needs a rebuild.",
+      "properties": {
+        "k1": {
+          "default": 1.5,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "K1",
+          "type": "number"
+        },
+        "b": {
+          "default": 0.75,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "B",
+          "type": "number"
+        },
+        "epsilon": {
+          "default": 0.25,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Epsilon",
+          "type": "number"
+        },
+        "tokenizer": {
+          "default": "unicode_word",
+          "enum": [
+            "unicode_word",
+            "ascii_alnum"
+          ],
+          "title": "Tokenizer",
+          "type": "string"
+        },
+        "lowercase": {
+          "default": true,
+          "title": "Lowercase",
+          "type": "boolean"
+        },
+        "stemming": {
+          "default": "none",
+          "title": "Stemming",
+          "type": "string"
+        },
+        "include_title": {
+          "default": false,
+          "title": "Include Title",
+          "type": "boolean"
+        }
+      },
+      "title": "Bm25Settings",
       "type": "object"
     },
     "BudgetsConfig": {
@@ -252,18 +305,25 @@
     },
     "CapabilityDeclaration": {
       "additionalProperties": false,
-      "description": "What a chat role relies on; validated against ``providers/capabilities.py``.\n\n``structured_output``: ``none`` (default; schema in the system prompt, strict validation of the\nreply), ``json_mode`` (``response_format: json_object``; OpenAI-style providers only),\n``json_schema`` (``response_format: json_schema``, ``strict: false``; OpenAI-style providers\nonly), ``native`` (provider-enforced: Anthropic forced tool use, OpenAI strict json_schema; only\nfor registry-declared ``(provider, model)`` pairs). ``prompt_caching``: ``controlled`` sends\n``cache_control`` (Anthropic); ``passive`` records cached tokens the provider reports.",
+      "description": "What a chat role relies on; validated against ``providers/capabilities.py``.\n\n``structured_output``: ``none`` (schema in the system prompt, strict validation of the\nreply), ``json_mode`` (``response_format: json_object``; OpenAI-style providers only),\n``json_schema`` (``response_format: json_schema``, ``strict: false``; OpenAI-style providers\nonly), ``native`` (provider-enforced: Anthropic forced tool use or ``output_config.format``,\nOpenAI strict json_schema; only for registry-declared ``(provider, model)`` pairs). When a role\ndoes not set ``structured_output``, Anthropic models the registry declares capable get\n``native`` (2.0.0a3); every other role gets ``none``. ``prompt_caching``: ``controlled`` sends\n``cache_control`` (Anthropic); ``passive`` records cached tokens the provider reports.",
       "properties": {
         "structured_output": {
-          "default": "none",
-          "enum": [
-            "none",
-            "json_mode",
-            "json_schema",
-            "native"
+          "anyOf": [
+            {
+              "enum": [
+                "none",
+                "json_mode",
+                "json_schema",
+                "native"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
-          "title": "Structured Output",
-          "type": "string"
+          "default": null,
+          "title": "Structured Output"
         },
         "prompt_caching": {
           "default": "none",
@@ -490,7 +550,8 @@
           "default": "entity",
           "enum": [
             "entity",
-            "louvain"
+            "louvain",
+            "louvain_hierarchical"
           ],
           "title": "Strategy",
           "type": "string"
@@ -517,6 +578,28 @@
           ],
           "default": null,
           "title": "Prompt"
+        },
+        "hierarchy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommunityHierarchy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "stats": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommunityStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "title": "CommunitiesConfig",
@@ -535,6 +618,71 @@
         "backend"
       ],
       "title": "CommunityArm",
+      "type": "object"
+    },
+    "CommunityHierarchy": {
+      "additionalProperties": false,
+      "description": "``louvain_hierarchical``: level 0 is the coarsest partition; each level-``n`` community with at\nleast ``min_split`` documents is re-partitioned (seeded) into level ``n+1`` children.",
+      "properties": {
+        "levels": {
+          "default": 3,
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Levels",
+          "type": "integer"
+        },
+        "resolution": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 10,
+          "title": "Resolution",
+          "type": "number"
+        },
+        "min_split": {
+          "default": 4,
+          "minimum": 2,
+          "title": "Min Split",
+          "type": "integer"
+        }
+      },
+      "title": "CommunityHierarchy",
+      "type": "object"
+    },
+    "CommunityStats": {
+      "additionalProperties": false,
+      "description": "Deterministic per-community statistics from declared fields only (``communities/stats.py``).",
+      "properties": {
+        "time_basis": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Time Basis"
+        },
+        "granularity": {
+          "default": "month",
+          "enum": [
+            "month",
+            "year"
+          ],
+          "title": "Granularity",
+          "type": "string"
+        },
+        "top_entities": {
+          "default": 5,
+          "maximum": 50,
+          "minimum": 0,
+          "title": "Top Entities",
+          "type": "integer"
+        }
+      },
+      "title": "CommunityStats",
       "type": "object"
     },
     "DecisionConfig": {
@@ -754,6 +902,17 @@
           "default": "cpu",
           "title": "Device",
           "type": "string"
+        },
+        "precomputed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PrecomputedVectors"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "pricing_key": {
           "anyOf": [
@@ -1041,6 +1200,13 @@
           ],
           "default": null,
           "title": "Pattern"
+        },
+        "states": {
+          "items": {
+            "$ref": "#/$defs/NamedState"
+          },
+          "title": "States",
+          "type": "array"
         }
       },
       "required": [
@@ -1129,12 +1295,51 @@
           ],
           "title": "Direction",
           "type": "string"
+        },
+        "templates": {
+          "additionalProperties": {
+            "$ref": "#/$defs/TraversalTemplate"
+          },
+          "title": "Templates",
+          "type": "object"
+        },
+        "ontology": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphOntology"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
         "backend"
       ],
       "title": "GraphArm",
+      "type": "object"
+    },
+    "GraphOntology": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Entity Types",
+          "type": "array"
+        },
+        "predicates": {
+          "additionalProperties": {
+            "$ref": "#/$defs/PredicateDecl"
+          },
+          "title": "Predicates",
+          "type": "object"
+        }
+      },
+      "title": "GraphOntology",
       "type": "object"
     },
     "GroundingConfig": {
@@ -1203,6 +1408,33 @@
         }
       },
       "title": "HttpConfig",
+      "type": "object"
+    },
+    "IdentifierPin": {
+      "additionalProperties": false,
+      "description": "Lexical front policy (off by default): documents named by an identifier in the query lead the\nlexical list. Identifiers are matches of the ``pattern`` of ``id`` fields in ``metadata_schema``\n(``fields`` narrows which; empty = all) and resolve by exact equality on that document field\ninside the request's scope. No normalisation, no fuzzy match; at most ``max_records``.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Fields",
+          "type": "array"
+        },
+        "max_records": {
+          "default": 5,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Max Records",
+          "type": "integer"
+        }
+      },
+      "title": "IdentifierPin",
       "type": "object"
     },
     "IngestBudget": {
@@ -1354,6 +1586,83 @@
       "title": "KnnConfig",
       "type": "object"
     },
+    "KuzuAttach": {
+      "additionalProperties": false,
+      "description": "Read-only attachment of an existing Kuzu database: ``mapping`` is a YAML file that maps its node\nand relationship tables onto the graph contract (``backends/kuzu/attach.py``). Private mappings\nstay outside the repository; the path is relative to this config file.",
+      "properties": {
+        "mapping": {
+          "format": "path",
+          "title": "Mapping",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mapping"
+      ],
+      "title": "KuzuAttach",
+      "type": "object"
+    },
+    "KuzuBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "kuzu",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "default": "state/graph.kuzu",
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "mode": {
+          "default": "native",
+          "enum": [
+            "native",
+            "attach"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "namespace": {
+          "default": "su_multi_arm",
+          "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "attach": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KuzuAttach"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "buffer_pool_mb": {
+          "default": 512,
+          "maximum": 65536,
+          "minimum": 16,
+          "title": "Buffer Pool Mb",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "KuzuBackend",
+      "type": "object"
+    },
     "LexicalArm": {
       "additionalProperties": false,
       "properties": {
@@ -1371,6 +1680,12 @@
         },
         "phrase_boost": {
           "$ref": "#/$defs/PhraseBoost"
+        },
+        "verbatim_boost": {
+          "$ref": "#/$defs/VerbatimBoost"
+        },
+        "pin_identifiers": {
+          "$ref": "#/$defs/IdentifierPin"
         }
       },
       "required": [
@@ -1509,6 +1824,20 @@
           ],
           "title": "Unknown Fields",
           "type": "string"
+        },
+        "timezone": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timezone"
         }
       },
       "title": "MetadataSchema",
@@ -1638,6 +1967,38 @@
       "title": "MongoBackend",
       "type": "object"
     },
+    "NamedState": {
+      "additionalProperties": false,
+      "description": "A declared name for a set of field values (``open`` = not ``done``/``closed``).",
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "values": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "minItems": 1,
+          "title": "Values",
+          "type": "array"
+        },
+        "negate": {
+          "default": false,
+          "title": "Negate",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "values"
+      ],
+      "title": "NamedState",
+      "type": "object"
+    },
     "Neo4jBackend": {
       "additionalProperties": false,
       "properties": {
@@ -1718,6 +2079,13 @@
           "minimum": 0,
           "title": "Min Per Record",
           "type": "integer"
+        },
+        "aggregate_reserve_max": {
+          "default": 0.5,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Aggregate Reserve Max",
+          "type": "number"
         }
       },
       "title": "PackingConfig",
@@ -1872,6 +2240,101 @@
         "kind"
       ],
       "title": "PostgresBackend",
+      "type": "object"
+    },
+    "PrecomputedVectors": {
+      "additionalProperties": false,
+      "description": "Import document vectors computed elsewhere. ``vectors`` is a 2-D float32 ``.npy`` file;\n``keys`` is a JSONL file with one object per row ``{\"document_id\", \"field\", \"text_sha256\"}``.\n\nWhat is verified: both files' SHA-256 equal the pinned ``sha256`` (vectors) and ``keys_sha256``\n(keys); row count, dimension, finite and non-zero rows, unique keys; and every chunk is matched\nto a key by document, field and the SHA-256 of its exact text (never fuzzily). What is NOT\nverifiable from the files alone: that row ``i`` of the vectors embeds the text named by line\n``i`` of the keys. That pairing is positional; the two pinned digests fix the pair as published,\nand ``verify`` (a re-embedding spot check with the configured provider) is the check that\ndetects a misaligned pair. Index identity comes from the two digests, never from file paths.\nA chunk with no row is an error unless ``on_missing: embed``. Queries are always encoded by the\nconfigured provider, which must be the model that produced the rows.",
+      "properties": {
+        "vectors": {
+          "format": "path",
+          "title": "Vectors",
+          "type": "string"
+        },
+        "keys": {
+          "format": "path",
+          "title": "Keys",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "keys_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Keys Sha256",
+          "type": "string"
+        },
+        "on_missing": {
+          "default": "error",
+          "enum": [
+            "error",
+            "embed"
+          ],
+          "title": "On Missing",
+          "type": "string"
+        },
+        "verify": {
+          "$ref": "#/$defs/PrecomputedVerify"
+        }
+      },
+      "required": [
+        "vectors",
+        "keys",
+        "sha256",
+        "keys_sha256"
+      ],
+      "title": "PrecomputedVectors",
+      "type": "object"
+    },
+    "PrecomputedVerify": {
+      "additionalProperties": false,
+      "description": "Optional content check of imported rows: re-embed ``sample`` matched chunks (seeded, chunk\ntext exactly as keyed, through the configured provider with its ``document_prefix``) and require\ncosine ``>= min_cosine`` against the imported row for every sampled chunk. This is the only\ncheck that can detect a vector row paired with the wrong key.",
+      "properties": {
+        "sample": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Sample",
+          "type": "integer"
+        },
+        "min_cosine": {
+          "default": 0.98,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Min Cosine",
+          "type": "number"
+        },
+        "seed": {
+          "default": 0,
+          "title": "Seed",
+          "type": "integer"
+        }
+      },
+      "title": "PrecomputedVerify",
+      "type": "object"
+    },
+    "PredicateDecl": {
+      "additionalProperties": false,
+      "description": "Entity types a predicate may connect (empty = any).",
+      "properties": {
+        "subject_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Subject Types",
+          "type": "array"
+        },
+        "object_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Object Types",
+          "type": "array"
+        }
+      },
+      "title": "PredicateDecl",
       "type": "object"
     },
     "PrivacyConfig": {
@@ -2114,6 +2577,21 @@
           "title": "Pins",
           "type": "array"
         },
+        "source_order": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Order",
+          "type": "array"
+        },
+        "source_slots": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1000,
+          "title": "Source Slots",
+          "type": "array"
+        },
         "rerank": {
           "default": false,
           "title": "Rerank",
@@ -2293,6 +2771,26 @@
           "maximum": 600,
           "title": "Timeout Seconds",
           "type": "number"
+        },
+        "lexical_engine": {
+          "default": "fts5",
+          "enum": [
+            "fts5",
+            "bm25"
+          ],
+          "title": "Lexical Engine",
+          "type": "string"
+        },
+        "bm25": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bm25Settings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -2389,6 +2887,19 @@
           "pattern": "^[a-z][a-z0-9_]{0,63}$",
           "title": "Backend",
           "type": "string"
+        },
+        "text_backend": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text Backend"
         }
       },
       "required": [
@@ -2410,6 +2921,176 @@
         }
       },
       "title": "ToolsConfig",
+      "type": "object"
+    },
+    "TraversalHop": {
+      "additionalProperties": false,
+      "properties": {
+        "predicates": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Predicates",
+          "type": "array"
+        },
+        "direction": {
+          "default": "any",
+          "enum": [
+            "out",
+            "in",
+            "any"
+          ],
+          "title": "Direction",
+          "type": "string"
+        },
+        "edge_kinds": {
+          "items": {
+            "enum": [
+              "fact",
+              "co_occurrence",
+              "mention",
+              "native_link",
+              "derived"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Edge Kinds",
+          "type": "array"
+        }
+      },
+      "title": "TraversalHop",
+      "type": "object"
+    },
+    "TraversalTemplate": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "neighbors",
+            "chain",
+            "connect",
+            "mentioned_in"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "maxLength": 500,
+          "title": "Description",
+          "type": "string"
+        },
+        "seed_match": {
+          "default": "exact",
+          "enum": [
+            "exact",
+            "tokens"
+          ],
+          "title": "Seed Match",
+          "type": "string"
+        },
+        "seed_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Seed Types",
+          "type": "array"
+        },
+        "target_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Target Types",
+          "type": "array"
+        },
+        "hop": {
+          "$ref": "#/$defs/TraversalHop"
+        },
+        "hops": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Hops",
+          "type": "integer"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/TraversalHop"
+          },
+          "maxItems": 3,
+          "title": "Steps",
+          "type": "array"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "TraversalTemplate",
+      "type": "object"
+    },
+    "VerbatimBoost": {
+      "additionalProperties": false,
+      "description": "Lexical front policy (off by default): documents whose text holds a quoted string of the query,\nor at least ``min_windows`` of its ``window_tokens``-token windows verbatim (error messages, pasted\nexcerpts, exact subjects), lead the lexical list, at most ``max_records``, ranked by (quoted,\nwindows matched). A window counts only if one of its tokens is in at most ``common_df`` chunks; a\nwindow found in more than ``max_window_hits`` chunks is boilerplate and ignored; a window whose\ntokens co-occur in more than ``max_candidates`` chunks is not verified (skipped, counted in the\ntrace). Needs a lexical index that exposes its analyzer and term statistics (sqlite\n``lexical_engine: bm25``); anything else is a validation error.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "window_tokens": {
+          "default": 6,
+          "maximum": 32,
+          "minimum": 2,
+          "title": "Window Tokens",
+          "type": "integer"
+        },
+        "min_windows": {
+          "default": 2,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Min Windows",
+          "type": "integer"
+        },
+        "common_df": {
+          "default": 5000,
+          "minimum": 1,
+          "title": "Common Df",
+          "type": "integer"
+        },
+        "max_window_hits": {
+          "default": 300,
+          "minimum": 1,
+          "title": "Max Window Hits",
+          "type": "integer"
+        },
+        "max_candidates": {
+          "default": 1200,
+          "minimum": 1,
+          "title": "Max Candidates",
+          "type": "integer"
+        },
+        "max_records": {
+          "default": 5,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Max Records",
+          "type": "integer"
+        },
+        "quoted": {
+          "default": true,
+          "title": "Quoted",
+          "type": "boolean"
+        }
+      },
+      "title": "VerbatimBoost",
       "type": "object"
     }
   },
@@ -2445,6 +3126,7 @@
         "discriminator": {
           "mapping": {
             "elasticsearch": "#/$defs/LuceneBackend",
+            "kuzu": "#/$defs/KuzuBackend",
             "memory": "#/$defs/MemoryBackendConfig",
             "mongodb": "#/$defs/MongoBackend",
             "neo4j": "#/$defs/Neo4jBackend",
@@ -2473,6 +3155,9 @@
           },
           {
             "$ref": "#/$defs/Neo4jBackend"
+          },
+          {
+            "$ref": "#/$defs/KuzuBackend"
           },
           {
             "$ref": "#/$defs/MongoBackend"

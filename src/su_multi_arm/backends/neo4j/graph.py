@@ -184,7 +184,7 @@ class Neo4jGraph:
         b = self._b
         g = b.gen_key(gen)
         rows = [
-            {"id": c.id, "label": c.label, "document_ids": list(c.document_ids), "entity_ids": list(c.entity_ids), "report": json.dumps(c.report, ensure_ascii=False, sort_keys=True)}
+            {"id": c.id, "label": c.label, "document_ids": list(c.document_ids), "entity_ids": list(c.entity_ids), "report": json.dumps(c.storage_report(), ensure_ascii=False, sort_keys=True)}
             for c in communities
         ]
         with b.transaction("put_communities", write=True) as run:
@@ -271,6 +271,6 @@ class Neo4jGraph:
             self._b.require_generation(run, gen)
             rows = run(q.COMMUNITIES, g=self._b.gen_key(gen))
         return [
-            Community(id=r["id"], label=r["label"] or "", document_ids=list(r["document_ids"] or []), entity_ids=list(r["entity_ids"] or []), report=json.loads(r["report"]))
+            Community.from_storage(r["id"], r["label"] or "", list(r["document_ids"] or []), list(r["entity_ids"] or []), json.loads(r["report"]))
             for r in rows
         ]

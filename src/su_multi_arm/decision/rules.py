@@ -17,14 +17,15 @@ stage policy applies (default ``fallback_to_next_stage``).
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 
 from ..core.component import Dependencies
-from ..core.types import JsonScalar, Measure, MetadataSchema, Predicate, UnsupportedConstraint
+from ..core.types import Measure, MetadataSchema, UnsupportedConstraint
 from ..models import StrictModel
 from .base import Capabilities, Decision, DecisionAgent, DecisionFailure, DecisionRequest, Plan, RetrievalStep, StructuredStep
 from .intent import Intents
+from .grammar import QueryGrammar
 from .scope import CompiledScope, ScopeCompiler, ScopeDraft
 from .values import ValueResolver
 
@@ -40,6 +41,7 @@ STOP_WORDS: frozenset[str] = frozenset(
     documents document rows row results result""".split()
 )
 WORD = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
+DEFAULT_LIST_LIMIT = 50  # records a ``list`` question shows; the total is always reported
 
 
 class RulesConfig(StrictModel):
@@ -55,8 +57,8 @@ class RulesAgent(DecisionAgent):
         super().__init__(config, deps)
         self.records = deps.backends.get("records")
 
-    def resolver(self, ctx: RunContext, schema: MetadataSchema) -> ValueResolver:
-        return ValueResolver(schema, self.records, ctx.generation, ctx.constraints())
+    def resolver(self, ctx: RunContext, schema: MetadataSchema, anchor: Any = None) -> ValueResolver:
+        return ValueResolver(schema, self.records, ctx.generation, ctx.constraints(), anchor=anchor)
 
     def attempt(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision:
         if request.scope is None and (intents.aggregate() or request.aggregate is not None):
@@ -98,29 +100,37 @@ class RulesAgent(DecisionAgent):
             ] or [UnsupportedConstraint(constraint_text="aggregate", reason="aggregate_intent_without_scope", suggestion="enable the structured arm")]
             raise DecisionFailure("no_plan", "aggregate intent but the structured arm is not enabled", flagged)
         schema = capabilities.metadata_schema
-        resolver = self.resolver(ctx, schema)
+        resolver = self.resolver(ctx, schema, request.as_of)
         compiler = ScopeCompiler(schema, resolver)
         if request.aggregate is not None:
             draft = ScopeDraft(measure=request.aggregate, time_basis=self._time_basis(schema, request.query, request.aggregate))
             compiled = compiler.compile(draft, request.filters)
             return self._finish(compiled, intents)
         kinds = intents.kinds()
-        residual, predicates = self._bind_values(request, schema, resolver)
-        unsupported: list[UnsupportedConstraint] = []
-        if residual:
+        grammar = QueryGrammar(schema, resolver, request.as_of, set(request.filters))
+        parsed = grammar.parse(request.query, kinds)
+        draft = parsed.draft
+        unsupported: list[UnsupportedConstraint] = list(parsed.unsupported)
+        if parsed.residual:
             unsupported.append(
                 UnsupportedConstraint(
-                    constraint_text=" ".join(residual),
+                    constraint_text=" ".join(parsed.residual),
                     reason="field_not_filterable",
                     suggestion="no declared filterable field expresses this qualifier; the count would ignore it",
                 )
             )
-        measure, time_basis, problem = self._measure(kinds, request.query, schema)
-        if problem is not None:
-            unsupported.append(problem)
+        if draft.measure is None and draft.sort is None:
+            measure, time_basis, problem = self._measure(kinds, request.query, schema)
+            if problem is not None and not (draft.group_by or draft.periods):
+                unsupported.append(problem)
+            elif problem is None:
+                draft.measure = measure
+                draft.time_basis = draft.time_basis or time_basis
+        if not (draft.group_by or draft.periods) and draft.limit is None and "list" in kinds and "count" not in kinds and "absence" not in kinds:
+            if draft.measure is None:
+                draft.limit = DEFAULT_LIST_LIMIT
         if unsupported:
-            raise DecisionFailure("unresolvable_value" if residual else "unsupported_measure", "grammar left unbound qualifiers", unsupported)
-        draft = ScopeDraft(predicates=predicates, measure=measure, time_basis=time_basis)
+            raise DecisionFailure("unresolvable_value" if parsed.residual else "unsupported_measure", "grammar left unbound qualifiers", unsupported)
         compiled = compiler.compile(draft, request.filters)
         return self._finish(compiled, intents)
 
@@ -140,33 +150,6 @@ class RulesAgent(DecisionAgent):
             intents=intents,
             note=note,
         )
-
-    def _bind_values(self, request: DecisionRequest, schema: MetadataSchema, resolver: ValueResolver) -> tuple[list[str], list[Predicate]]:
-        """Bind observed/enum values that occur verbatim in the question; return residual tokens."""
-        text = request.query.casefold()
-        bound: dict[str, JsonScalar] = {}
-        consumed: set[str] = set()
-        unit_words = {schema.canonical_unit.casefold(), schema.canonical_unit.casefold() + "s"}
-        for spec in schema.fields:
-            if not spec.filterable or spec.name in request.filters:
-                continue
-            universe = spec.enum_values if spec.type == "enum" else (resolver.observed(spec.name) or [])
-            for value in sorted(universe, key=len, reverse=True):
-                if value.casefold() in unit_words:
-                    continue  # the population word ("record") names the unit, never a filter value
-                pattern = r"(?<![^\W_])" + re.escape(value.casefold()) + r"(?![^\W_])"
-                if re.search(pattern, text) and spec.name not in bound:
-                    bound[spec.name] = value
-                    consumed.update(WORD.findall(value.casefold()))
-        predicates = [Predicate(field=f, op="eq", value=v) for f, v in bound.items()]
-        field_words = {w for spec in schema.fields for w in WORD.findall(spec.name.replace("_", " "))}
-        label_words = {w for spec in schema.fields if spec.time_basis for w in WORD.findall(spec.time_basis)}
-        residual = [
-            w
-            for w in WORD.findall(text)
-            if w not in STOP_WORDS and w not in consumed and w not in field_words and w not in label_words and w not in unit_words
-        ]
-        return residual, predicates
 
     def _measure(self, kinds: list[str], query: str, schema: MetadataSchema) -> tuple[Measure | None, str | None, UnsupportedConstraint | None]:
         words = set(WORD.findall(query.casefold()))

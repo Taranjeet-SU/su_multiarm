@@ -203,13 +203,13 @@ class SqliteGraph:
             for community in communities:
                 db.execute(
                     "INSERT OR REPLACE INTO communities VALUES (?,?,?,?,?)",
-                    (community.id, community.label, json.dumps(community.document_ids), json.dumps(community.entity_ids), dumps(community.report)),
+                    (community.id, community.label, json.dumps(community.document_ids), json.dumps(community.entity_ids), dumps(community.storage_report())),
                 )
 
     def communities(self, gen: GenerationId) -> list[Community]:
         with self._b.catalog_db(gen) as db:
             rows = db.execute("SELECT * FROM communities ORDER BY id").fetchall()
         return [
-            Community(id=r["id"], label=r["label"], document_ids=json.loads(r["documents"]), entity_ids=json.loads(r["entities"]), report=json.loads(r["report"]))
+            Community.from_storage(r["id"], r["label"], json.loads(r["documents"]), json.loads(r["entities"]), json.loads(r["report"]))
             for r in rows
         ]

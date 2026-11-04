@@ -24,6 +24,7 @@ from pydantic import Field, ValidationError, model_validator
 
 from ..core.component import Dependencies, Diagnostic, Environment
 from ..core.config import ChatRole
+from ..core.config_graph import GraphIntent
 from ..core.errors import BudgetExhausted, DeadlineExceeded, SuError
 from ..core.types import JsonScalar, MetadataSchema, Predicate, UnsupportedConstraint
 from ..models import StrictModel
@@ -61,6 +62,9 @@ class LlmStep(StrictModel):
     query: str | None = Field(default=None, max_length=16000)
     filters: list[LlmFilter] = Field(default_factory=list)
     scope: ScopeDraft | None = None
+    # graph arm only: a declared traversal template (``graph_templates`` in the payload) and its seeds
+    template: str | None = Field(default=None, max_length=64)
+    seeds: list[str] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="before")
     @classmethod
@@ -82,6 +86,10 @@ class LlmStep(StrictModel):
                 raise ValueError(f"only the structured arm carries a scope, not {self.arm}")
             if not (self.query or "").strip():
                 raise ValueError(f"a {self.arm} step needs a non-empty query")
+        if (self.template is not None or self.seeds) and self.arm != "graph":
+            raise ValueError(f"only a graph step selects a traversal template, not {self.arm}")
+        if (self.template is None) != (not self.seeds):
+            raise ValueError("a graph template step needs both template and seeds")
         names = [f.field for f in self.filters]
         if len(set(names)) != len(names):
             raise ValueError("a step filters each field at most once")
@@ -124,8 +132,8 @@ class LlmAgent(DecisionAgent):
             return [Diagnostic(severity="error", code="missing_secret", message=f"{role.api_key_env} is not set", path="role.api_key_env", component=self.name)]
         return []
 
-    def resolver(self, ctx: RunContext, schema: MetadataSchema) -> ValueResolver:
-        return ValueResolver(schema, self.records, ctx.generation, ctx.constraints())
+    def resolver(self, ctx: RunContext, schema: MetadataSchema, anchor: Any = None) -> ValueResolver:
+        return ValueResolver(schema, self.records, ctx.generation, ctx.constraints(), anchor=anchor)
 
     def payload(self, request: DecisionRequest, intents: Intents, capabilities: Capabilities, resolver: ValueResolver) -> dict[str, Any]:
         schema = capabilities.metadata_schema
@@ -137,7 +145,7 @@ class LlmAgent(DecisionAgent):
             if spec.type in {"integer", "number"}:
                 ops.append("range")
             if spec.type in {"datetime", "date"}:
-                ops.extend(["range", "date_interval"])
+                ops.extend(["range", "date_interval", "window"])
             fields.append(
                 {
                     "name": spec.name,
@@ -147,9 +155,10 @@ class LlmAgent(DecisionAgent):
                     "groupable": spec.groupable,
                     "sortable": spec.sortable,
                     "time_basis": spec.time_basis,
+                    "states": [s.name for s in spec.states],
                 }
             )
-        return {
+        payload: dict[str, Any] = {
             "question": request.query,
             "caller_context_unverified": request.record_context,
             "canonical_record": request.canonical_record,
@@ -161,8 +170,17 @@ class LlmAgent(DecisionAgent):
             "explicit_aggregate": request.aggregate.model_dump() if request.aggregate else None,
             "explicit_scope": request.scope.model_dump(mode="json") if request.scope else None,
             "detected_intents": intents.kinds(),
+            "time_anchor": request.as_of.isoformat() if request.as_of else None,
+            "timezone": schema.timezone,
             "max_steps": min(capabilities.max_steps, self.config.max_steps),  # type: ignore[attr-defined]
         }
+        if capabilities.graph_templates and "graph" in capabilities.arms:
+            payload["graph_templates"] = dict(capabilities.graph_templates)
+            payload["graph_template_rule"] = (
+                "A graph step may select one of graph_templates by name in `template` and name its start "
+                "entities in `seeds` (entity names or ids from the question); never write a query language."
+            )
+        return payload
 
     def call_model(self, ctx: RunContext, payload: dict[str, Any]) -> LlmPlan:
         from ..providers import JsonModel
@@ -189,7 +207,7 @@ class LlmAgent(DecisionAgent):
 
     def attempt(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision:
         schema = capabilities.metadata_schema
-        resolver = self.resolver(ctx, schema)
+        resolver = self.resolver(ctx, schema, request.as_of)
         plan = self.call_model(ctx, self.payload(request, intents, capabilities, resolver))
         max_steps = min(capabilities.max_steps, self.config.max_steps)  # type: ignore[attr-defined]
         if len(plan.steps) > max_steps:
@@ -228,7 +246,15 @@ class LlmAgent(DecisionAgent):
                     scope = compiled.spec
                 steps.append(StructuredStep(arm="structured", scope=compiled.spec))  # type: ignore[arg-type]
             else:
-                steps.append(RetrievalStep(arm=step.arm, query=step.query or "", filters=self._step_filters(step, request, resolver)))  # type: ignore[arg-type]
+                intent = None
+                if step.template is not None:
+                    if step.template not in capabilities.graph_templates:
+                        raise DecisionFailure("invalid_step", f"planner selected undeclared graph template {step.template!r}")
+                    try:
+                        intent = GraphIntent(template=step.template, seeds=step.seeds)
+                    except ValidationError as error:
+                        raise DecisionFailure("invalid_step", f"graph template seeds are invalid ({error.error_count()} errors)") from error
+                steps.append(RetrievalStep(arm=step.arm, query=step.query or "", filters=self._step_filters(step, request, resolver), graph=intent))  # type: ignore[arg-type]
         return Decision(
             plan=Plan(steps=steps),
             scope=scope,

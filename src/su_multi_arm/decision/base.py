@@ -12,11 +12,13 @@ every agent. Not its job: executing anything.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Union
 
 from pydantic import ConfigDict, Field, model_validator
 
 from ..core.component import Dependencies, Diagnostic, Environment
+from ..core.config_graph import GraphIntent
 from ..core.types import JsonScalar, Measure, MetadataSchema, ScopeSpec, UnsupportedConstraint
 from ..models import StrictModel
 from .intent import Intents, detect_intents
@@ -53,12 +55,23 @@ class DecisionRequest(StrictModel):
     aggregate: Measure | None = None  # explicit typed measure from the caller (never inferred from text)
     scope: ScopeSpec | None = None  # explicit caller-typed scope (the engine maps the v1 ``aggregate`` onto it)
     canonical_record: dict[str, str] | None = None  # engine-verified catalog record named by the caller context
+    # Anchor day for relative calendar expressions, in ``metadata_schema.timezone`` (the engine sets
+    # it from ``SearchRequest.as_of`` or the clock). None: relative windows are refused.
+    as_of: date | None = None
 
 
 class RetrievalStep(StrictModel):
     arm: Literal["exact_id", "dense", "lexical", "graph", "community"]
     query: str = Field(min_length=1, max_length=16000)
     filters: dict[str, JsonScalar] = Field(default_factory=dict)  # typed eq filters on filterable fields
+    # Graph arm only: a declared traversal template by name plus its seeds (typed; never query text).
+    graph: GraphIntent | None = None
+
+    @model_validator(mode="after")
+    def graph_intent_on_graph_arm(self):
+        if self.graph is not None and self.arm != "graph":
+            raise ValueError(f"only the graph arm takes a graph intent, not {self.arm}")
+        return self
 
 
 class StructuredStep(StrictModel):
@@ -93,6 +106,8 @@ class Capabilities(StrictModel):
     metadata_schema: MetadataSchema = Field(default_factory=MetadataSchema)
     max_steps: int = Field(default=10, ge=1, le=20)
     id_patterns: list[str] = Field(default_factory=list)  # exact-identifier regexes from the alias map
+    # Declared graph traversal templates (name -> description) a plan may select on the graph arm.
+    graph_templates: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def known_arms(self):
@@ -120,6 +135,8 @@ class Capabilities(StrictModel):
             targets.append(spec.name.replace("_", " "))
             if spec.time_basis:
                 targets.append(spec.time_basis)
+                if spec.groupable:  # "by month", "per year": calendar groups of the time basis
+                    targets.extend(["day", "month", "year"])
         return list(dict.fromkeys(t for t in targets if t))
 
 
@@ -279,6 +296,7 @@ class DecisionAgent:
             return decision
         if request.aggregate is not None or request.scope is not None:
             return decision  # the caller typed the operation: its scope is the caller's filters
+        from .intent import untargeted_constraint
         from .qualifiers import NO_OPERATOR, qualifier_candidates, unapplied
         from .values import ValueResolver
 
@@ -293,7 +311,8 @@ class DecisionAgent:
             if isinstance(step, StructuredStep):
                 missing = unapplied(candidates, step.scope, request.filters, schema)
                 if not intents.aggregate():
-                    missing.append(NO_OPERATOR)
+                    # QQ-04: a list of an undeclared record noun is an operator, just not a typed one.
+                    missing.extend([untargeted_constraint(u) for u in intents.untargeted] or [NO_OPERATOR])
                 if missing:
                     step = step.model_copy(update={"unapplied": [*step.unapplied, *missing]})
                     for item in missing:

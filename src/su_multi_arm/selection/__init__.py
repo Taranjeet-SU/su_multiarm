@@ -15,7 +15,7 @@ from .diversity import DiversityTrace, diversify
 from .limits import limit
 from .ordering import OrderingPolicy, OrderingTrace, order
 from .packing import PackedEvidence, PackExtra, PackRecord, PackResult, pack, render
-from .pins import pin
+from .pins import order_by_source, pin
 from .types import Candidate, PerArm, Selected
 from .union import membership, merge_pools, union
 
@@ -30,6 +30,8 @@ class SelectionPolicy(StrictModel):
     max_documents: int | None = Field(default=None, ge=1)
     diversity_field: str | None = None
     diversity_min_per_value: int = Field(default=1, ge=1)
+    source_order: list[str] = Field(default_factory=list)
+    source_slots: list[str] = Field(default_factory=list)
     pins: bool = True
 
     def ordering_policy(self) -> OrderingPolicy:
@@ -49,15 +51,19 @@ class SelectionTrace(StrictModel):
     ordering: OrderingTrace
     diversity: DiversityTrace | None = None
     pinned: int = 0
+    source_order: list[str] = Field(default_factory=list)
+    source_slots: list[str] = Field(default_factory=list)
 
 
 def select(per_arm: PerArm, policy: SelectionPolicy) -> tuple[list[Selected], PerArm, SelectionTrace]:
     """Returns the ordered union, the per-arm pools after limits, and the effective-policy trace."""
-    pools = limit(collapse(per_arm, policy.collapse), policy.per_arm)
+    pools = limit(collapse(per_arm, policy.collapse), policy.per_arm, policy.source_slots)
     ordered, ordering_trace = order(pools, policy.ordering_policy())
     diversity_trace = None
     if policy.diversity_field:
         ordered, diversity_trace = diversify(ordered, policy.diversity_field, policy.diversity_min_per_value)
+    if policy.source_order:
+        ordered = order_by_source(ordered, policy.source_order)
     if policy.pins:
         ordered = pin(ordered)
     trace = SelectionTrace(
@@ -67,6 +73,8 @@ def select(per_arm: PerArm, policy: SelectionPolicy) -> tuple[list[Selected], Pe
         ordering=ordering_trace,
         diversity=diversity_trace,
         pinned=sum(1 for r in ordered if r.pinned),
+        source_order=list(policy.source_order),
+        source_slots=list(policy.source_slots),
     )
     return ordered, pools, trace
 

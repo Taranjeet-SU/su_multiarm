@@ -174,9 +174,10 @@ def create_mcp(config=None, *, engine=None, principal_resolver: PrincipalResolve
         aggregate: Aggregate | None = None,
         pipeline: str | None = None,
         mode: Mode | None = None,
+        as_of: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve cited source documents from the configured dataset (same request model as HTTP)."""
-        request = request_from_arguments(query=query, filters=filters, exclude_ids=exclude_ids, record_context=record_context, aggregate=aggregate, pipeline=pipeline, mode=mode)
+        request = request_from_arguments(query=query, filters=filters, exclude_ids=exclude_ids, record_context=record_context, aggregate=aggregate, pipeline=pipeline, mode=mode, as_of=as_of)
         principal, session_id = await bound(ctx, "search")
         result = await run(engine.search, request, principal, session_id)
         return result.model_dump(mode="json")
@@ -191,11 +192,12 @@ def create_mcp(config=None, *, engine=None, principal_resolver: PrincipalResolve
         aggregate: Aggregate | None = None,
         pipeline: str | None = None,
         mode: Mode | None = None,
+        as_of: str | None = None,
     ) -> dict[str, Any]:
         """Answer using configured models and grounded evidence; optional record context is data.
         Progress notifications carry the stream events (``token`` deltas are provisional);
         ``unsupported_constraints`` lists what the answer could not express exactly."""
-        request = request_from_arguments(query=query, filters=filters, exclude_ids=exclude_ids, record_context=record_context, aggregate=aggregate, pipeline=pipeline, mode=mode)
+        request = request_from_arguments(query=query, filters=filters, exclude_ids=exclude_ids, record_context=record_context, aggregate=aggregate, pipeline=pipeline, mode=mode, as_of=as_of)
         principal, session_id = await bound(ctx, "answer")
         stream = await run(engine.answer_stream, request, principal, session_id)
         try:

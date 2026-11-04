@@ -189,6 +189,16 @@ MATRIX: dict[str, AdapterCapabilities] = {
             ),
         ),
         AdapterCapabilities(
+            kind="kuzu",
+            capabilities={"graph": _c("contracts", templated=True, provenance=True, memberships=True, predicate_scope=False, embedded=True)},
+            notes=(
+                "backends/kuzu/ (embedded Kuzu, the 'kuzu' extra) on the contracts; graph conformance passes in-process "
+                "(no service). Fixed parameterised Cypher only; eligibility is a document-id allow/deny list "
+                "(predicate_scope false). mode: attach opens an existing database read-only through a declared "
+                "mapping file (upsert/put_communities refused)."
+            ),
+        ),
+        AdapterCapabilities(
             kind="mongodb",
             capabilities={
                 "catalog": _c("contracts", registry=True),

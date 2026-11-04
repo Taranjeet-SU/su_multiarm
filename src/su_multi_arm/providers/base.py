@@ -85,6 +85,14 @@ class ProviderIncomplete(ProviderError):
     category = "incomplete"
 
 
+class ProviderLimitIgnored(ProviderResponseError):
+    """The provider reported more output tokens than the role's ``max_tokens`` (QQ-01): the server
+    ignored the output ceiling (Ollama's ``/v1`` ignores ``max_completion_tokens``). The reply is
+    not used; set the role's ``max_tokens_parameter`` to the name the server honours."""
+
+    category = "output_limit_ignored"
+
+
 class ProviderRefusal(ProviderError):
     category = "refusal"
 
@@ -237,7 +245,7 @@ class RoleSpec:
             max_tokens=config.max_tokens,
             timeout_seconds=config.timeout_seconds,
             max_tokens_parameter=getattr(config, "max_tokens_parameter", "max_completion_tokens"),
-            structured_output=getattr(caps, "structured_output", "none"),
+            structured_output=getattr(caps, "structured_output", None) or "none",
             prompt_caching=getattr(caps, "prompt_caching", "none"),
             reasoning_effort=getattr(config, "reasoning_effort", None),
             pricing_key=pricing or config.model or None,
@@ -326,10 +334,10 @@ class StrictSchemaError(CapabilityMismatch):
     """A schema OpenAI strict mode cannot express. ``problems`` lists every offending construct
     with its JSON path so validation reports all of them at once. Raised before any call."""
 
-    def __init__(self, name: str, problems: list[str]):
+    def __init__(self, name: str, problems: list[str], hint: str = "declare structured_output: json_schema for this role"):
         self.schema_name = name
         self.problems = list(problems)
-        super().__init__(f"{name} is not strict-expressible: " + "; ".join(self.problems) + " (declare structured_output: json_schema for this role)")
+        super().__init__(f"{name} is not strict-expressible: " + "; ".join(self.problems) + f" ({hint})")
 
 
 def strict_schema(schema: dict[str, Any], name: str = "schema") -> dict[str, Any]:
@@ -385,6 +393,49 @@ def strict_schema(schema: dict[str, Any], name: str = "schema") -> dict[str, Any
     converted = walk(schema, "$")
     if problems:
         raise StrictSchemaError(name, problems)
+    return converted
+
+
+# Anthropic ``output_config.format`` (2.0.0a3, verified against the real API): numeric bounds and
+# ``maxItems`` are refused with HTTP 400, ``minItems`` only takes 0 or 1, and every object must be
+# closed. These value constraints are dropped from the wire schema; the reply is still validated
+# with the original pydantic model, so a value outside them is a ``SchemaViolation``, never accepted.
+OUTPUT_FORMAT_DROPPED: frozenset[str] = frozenset({"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "maxItems"})
+
+
+def output_format_schema(schema: dict[str, Any], name: str = "schema") -> dict[str, Any]:
+    """The schema as Anthropic ``output_config.format`` accepts it. Free-form mappings
+    (``additionalProperties`` with a schema, or an object without declared properties) cannot be
+    closed and raise ``StrictSchemaError`` before any call; nothing else is rewritten."""
+    problems: list[str] = []
+
+    def walk(node: Any, path: str) -> Any:
+        if isinstance(node, list):
+            return [walk(v, f"{path}[{i}]") for i, v in enumerate(node)]
+        if not isinstance(node, dict):
+            return node
+        result: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in OUTPUT_FORMAT_DROPPED or (key == "minItems" and isinstance(value, int) and value > 1):
+                continue
+            if key in {"properties", "$defs"} and isinstance(value, dict):
+                result[key] = {sub: walk(child, f"{path}.{key}.{sub}") for sub, child in value.items()}
+            elif key in {"enum", "required", "const", "default"}:
+                result[key] = value
+            else:
+                result[key] = walk(value, f"{path}.{key}")
+        if node.get("type") == "object" or "properties" in node:
+            if "properties" not in node:
+                problems.append(f"{path}: object without declared properties (free-form mapping)")
+            elif node.get("additionalProperties") not in (None, False):
+                problems.append(f"{path}: additionalProperties with a schema (free-form mapping)")
+            else:
+                result["additionalProperties"] = False
+        return result
+
+    converted = walk(schema, "$")
+    if problems:
+        raise StrictSchemaError(name, problems, hint="declare structured_output: none for this role")
     return converted
 
 

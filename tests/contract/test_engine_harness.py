@@ -27,7 +27,7 @@ PROBES = [
     ("What is the total of all records?", "numeric total answered with a record count", {"arm": "structured", "scope": {"measure": {"kind": "count"}}}),
     ("How many records are in region north?", "qualifier on a non-filterable field", {"arm": "structured", "scope": {"predicates": [{"field": "region", "op": "eq", "value": "north"}], "measure": {"kind": "count"}}}),
     ("How many records were created in March 2024?", "calendar qualifier without an offset", {"arm": "structured", "scope": {"predicates": [{"field": "created_at", "op": "date_interval", "lower": "2024-03", "granularity": "month"}], "measure": {"kind": "count"}}}),
-    ("List all records about billing", "exhaustive list over an unbound topic", {"arm": "structured", "scope": {"predicates": [{"field": "status", "op": "eq", "value": "billing"}]}}),
+    ("List all billing records", "exhaustive list over an unbound topic", {"arm": "structured", "scope": {"predicates": [{"field": "status", "op": "eq", "value": "billing"}]}}),
     ("Are there any records for project Omega?", "absence with an unobserved value", {"arm": "structured", "scope": {"predicates": [{"field": "project", "op": "eq", "value": "Omega"}], "measure": {"kind": "count"}}}),
     ("When was the earliest record?", "earliest without a declared time basis", {"arm": "structured", "scope": {"measure": {"kind": "first_seen", "field": "created_at"}}}),
     ("How many open records are there in table 7?", "count scoped to a non-existent table", {"arm": "structured", "scope": {"predicates": [{"field": "status", "op": "eq", "value": "open"}, {"field": "tag", "op": "eq", "value": "7"}], "measure": {"kind": "count"}}}),

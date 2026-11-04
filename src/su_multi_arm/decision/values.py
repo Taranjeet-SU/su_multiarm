@@ -16,6 +16,11 @@ Resolution table (one row per predicate/field-type combination):
   end)`` computed under the field's timezone policy.
 * ``missing``: the field must be ``nullable``. Failure: ``field_not_nullable``.
 * any predicate on an unknown or non-``filterable`` field: ``field_not_filterable``.
+* ``eq`` (agent-compiled) whose value names a declared ``FieldSpec.states`` entry: the state's
+  value set (``in``, negated for a ``negate`` state, which includes and reports null values).
+* a calendar expression (``ValueResolver.window``; ``decision/windows.py``): a half-open
+  ``date_interval`` in ``MetadataSchema.timezone``; a relative expression needs the request
+  ``anchor``. Failure: ``unparseable_bound``.
 
 Fields with ``max_catalog_cardinality: 0`` (IDs, free text) are never enumerated to a model. No
 value is ever guessed, corrected or dropped silently.
@@ -185,11 +190,15 @@ class ValueResolver:
         records: Any | None = None,
         gen: GenerationId | None = None,
         acl: ScopePredicates | Sequence[Predicate] = (),
+        anchor: date | None = None,
     ):
         self.schema = schema
         self.records = records
         self.gen = gen
         self.acl = list(acl)
+        # The request's anchor day in ``schema.timezone`` for relative calendar expressions
+        # ("this month", "last 7 days"); ``None`` refuses them (never guessed).
+        self.anchor = anchor
         self._observed: dict[str, list[str] | None] = {}
 
     # --- observed values -------------------------------------------------------------------------
@@ -240,6 +249,11 @@ class ValueResolver:
                 origin=origin,
             )
         try:
+            # Declared states apply to agent-compiled predicates only; a caller's request filter is
+            # a literal value and is applied as given.
+            state = self.state(spec, predicate) if origin == "agent" else None
+            if state is not None:
+                return Resolution(predicate=state, origin=origin)
             if predicate.op == "missing":
                 return self._resolve_missing(spec, predicate, origin)
             if predicate.op in {"eq", "in"}:
@@ -252,6 +266,46 @@ class ValueResolver:
                 unsupported=UnsupportedConstraint(constraint_text=_constraint(predicate), reason=error.reason, suggestion=str(error)),
                 origin=origin,
             )
+
+    @staticmethod
+    def state(spec: FieldSpec, predicate: Predicate) -> Predicate | None:
+        """An ``eq`` on a declared state name (``FieldSpec.states``, case-insensitive) becomes the
+        state's value set: ``in values``, negated per the state (and inverted again by a negated
+        predicate). A declared state takes precedence over an observed value of the same text."""
+        if predicate.op != "eq" or not isinstance(predicate.value, str) or not spec.states:
+            return None
+        folded = predicate.value.strip().casefold()
+        named = next((s for s in spec.states if s.name.casefold() == folded), None)
+        if named is None:
+            return None
+        return Predicate(field=spec.name, op="in", value=list(named.values), negate=named.negate != predicate.negate)
+
+    def window(self, field: str, expression: str) -> Resolution:
+        """A calendar expression on a temporal field → a half-open ``date_interval`` predicate
+        (``decision/windows.py``; relative expressions need ``anchor``)."""
+        from ..backends._scope import zone_of
+        from .windows import WindowError, bounds, parse_window
+
+        spec = self.schema.field(field)
+        text = f"{field} within {expression!r}"
+        if spec is None or not spec.filterable or spec.type not in {"datetime", "date"}:
+            return Resolution(
+                unsupported=UnsupportedConstraint(constraint_text=text, reason="field_not_filterable", suggestion="a time window needs a declared filterable datetime/date field")
+            )
+        if spec.type == "datetime" and spec.timezone_policy == "require_offset" and self.schema.timezone is None:
+            return Resolution(
+                unsupported=UnsupportedConstraint(
+                    constraint_text=text,
+                    reason="timezone_missing",
+                    suggestion=f"{field} requires offsets and metadata_schema.timezone is not declared; declare the zone calendar expressions are read in",
+                )
+            )
+        try:
+            window = parse_window(expression, self.anchor)
+        except WindowError as error:
+            return Resolution(unsupported=UnsupportedConstraint(constraint_text=text, reason="unparseable_bound", suggestion=str(error)))
+        lower, upper = bounds(window, spec.type, zone_of(self.schema))
+        return Resolution(predicate=Predicate(field=field, op="date_interval", lower=lower, upper=upper, granularity="day"))
 
     def _resolve_missing(self, spec: FieldSpec, predicate: Predicate, origin: str) -> Resolution:
         if not spec.nullable:

@@ -18,21 +18,47 @@ from ..models import StrictModel
 ReportStatus = str  # disabled | no_evidence_within_budget | partial | complete_input | rejected
 
 
+# Key under which a stored report carries the hierarchy and statistics (backends persist five
+# columns: id, label, documents, entities, report; rows written before 2.0.0a3 simply lack it).
+STORAGE_KEY = "_community"
+
+
 class Community(StrictModel):
     id: str = Field(min_length=1)
     label: str = ""
     document_ids: list[str] = Field(default_factory=list)
     entity_ids: list[str] = Field(default_factory=list)
     report: dict[str, Any] = Field(default_factory=lambda: {"status": "disabled", "claims": []})
+    level: int = Field(default=0, ge=0, le=2)  # 0 = coarsest (``louvain_hierarchical``)
+    parent_id: str | None = None
+    stats: dict[str, Any] = Field(default_factory=dict)  # ``communities/stats.py``; empty when not configured
 
     def status(self) -> str:
         return str(self.report.get("status", "disabled"))
 
+    def storage_report(self) -> dict[str, Any]:
+        """The report as backends persist it: hierarchy and statistics ride along under
+        ``STORAGE_KEY`` when they differ from the defaults (so existing rows are unchanged)."""
+        meta = {k: v for k, v in (("level", self.level), ("parent_id", self.parent_id), ("stats", self.stats)) if v}
+        return {**self.report, STORAGE_KEY: meta} if meta else dict(self.report)
+
+    @classmethod
+    def from_storage(cls, id: str, label: str, document_ids: list[str], entity_ids: list[str], report: dict[str, Any]) -> Community:
+        report = dict(report)
+        meta = report.pop(STORAGE_KEY, None) or {}
+        return cls(id=id, label=label, document_ids=document_ids, entity_ids=entity_ids, report=report, **meta)
+
 
 def build_communities(
-    strategy: str, memberships: dict[str, set[str]], names: dict[str, str], min_documents: int, seed: int
+    strategy: str, memberships: dict[str, set[str]], names: dict[str, str], min_documents: int, seed: int, hierarchy: Any = None
 ) -> list[Community]:
-    """``memberships``: entity id -> document ids; ``names``: entity id -> display name."""
+    """``memberships``: entity id -> document ids; ``names``: entity id -> display name. ``hierarchy``
+    (``CommunityHierarchy``) tunes ``louvain_hierarchical``; defaults apply when it is ``None``."""
+    if strategy == "louvain_hierarchical":
+        from .hierarchy import build_hierarchical
+
+        options = {} if hierarchy is None else {"levels": hierarchy.levels, "resolution": hierarchy.resolution, "min_split": hierarchy.min_split}
+        return build_hierarchical(memberships, names, min_documents, seed, **options)
     if strategy == "entity":
         return [
             Community(id=key, label=names[key], document_ids=sorted(docs), entity_ids=[key])

@@ -5,30 +5,31 @@
 Chat capabilities come from `su_multi_arm/providers/capabilities.py::REGISTRY`; configuration
 validation accepts `structured_output: native` or `prompt_caching: controlled` only for declared
 `(provider, model)` pairs. Hosted providers are **contract-mocked** in this repository: their entries
-follow the providers' published API documentation and no paid call has been made.
+follow the providers' published API documentation. Rows whose Evidence names a real-API run were also
+exercised once against the paid API (small, spend-capped runs; see VALIDATION.md).
 
 ## Chat providers
 
 | Provider | Model pattern (first match wins) | Native structured output | Prompt caching | Streaming | Evidence |
 |---|---|---|---|---|---|
-| `anthropic` | `claude-3*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `claude-sonnet-4*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `claude-opus-4*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `claude-haiku-4*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `claude-sonnet-5*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `claude-opus-5*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `claude-haiku-5*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `anthropic` | `*` | no | controlled | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `gpt-4o-2024-05-13` | no | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `gpt-4o*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `gpt-4.1*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `gpt-5*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `o1-mini*` | no | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `o1-preview*` | no | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `o1*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `o3*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `o4-mini*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | `*` | no | passive | yes | contract-mocked (mocked HTTP transport; no paid call made) |
+| `anthropic` | `claude-3*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `anthropic` | `claude-sonnet-4*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `anthropic` | `claude-opus-4*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `anthropic` | `claude-haiku-4*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `anthropic` | `claude-sonnet-5*` | output_format | controlled | yes | real-API smoke, 2.0.0a3 (`claude-sonnet-5-5`: output_format planner); otherwise contract-mocked |
+| `anthropic` | `claude-opus-5*` | tool_use | controlled | yes | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `anthropic` | `claude-haiku-5*` | output_format | controlled | yes | real-API smoke, 2.0.0a3 (`claude-haiku-5-5`: output_format, tool_use with `$defs`, streaming, cache write/read, thinking truncation); otherwise contract-mocked |
+| `anthropic` | `*` | no | controlled | yes | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `openai` | `gpt-4o-2024-05-13` | no | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `gpt-4o*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `gpt-4.1*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `gpt-5*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `o1-mini*` | no | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `o1-preview*` | no | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `o1*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `o3*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `o4-mini*` | json_schema_strict | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
+| `openai` | `*` | no | passive | yes | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
 | `openai_compatible` | `*` | role-declared | passive | yes | contract-mocked; optional `external` smoke against a local server you run |
 | `none` | — | — | — | — | in-process (answer generation disabled) |
 

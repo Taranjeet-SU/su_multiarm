@@ -15,20 +15,26 @@ Rules, applied after generation and before any guard:
 5. (QA-04) the user-facing ``answer`` text is checked too: every count, exhaustive-list or absence
    **statement** found in it (``statements.py``; deterministic, English-scoped) needs a typed claim of
    the same kind (an absence statement may be backed by a ``count`` claim) that rule 2 accepts.
-   Violation: ``answer_text_without_exact_scope``.
+   Violation: ``answer_text_without_exact_scope``. The check runs whether or not the model set
+   ``insufficient_evidence`` (QQ-06): a hedge flag never exempts a stated count, list or absence.
 
 ``unsupported_constraints`` is populated here from the ``Decision`` and the ``ScopeResult``s; the
 generator cannot set it (``Answer`` forbids the key).
 
 Violation handling (``on_violation``):
 
-* ``abstain_with_reason`` (default): the answer becomes ``insufficient_evidence: true`` with the
-  violated rules recorded (``contract: abstained``). One exception (QA-08): when the answer **text**
+* ``strip`` (default since 2.0.0a3, owner decision): a non-narrative claim that rules 2/3 reject is
+  removed from ``claims`` (QA-08), and when the **question asks no aggregate** (no count, list,
+  total, earliest/latest or absence intent, targeted or not) the sentences of the answer text that
+  carry an unbacked statement are removed too; every removal is recorded (``action: strip``,
+  ``contract: stripped``). When the question **does** ask an aggregate, an unbacked statement in the
+  text is the answer itself, so the answer abstains instead. If nothing remains, or no citation
+  remains for a factual answer, it abstains. Unknown evidence, missing citations, an empty answer
+  and a stated number that differs from the cited exact aggregate always abstain.
+* ``abstain_with_reason``: the answer becomes ``insufficient_evidence: true`` with the violated
+  rules recorded (``contract: abstained``). One exception (QA-08): when the answer **text**
   contains no count, list or absence statement, a non-narrative claim that rules 2/3 reject is
-  stripped from ``claims`` instead (recorded with ``action: strip``, ``contract: stripped``); the
-  narrative answer stands. Unknown evidence and missing citations always abstain.
-* ``strip``: as above, and in addition the sentences of the answer text that carry an unbacked
-  statement are removed; if nothing remains the answer abstains.
+  stripped from ``claims`` instead; the narrative answer stands.
 * ``fail``: any violation raises ``AnswerContractViolation``.
 """
 
@@ -40,7 +46,7 @@ from typing import TYPE_CHECKING, Any, Literal, Sequence
 from pydantic import Field, create_model
 
 from ..core.types import ScopeResult, UnsupportedConstraint
-from ..decision.intent import Intents
+from ..decision.intent import Intents, untargeted_constraint
 from ..models import Answer, Claim, ClaimKind, ContractRule, Coverage, StrictModel, Violation
 from .statements import Statement, detect_statements, stated_number, units_for
 
@@ -139,7 +145,7 @@ class _Finding(StrictModel):
 
 
 class AnswerContract:
-    def __init__(self, on_violation: OnViolation = "abstain_with_reason"):
+    def __init__(self, on_violation: OnViolation = "strip"):
         self.on_violation = on_violation
 
     # --- checks ----------------------------------------------------------------------------------
@@ -154,8 +160,9 @@ class AnswerContract:
     @staticmethod
     def _number_matches(statement: Statement, answer: Answer, by_id: dict[str, AggregateEvidence]) -> bool:
         """A backed ``count`` statement's number equals a value of an exact aggregate cited by a count
-        claim (scalar value, a group count, or the number of listed ids). Vague counts pass (N2)."""
-        stated = stated_number(statement.text)
+        claim (scalar value, a group count, or the number of listed ids). Vague counts pass (N2).
+        A total/sum statement compares its ``amount`` (QQ-03)."""
+        stated = statement.amount if statement.amount is not None else stated_number(statement.text)
         if stated is None:
             return True
         values: set[float] = set()
@@ -175,10 +182,21 @@ class AnswerContract:
                     values.update(float(v) for v in value.values() if isinstance(v, (int, float)) and not isinstance(v, bool))
                 elif isinstance(value, list):
                     values.add(float(len(value)))
-                for group in aggregate.result.groups:
+                result = aggregate.result
+                numbers: list[float] = []
+                for group in [*result.groups, *result.ties]:
                     values.add(float(group.count))
                     if isinstance(group.value, (int, float)) and not isinstance(group.value, bool):
                         values.add(float(group.value))
+                        numbers.append(float(group.value))
+                # Query-compiler results (2.0.0a3): the matched total ("showing 10 of 42"), a share's
+                # numerator, the records listed, null counts and a two-period difference.
+                values.update(float(n) for n in (result.total, result.numerator) if n is not None)
+                values.update(float(n) for n in result.unknown.values())
+                if result.listed:
+                    values.add(float(len(result.listed)))
+                if len(numbers) >= 2 and all(g.key.keys() == {"period"} for g in result.groups[:2]):
+                    values.add(abs(numbers[1] - numbers[0]))
                 if re.search(r"\bof\s+(?:the\s+|all\s+)?$", answer.answer[: statement.start], re.I):
                     values.add(float(aggregate.result.denominator))  # "12 of 36 records": the population
         return not values or float(stated) in values
@@ -219,14 +237,15 @@ class AnswerContract:
             if not any(c.kind in accepted and self._backs(c, by_id, statement.kind) for c in answer.claims):
                 unbacked.append(statement)
         mismatched = [s for s in statements if s.kind == "count" and s not in unbacked and not self._number_matches(s, answer, by_id)]
-        if mismatched and not answer.insufficient_evidence:
+        # QQ-06: the model's insufficient_evidence flag does not exempt the text from these checks.
+        if mismatched:
             findings.append(
                 _Finding(
                     violation=Violation(rule="answer_number_mismatch", detail="the count stated in the answer text differs from the value of the exact aggregate its count claim cites"),
                     statements=mismatched,
                 )
             )
-        if unbacked and not answer.insufficient_evidence:
+        if unbacked:
             kinds = list(dict.fromkeys(s.kind for s in unbacked))
             findings.append(
                 _Finding(
@@ -276,14 +295,18 @@ class AnswerContract:
                 UnsupportedConstraint(constraint_text=a.text, reason="aggregate_intent_without_scope", suggestion="no exact typed scope was executed")
                 for a in intents.aggregates
             ]
+        for item in intents.untargeted:  # QQ-04: a list of a noun no structured scope can express
+            if not any(f.constraint_text == item.text for f in flagged):
+                flagged.append(untargeted_constraint(item))
         statements = detect_statements(
             answer.answer,
             units=units_for(targets, question),
-            list_intent="list" in intents.kinds(),
+            list_intent=intents.asks_list(),
             passages=passages,
+            fields=targets,
         )
         findings = self._findings(answer, evidence_ids=evidence_ids, aggregates=aggregates, intents=intents, statements=statements)
-        outcome, result_answer = self._apply(answer, findings, statements)
+        outcome, result_answer = self._apply(answer, findings, statements, aggregate_question=intents.asks_aggregate())
         violations = [f.violation.model_copy(update={"action": "strip" if outcome == "stripped" else "abstain"}) for f in findings]
         if trace is not None:
             trace.event(
@@ -309,7 +332,7 @@ class AnswerContract:
         )
         return AnswerResult(answer=abstained, unsupported_constraints=flagged, coverage=coverage, violations=violations, contract="abstained")
 
-    def _apply(self, answer: Answer, findings: list[_Finding], statements: list[Statement]) -> tuple[str, Answer]:
+    def _apply(self, answer: Answer, findings: list[_Finding], statements: list[Statement], *, aggregate_question: bool = False) -> tuple[str, Answer]:
         """``("passed" | "stripped" | "abstained", answer)`` under the configured policy."""
         if not findings:
             return "passed", answer
@@ -317,7 +340,8 @@ class AnswerContract:
             return "abstained", answer
         strippable = {"claim_without_exact_scope", "aggregate_intent_without_scope"}
         if self.on_violation == "strip":
-            strippable = strippable | {"answer_text_without_exact_scope"}
+            if not aggregate_question:  # a narrative answer: drop the unbacked sentences only
+                strippable = strippable | {"answer_text_without_exact_scope"}
         elif statements:
             return "abstained", answer  # the text itself states a count/list/absence: never strip silently
         if any(f.violation.rule not in strippable for f in findings):
@@ -334,7 +358,7 @@ class AnswerContract:
         cited = {e for c in claims for e in c.evidence_ids}
         dropped_only = {e for i in drop_claims for e in answer.claims[i].evidence_ids} - cited
         citations = [c for c in answer.citations if c not in dropped_only or c in text]
-        if not citations:
+        if not citations and not answer.insufficient_evidence:
             return "abstained", answer
         return "stripped", answer.model_copy(update={"answer": text, "claims": claims, "citations": citations})
 

@@ -132,3 +132,17 @@ def v2_caps(v2_schema):
         metadata_schema=v2_schema,
         id_patterns=[V2_ID_PATTERN],
     )
+
+
+# Modules that import an optional extra at module level are skipped, not errored, when the extra is
+# not installed (a fresh ``pip install su-multi-arm[dev]`` has no ``api`` extra).
+import importlib.util as _importlib_util  # noqa: E402
+
+collect_ignore: list[str] = []
+if _importlib_util.find_spec("fastapi") is None:
+    collect_ignore += [
+        "contract/test_serving_http.py",
+        "parity/test_request_parity.py",
+        "parity/test_serving_parity.py",
+        "test_interfaces.py",
+    ]

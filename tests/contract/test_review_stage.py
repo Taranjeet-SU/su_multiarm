@@ -190,7 +190,7 @@ def test_structured_first_replan_runs_through_engine_answer(agentic, monkeypatch
 
 
 def test_structured_first_replan_over_http_and_stream_is_not_an_internal_error(agentic, monkeypatch):
-    from fastapi.testclient import TestClient
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
     from su_multi_arm.runtime.events import DoneEvent, ErrorEvent
     from su_multi_arm.serving.http import create_app

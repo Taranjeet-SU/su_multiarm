@@ -22,11 +22,20 @@ def collapse_arm(candidates: list[Candidate], unit: CollapseUnit = "document") -
     for candidate in ordered:
         prior = seen.get(candidate.record_id)
         if prior is None:
-            seen[candidate.record_id] = candidate.model_copy(deep=True)
+            # Fresh containers, not a deep copy: the merge below only rebinds these fields, and a deep
+            # copy of every candidate dominated selection time on large candidate pools.
+            seen[candidate.record_id] = candidate.model_copy(
+                update={
+                    "chunk_ids": list(candidate.chunk_ids),
+                    "metadata": dict(candidate.metadata),
+                    "provenance": [dict(p) for p in candidate.provenance],
+                }
+            )
             continue
         prior.chunk_ids = list(dict.fromkeys([*prior.chunk_ids, *candidate.chunk_ids]))
         prior.provenance = [*prior.provenance, *candidate.provenance]
         prior.pinned = prior.pinned or candidate.pinned
+        prior.leads = prior.leads or candidate.leads
     return list(seen.values())
 
 

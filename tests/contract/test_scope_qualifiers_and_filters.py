@@ -303,7 +303,7 @@ def example_engine(tmp_path, path: str) -> Engine:
 
 @pytest.mark.parametrize("path", ["examples/v2/local.yaml", "examples/local.yaml"])
 def test_documented_ordinary_questions_are_retrieval_on_every_surface(tmp_path, path):
-    from fastapi.testclient import TestClient
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
     from su_multi_arm.api import create_app
 

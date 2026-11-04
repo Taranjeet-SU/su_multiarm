@@ -259,6 +259,14 @@ FieldType = Literal["string", "integer", "number", "boolean", "datetime", "date"
 ViolationCategory = Literal["unknown_field", "type", "null", "enum", "timezone", "format"]
 
 
+class NamedState(StrictModel):
+    """A declared name for a set of field values (``open`` = not ``done``/``closed``)."""
+
+    name: str = Field(min_length=1, max_length=64)
+    values: list[str] = Field(min_length=1, max_length=200)
+    negate: bool = False  # the state is "none of ``values``" (unknown/null values included and reported)
+
+
 class FieldSpec(StrictModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
     type: FieldType
@@ -275,9 +283,23 @@ class FieldSpec(StrictModel):
     # ``id`` fields only: regex an identifier of this field matches inside free text. The exact_id
     # arm and the intent pre-pass use it to route lookups; it never widens a match (no fuzzy ids).
     pattern: str | None = Field(default=None, min_length=1, max_length=512)
+    # Named value sets a question may use instead of a value ("open" = not one of the closed
+    # values). Declared by the operator, never inferred; ``negate`` sets match records whose value
+    # is unknown (null) too, and every result reports how many of those it counted.
+    states: list[NamedState] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def coherent(self):
+        if self.states:
+            if self.type not in {"string", "enum", "id"}:
+                raise ValueError(f"field {self.name}: states are only valid for string/enum/id fields")
+            names = [s.name.casefold() for s in self.states]
+            if len(set(names)) != len(names):
+                raise ValueError(f"field {self.name}: state names must be unique")
+            if self.type == "enum":
+                unknown = sorted({v for s in self.states for v in s.values} - set(self.enum_values or []))
+                if unknown:
+                    raise ValueError(f"field {self.name}: state values {unknown} are not enum_values")
         if self.pattern is not None:
             if self.type != "id":
                 raise ValueError(f"field {self.name}: pattern is only valid for type id")
@@ -312,12 +334,24 @@ class MetadataSchema(StrictModel):
     canonical_unit: str = Field(default="document", min_length=1)  # population counted by default
     equivalence_field: str | None = None  # optional cross-record identity for count_distinct
     unknown_fields: Literal["allow", "reject"] = "allow"  # undeclared metadata keys are untyped, never filterable
+    # IANA zone in which calendar expressions ("this month", "October", "last 7 days") and calendar
+    # buckets are read; relative expressions also need the request anchor (``as_of``, else now).
+    # Undeclared (None): buckets and date/assume_utc fields use UTC, but a calendar expression on a
+    # ``require_offset`` datetime field is refused (``timezone_missing``), never read in a guessed zone.
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
 
     @model_validator(mode="after")
     def coherent(self):
         names = [f.name for f in self.fields]
         if len(set(names)) != len(names):
             raise ValueError("metadata field names must be unique")
+        if self.timezone is not None:
+            try:
+                from zoneinfo import ZoneInfo
+
+                ZoneInfo(self.timezone)
+            except (ValueError, KeyError, OSError):
+                raise ValueError(f"timezone {self.timezone!r} is not a known IANA zone") from None
         if self.equivalence_field and self.equivalence_field not in names:
             raise ValueError("equivalence_field must be a declared field")
         return self
@@ -449,7 +483,37 @@ class Measure(StrictModel):
             raise ValueError(f"measure {self.kind} requires a field")
         if self.kind == "bucket" and not self.granularity:
             raise ValueError("bucket requires a granularity")
+        if self.kind == "count_distinct" and self.field is not None:
+            # ``count_distinct`` counts distinct values of ``unit``; a planner that names the field as
+            # ``field`` meant that unit. Without this the field was ignored and the count fell back to
+            # record ids, a silently wrong "exact" number.
+            if self.unit is not None and self.unit != self.field:
+                raise ValueError("count_distinct takes one key: field and unit differ")
+            self.unit = self.field
         return self
+
+
+class Period(StrictModel):
+    """One period of a comparison: the half-open window ``[lower, upper)`` on the scope's
+    ``time_basis`` field (ISO bounds; aware datetimes for ``datetime`` fields, dates for ``date``)."""
+
+    label: str = Field(min_length=1, max_length=128)
+    lower: str = Field(min_length=1, max_length=64)
+    upper: str = Field(min_length=1, max_length=64)
+
+
+class TextMatch(StrictModel):
+    """A literal topic condition counted through the lexical index over the whole eligible corpus
+    (never a ranked top-k). ``phrase``: the words contiguous; ``all_terms``: every word in one indexed
+    chunk. ``role: numerator`` makes it the numerator of a share instead of a scope condition. The
+    structured arm resolves it to record ids; a record store never evaluates text itself."""
+
+    kind: Literal["phrase", "all_terms"] = "all_terms"
+    text: str = Field(min_length=1, max_length=512)
+    role: Literal["scope", "numerator"] = "scope"
+
+
+Granularity = Literal["day", "month", "year"]
 
 
 class ScopeSpec(StrictModel):
@@ -460,12 +524,51 @@ class ScopeSpec(StrictModel):
     measure: Measure | None = None
     time_basis: str | None = None
     population: Literal["canonical_record", "chunk"] = "canonical_record"
+    # --- query-compiler operations (2.0.0a3 parity; all optional, additive) -----------------------
+    # Ranking of groups by their measure value (the group count for ``count``); ties broken by the
+    # group key, ascending; ``nth`` keeps only the groups at that dense rank ("second most").
+    order: Literal["desc", "asc"] | None = None
+    nth: int | None = Field(default=None, ge=1, le=1000)
+    granularity: Granularity | None = None  # calendar bucket of temporal ``group_by`` fields
+    periods: list[Period] = Field(default_factory=list, max_length=12)  # period comparison on time_basis
+    with_share: bool = False  # each group's share of the matched total
+    numerator: list[Predicate] = Field(default_factory=list)  # share: the numerator condition
+    text: TextMatch | None = None  # literal topic via the lexical index (resolved by the structured arm)
+    limit: int | None = Field(default=None, ge=1, le=10000)  # list: records shown (``total`` is reported)
+
+    @model_validator(mode="after")
+    def coherent(self):
+        if len(self.group_by) > 2:
+            raise ValueError("group_by takes at most two fields (a cross-tab)")
+        if len(set(self.group_by)) != len(self.group_by):
+            raise ValueError("group_by fields must differ")
+        if self.nth is not None and not self.group_by:
+            raise ValueError("nth ranks groups: it needs group_by")
+        if self.periods and not self.time_basis:
+            raise ValueError("periods compare windows of the time_basis field: set time_basis")
+        if self.periods and self.group_by:
+            raise ValueError("a period comparison is its own grouping: drop group_by")
+        labels = [p.label for p in self.periods]
+        if len(set(labels)) != len(labels):
+            raise ValueError("period labels must be unique")
+        if self.numerator and (self.measure is None or self.measure.kind != "share"):
+            raise ValueError("numerator is only valid for a share measure")
+        if self.text is not None and self.text.role == "numerator" and (self.measure is None or self.measure.kind != "share"):
+            raise ValueError("a numerator text match is only valid for a share measure")
+        return self
 
 
 class GroupRow(StrictModel):
     key: dict[str, JsonScalar]
     value: JsonScalar | dict[str, Any]
     count: int = Field(ge=0)
+    rank: int | None = Field(default=None, ge=1)  # dense rank when the scope ranks groups
+    share: float | None = Field(default=None, ge=0, le=1)  # count / matched total (``with_share``)
+
+
+class ListedRecord(StrictModel):
+    id: str
+    sort_value: JsonScalar = None
 
 
 class ScopeResult(StrictModel):
@@ -478,6 +581,13 @@ class ScopeResult(StrictModel):
     zero_match: bool = False
     matched_ids: list[str] = Field(default_factory=list)
     missing_or_invalid: int = Field(default=0, ge=0)
+    # --- query-compiler operations (2.0.0a3) ------------------------------------------------------
+    total: int | None = Field(default=None, ge=0)  # records matched by the scope (list: "showing N of total")
+    listed: list[ListedRecord] = Field(default_factory=list)  # ``limit`` records in ``sort`` order
+    ties: list[GroupRow] = Field(default_factory=list)  # groups cut by top_n/nth that tie a kept group
+    unknown: dict[str, int] = Field(default_factory=dict)  # field -> matched records with a null value under a negated predicate
+    numerator: int | None = Field(default=None, ge=0)  # share: records matching the numerator
+    basis: list[str] = Field(default_factory=list)  # human-readable labels: time basis, windows, text match, count unit
 
 
 class Page(StrictModel):

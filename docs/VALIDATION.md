@@ -1,6 +1,25 @@
 # Validation report
 
-## 2.0.0a2 status — 2026-11-04
+## 2.0.0a3 status — 2026-11-04
+
+Release candidate: `2.0.0a3` (slice a3/contract-providers). This release makes `on_violation: strip`
+the default and native structured output the Anthropic default. It also fixes the local-model QA
+findings QQ-01 to QQ-06. CHANGELOG.md lists the changes, and the "2.0.0a3 contract and providers"
+entry at the end has the evidence.
+
+- **Synthetic local suite**: `python -m pytest -m 'not external'` gives **1069 passed** (the base at
+  `b99eae2` gave 1031 passed and 1 skipped). Bare `pytest -q` gives 1072 passed and 123 skipped.
+  `ruff check src tests` is clean.
+- **First real Anthropic run.** One small smoke under the QA spend guard: `claude-haiku-5-5` and
+  `claude-sonnet-5-5`, 44 requests, **$0.047** by the guard's ledger. It covered native
+  `output_config.format`, forced tool use with `$defs`, prompt-cache write and read, thinking and
+  truncation, LLM extraction with grounding, a planned answer, and a streamed answer.
+- **Refusal** (`stop_reason: refusal`) is still contract-mocked only. No prompt was sent to provoke
+  one.
+- **Not measured**: answer quality or relevance on any non-synthetic corpus, and Anthropic
+  behaviour beyond these single calls.
+
+## 2.0.0a2 status — 2026-11-04 (historical)
 
 Release candidate: `2.0.0a2` (branch `v2/phase-0`). This release fixes the 2.0.0a1 QA findings
 (QA-01 to QA-16), the 2.0.0a1 completeness-review risks R1 to R3 and the 2.0.0a2 release-review
@@ -25,6 +44,21 @@ Evidence by level. The "2.0.0a2 release evidence" entry at the end has the detai
 
 The sections that follow, starting with the 0.1.0a1 alpha report, are kept as dated history; their
 version numbers and test counts describe the code at that date, not this release.
+
+## Vector import, source order and source slots — 2026-11-04 (branch `parity/review-fix`)
+
+Scope: synthetic unit tests only (`tests/unit/test_precomputed_vectors.py`); no customer data, no paid
+calls. Covered: import matched by key with the provider never called; missing-row error vs
+`on_missing: embed`; audit refusals (dimension, count, duplicate key, non-finite, zero row, vectors
+digest, keys digest) with nothing activated; relocating the files keeps the index fingerprint and
+recipe while a changed digest changes both, and no path appears in the recipe or manifest; manifest
+records both digests, positional pairing and the imported input; a permuted keys file passes the file
+audit (documented as undetectable without `verify`) and fails the spot check, while the correct
+pairing passes it; FTS re-index with duplicate ids keeps one row per chunk; vector upsert replace path
+keeps ids and rows aligned; source slots never displace a pinned exact-id hit and are traced; v1
+downgrade refuses `source_order`/`source_slots`. The 2.0.0a1 golden index fingerprints are unchanged.
+An aggregate-only production-workload parity summary is kept outside this repository; it is not a
+claim of this release.
 
 ## 0.1.0a1 alpha report — 2026-10-11 (historical)
 
@@ -1407,3 +1441,187 @@ lists models.
   not log bodies. Still unsettled: whether `input_schema` with `$defs` is accepted (`LlmPlan` has 6
   `$defs`, `Answer` has 1), native planner and generator calls, streaming, and cache read/write token
   reporting. The Anthropic provider stays at "contract-mocked" evidence.
+
+## Query-compiler operations (structured-question parity) — 2026-11-04 (slice parity/query-compiler)
+
+Evidence level: **synthetic and mocked only**. No model call and no real service was used.
+- **Records adapters.** `testing/backend_conformance.py::check_query_operations` holds every records
+  adapter to the same results for ranking with ties, `nth`, calendar buckets, cross-tab, period
+  comparison, shares, `count_distinct` with missing/null values (review B1), numeric measures with null
+  coverage, negated states with their unknown count, lists with totals, record-identity predicates and
+  an unresolved text condition. `check_text_count` checks whole-corpus text matches on every adapter
+  with a lexical index. Ran here on memory, sqlite (numpy and faiss) and SQLAlchemy-on-SQLite; the
+  PostgreSQL, MongoDB, OpenSearch and Elasticsearch modules run the same checks but were **not run**
+  in this slice (no isolated service stack was started; they skip without one).
+- **Grammar and planner.** `tests/unit/test_query_compiler.py` (41 tests) covers calendar
+  expressions against a fixed anchor, zone handling, the rules grammar end to end over the in-memory
+  store, refusals (median, ambiguous per-group measure, unstructured double windows, residual words,
+  share without numerator), the strict-expressible planner schema with a mocked planner, the engine's
+  text-topic count through the structured arm, the answer contract's number check and the packing cap.
+- **Not measured.** The second historical service's structured-question gap (26/45) was not re-measured: that needs the
+  live planner and the private corpus. The grammar is English-only and covers the phrasings listed in
+  `docs/CONFIGURATION.md`; other phrasings still abstain with an `UnsupportedConstraint`.
+- Suite: `pytest -q -m 'not external'` 1073 passed (was 1032 tests); `pytest -q` (with
+  `-o pythonpath=src` in the worktree) 1076 passed, 123 skipped; ruff clean; golden index
+  fingerprints unchanged.
+
+## 2.0.0a3 contract and providers — 2026-11-04 (slice a3/contract-providers)
+
+**Synthetic and mocked evidence** (offline, `httpx.MockTransport` replays of the observed reply
+shapes):
+
+- `tests/qa/test_qa_qwen_2_0_0a3.py` has 13 tests for QQ-01 to QQ-04 and QQ-06. They came from the
+  local-model QA run (Ollama 0.33.0 `/v1`, a 27B open-weights model, synthetic support corpus). The
+  four proposed failing tests from that run pass unchanged after the fix: they XPASS under their
+  original `xfail(strict)` markers.
+- `tests/unit/test_contract_strip_default.py` has 8 tests for the `strip` default.
+- `tests/contract/test_anthropic_a3.py` has 16 tests: native default, `output_config.format`
+  request/reply, the thinking minimum, the v1 raise, thinking-token usage, `stop_details`, and every
+  package schema converting for `output_format`.
+- Suite: 1031 passed and 1 skipped at the base, then **1069 passed** (`-m 'not external'`). Bare
+  `pytest -q` gives 1072 passed and 123 skipped. The golden index-fingerprint test is green.
+
+**Found while fixing QQ-06 (synthetic):** "there are 111 open CloudTax tickets" was not detected as
+a count at all when the question was "How many open CloudTax tickets are there?". The cause: "open"
+became a question unit, so "111 open" was rejected as a label and the farther unit was never tried.
+The detector now retries the farther unit.
+
+**Real Anthropic smoke (first successful real calls).**
+
+Setup: `~/su_mutliarm_tests/claude/a3_smoke/smoke.py` ran through the QA spend guard
+(`~/su_mutliarm_tests/qa/`). The guard's caps were Anthropic $2.00 total and $0.40 for this tag. The
+guard now prices Sonnet at $2/$10 per 1M tokens and still prices cache reads at the full input rate,
+so its ledger is pessimistic. Models: `claude-haiku-5-5` and `claude-sonnet-5-5`; no other model was
+called. Corpus: 6 synthetic tickets. Each step ran once.
+
+Results:
+
+- **Planner, native `output_config.format`, Sonnet 5.5.** The `LlmPlan` reply was valid, with 2
+  steps. Stop reason `end_turn`, 3081 input / 87 output tokens.
+- **Planner, forced `tool_use`, Haiku 5.5.** The registry kind was overridden in the harness. The
+  `LlmPlan` schema with `$defs` was accepted as `input_schema`, and the tool input validated. Stop
+  reason `tool_use`, 0 thinking tokens: a forced tool call does not think.
+- **Prompt caching (`controlled`, Haiku 5.5).** Two identical calls with a 42.7k-character system
+  prompt. The first reported `cache_creation_input_tokens` 13873. The second reported
+  `cache_read_input_tokens` 13873. Both are normalised into `Usage` (input 13898 including cached
+  tokens).
+- **Thinking (Haiku 5.5, `max_tokens` 1024, text mode).** Arithmetic prompt: `end_turn`, 469 output
+  tokens, of which 464 were thinking (`Usage.reasoning_tokens`).
+  - In an exploratory raw call before the fix, `max_tokens` 128 ended with `stop_reason:
+    max_tokens`, all 128 tokens thinking and no text block. This is why the 1024 minimum exists.
+  - Sonnet 5.5 did not think on the same prompt.
+- **Schema limits found on the real API.** `output_config.format` refuses `minimum`/`maximum` on
+  integers and `maxItems` on arrays with HTTP 400. It accepts `minLength`/`maxLength`, `anyOf`
+  with null, `default` and `$defs`. These findings set what `output_format_schema` drops.
+- **LLM extraction with grounding (ingest, Haiku 5.5 `output_format`).** 6 documents and 12 chunks:
+  12 extraction calls, all `end_turn`, 117 to 379 thinking tokens each. 17 entities and 1 relation
+  were accepted under the strict grounding policy, with 0 rejected.
+- **Planned answer (Sonnet planner, Haiku generator).**
+  - First run: the contract **abstained** (`factual_without_citations` plus
+    `answer_text_without_exact_scope`). The raw reply was not captured on that run.
+  - Second run, same question, raw reply recorded: `contract: passed`. 4 narrative claims, citations
+    `case:0003` and `case:0000`, `insufficient_evidence: false`.
+  - The model's output varies between runs. The first abstention is a fail-closed outcome, not a
+    package error.
+- **Streamed answer (`answer_stream`, Haiku generator `streaming: true`, `output_format`).** Events
+  arrived as decision, arm_result, evidence, 50 token deltas, contract, then done.
+  `contract: passed`, and the answer cites `case:0002` (the BOM fix).
+- **Refusal.** `stop_reason: refusal` was not exercised; it remains contract-mocked.
+- **Spend.** 44 requests: 37 Haiku 200s, 5 Sonnet 200s and 2 Haiku 400s from the schema-limit
+  probes. The ledger shows **$0.0467** ($0.0342 Sonnet, $0.0125 Haiku). Cumulative Anthropic QA
+  spend is $0.0467 of the $2.00 cap.
+
+## Kuzu graph backend, typed traversal templates, hierarchical communities — 2026-11-04
+
+Scope: `backends/kuzu/` (embedded Kuzu 0.11.3, extra `kuzu`; `mode: native` and read-only
+`mode: attach`), `core/config_graph.py` + `arms/traversal.py` (typed traversal templates selected by
+a `GraphIntent`), `communities/hierarchy.py` (`louvain_hierarchical`) and `communities/stats.py`.
+
+Evidence level:
+
+- **Synthetic, in-process (default test run).** The graph conformance kit passes on the native kuzu
+  adapter with no service (`tests/conformance/test_kuzu_conformance.py`: fact-only traversal, hop
+  bound, document-id eligibility, predicates refused, provenance/occurrences, memberships, communities,
+  MERGE idempotency, atomic rejected upsert, generation isolation, compare-and-set pointer, namespaces
+  sharing one file). One traversal-template fixture gives **identical results on the in-memory fake,
+  sqlite and kuzu** (`tests/conformance/test_traversal_templates.py`); the kit's graph check now runs
+  the template cases on every graph backend. Attach mode is tested against a synthetic external Kuzu
+  database with its own schema (`tests/unit/test_kuzu_attach.py`): mapping validated against the
+  store catalog, unverified/quote-less/undocumented edges never surfaced, scope applied per row,
+  batched and per-node reads equal, writes refused, only built statements run. An engine run on
+  sqlite + native kuzu (`tests/contract/test_graph_templates_engine.py`) ingests with a stand-in
+  extractor, stores hierarchical communities with stats in kuzu, and a planner-selected template
+  returns path provenance; an undeclared template abstains.
+- **Not run:** neo4j template identity (`external`; no Neo4j test server was up), Leiden (Louvain
+  dendrogram used instead; plan open decision 7).
+- **Found and avoided:** Kuzu 0.11.3 `regexp_extract` returned a previous row's value for a
+  non-matching row when combined with filters (non-deterministically). The attach adapter derives
+  document ids in Python and runs no regex functions in Kuzu.
+- Counts: `-m 'not external'` **1068 passed** (base 1031 passed, 1 skipped); bare `pytest -q`
+  1071 passed, 124 skipped; ruff clean; golden index fingerprints unchanged (new community recipe
+  keys enter the fingerprint only when set).
+
+**Private parity measurement (aggregate only; store, mapping and questions stay outside the
+repository).** A copy of an earlier service's Kuzu knowledge-graph store (~0.96 GB; ~600k nodes,
+~1.4M relationships) was attached read-only through a private mapping (28 node tables, 30
+relationship tables, communities). For the 36-question parity set, the graph queries the earlier
+service actually executed in a recorded run (frozen plans; $0, no model call) were replayed as typed
+templates through the package graph arm against the package catalog of the same corpus:
+
+| | earlier service (recorded) | package, attached store |
+|---|---|---|
+| questions with graph queries | 12 | 11 replayed (1 used model-written Cypher: not replayable by design) |
+| questions with graph evidence | 11 | 8 |
+| graph evidence documents | 46 (as delivered) | 1,116 distinct (1,123 paths, all edges with quote + provenance; all in the package catalog) |
+| overlap with the earlier evidence documents | — | 14 of 46 (4 questions) |
+| retrieval targets reached through graph evidence | 0 | 1 (already in the package dense/lexical pool; 0 added) |
+| community evidence | 48 unverified summaries (24 questions) | 0: the store's communities carry no quote and no entity members, so no grounded claim exists |
+
+Read-out: graph evidence is now measurable through the package. Entity-neighbour and path questions
+reproduce (overlap on 4 of 7 such questions); the 5 symptom/error "troubleshoot" replays (4 questions) return
+nothing because the package resolves seeds by entity-name tokens while the earlier service matched
+substrings of symptom descriptions; community summaries are not used because they are unverified.
+Latency of the replayed graph steps: p50 1.0 s, max 53.5 s (a two-hop `connect` through hub nodes).
+This is evidence about evidence volume and overlap only, not answer quality or relevance.
+
+## Lexical `bm25` engine and request-path latency — 2026-11-04 (branch `worktree-agent-a0dd61f541791a8d6`, slice parity/lexical-latency)
+
+Evidence levels: **synthetic** (unit, contract and conformance tests) and **measured on a private
+corpus** (sanitised aggregates only; corpus, queries and per-query results stay outside the
+repository). No paid model call was made.
+
+- **Synthetic.** `rank_bm25.BM25Okapi` parity on a seeded 240-row Zipf corpus (words in more than
+  half of the rows, so the idf epsilon floor applies; a word in exactly half; repeated and unknown
+  query tokens): every score vector is bit-identical (`np.array_equal`; max |Δ| ≤ 1e-9 asserted),
+  the idf table and `average_idf` are equal, and the ranked list is every row containing a query
+  token by (−score, chunk id). The conformance kit passes on `sqlite_bm25` (and on `sqlite_faiss`
+  with the new bitset scope). Tests: `not external` 1032 → 1066 passed; ruff clean; the 2.0.0a1
+  golden index fingerprints are unchanged (the engine keys enter the recipe only with `bm25`).
+- **Measured, private support corpus** (58.7k records, 521k chunks, 1024-d precomputed vectors,
+  CPU only, shared host with load average ~15), 630 labelled queries replayed with frozen planner
+  queries against the earlier recorded service lists (paired bootstrap 10k):
+  - FTS5 path after the latency changes: all 630 lexical, dense, RRF and union lists are identical
+    to the recorded package run (the latency work changes no ranking).
+  - `bm25` alone (`ascii_alnum`, k1 1.5, b 0.75, ε 0.25): lexical R@10 0.668 / MRR 0.383 vs the
+    service 0.698 / 0.426 — no better than FTS5 (0.676 / 0.389). The scorer was not the gap.
+  - `bm25` + `verbatim_boost` + `pin_identifiers` (defaults) with front records kept first under
+    `source_slots`: lexical R@10 **0.703** / MRR **0.426** (Δ +0.005 [−0.011, +0.022] /
+    +0.000 [−0.018, +0.019]); fused RRF R@10 **0.837** / MRR **0.639** vs 0.826 / 0.645
+    (Δ +0.011 [−0.000, +0.023] / −0.006 [−0.021, +0.008]). Without the `leads` ordering fix the
+    same policies gave 0.672 / 0.384 (the slots re-ordered the front records).
+- **Latency** (warm p50 / p95, retrieval only, query embedding on CPU included):
+  - before (FTS5, 2 threads): 1.21 / 2.47 s — encode 0.39, vector search 0.24, two arm collapses
+    0.24, FTS5 search 0.72 s;
+  - after, `bm25`, 2 threads: **0.74 / 1.32 s** — encode 0.44, vector search 0.16, collapses 0.12,
+    lexical search **0.028** s; 8 threads (630 queries): **0.41 / 1.03 s** (dense step 0.34,
+    lexical step 0.11); excluding the query encode, ~0.25–0.29 s p50;
+  - the FTS5 path with the same request-path changes: 1.10 / 2.32 s (2 threads) — the FTS5 query
+    itself (0.88 s) stays the bottleneck.
+  - **Target p50 ≤ 0.3 s not met** with the query encoder on CPU (0.19–0.44 s in-process). The p95
+    tail is Python's full garbage collection over the ~0.5M objects the transformer stack loads
+    (0.5 s per full collection); `gc.freeze()` after warm-up in the serving process cut the arm
+    collapse p95 from 0.63 to 0.17 s in a 60-query check. The package does not do this itself.
+- **Not established.** Relevance on other corpora; the policies' effect without `source_slots`;
+  `bm25` build cost beyond this one ingest (886 s and peak RSS 10.4 GB, against 833 s and 10.4 GB
+  for the FTS5 build of the same corpus; the segment held 23.4M postings and 229k terms);
+  concurrent-request latency.

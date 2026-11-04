@@ -45,15 +45,21 @@ BACKEND_TESTS: dict[str, str] = {
     "opensearch": "tests/services/test_opensearch_adapter.py",
     "elasticsearch": "tests/conformance/test_elasticsearch_conformance.py",
     "neo4j": "tests/conformance/test_neo4j_conformance.py",
+    "kuzu": "tests/conformance/test_kuzu_conformance.py",
     "mongodb": "tests/conformance/test_mongodb_conformance.py",
 }
-IN_PROCESS = {"memory", "sqlite"}
+IN_PROCESS = {"memory", "sqlite", "kuzu"}  # kuzu is embedded: its conformance runs in-process (needs the kuzu extra)
 
 CHAT_EVIDENCE: dict[str, str] = {
-    "anthropic": "contract-mocked (mocked HTTP transport; no paid call made)",
-    "openai": "contract-mocked (mocked HTTP transport; no paid call made)",
+    "anthropic": "contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3)",
+    "openai": "contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun",
     "openai_compatible": "contract-mocked; optional `external` smoke against a local server you run",
     "none": "in-process (answer generation disabled)",
+}
+# Registry rows with evidence beyond the provider default (VALIDATION.md has the runs).
+CHAT_PATTERN_EVIDENCE: dict[tuple[str, str], str] = {
+    ("anthropic", "claude-haiku-5*"): "real-API smoke, 2.0.0a3 (`claude-haiku-5-5`: output_format, tool_use with `$defs`, streaming, cache write/read, thinking truncation); otherwise contract-mocked",
+    ("anthropic", "claude-sonnet-5*"): "real-API smoke, 2.0.0a3 (`claude-sonnet-5-5`: output_format planner); otherwise contract-mocked",
 }
 EMBEDDING_EVIDENCE: dict[str, str] = {
     "hash": "in-process, offline demo vectors (not semantic)",
@@ -105,7 +111,7 @@ def chat_table() -> str:
         native = cap.native_kind if cap.native_structured_output else ("role-declared" if cap.role_declared else "no")
         rows.append(
             f"| `{cap.provider}` | `{cap.pattern}` | {native} | {cap.prompt_caching} | "
-            f"{'yes' if cap.streaming else 'no'} | {CHAT_EVIDENCE[cap.provider]} |"
+            f"{'yes' if cap.streaming else 'no'} | {CHAT_PATTERN_EVIDENCE.get((cap.provider, cap.pattern), CHAT_EVIDENCE[cap.provider])} |"
         )
     rows.append(f"| `none` | — | — | — | — | {CHAT_EVIDENCE['none']} |")
     return "\n".join(rows)
@@ -167,7 +173,8 @@ def providers_page() -> str:
 Chat capabilities come from `su_multi_arm/providers/capabilities.py::REGISTRY`; configuration
 validation accepts `structured_output: native` or `prompt_caching: controlled` only for declared
 `(provider, model)` pairs. Hosted providers are **contract-mocked** in this repository: their entries
-follow the providers' published API documentation and no paid call has been made.
+follow the providers' published API documentation. Rows whose Evidence names a real-API run were also
+exercised once against the paid API (small, spend-capped runs; see VALIDATION.md).
 
 ## Chat providers
 

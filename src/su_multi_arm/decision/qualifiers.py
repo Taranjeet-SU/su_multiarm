@@ -138,6 +138,7 @@ def qualifier_candidates(query: str, schema: MetadataSchema, resolver: ValueReso
             continue
         values = spec.enum_values if spec.type == "enum" else (resolver.observed(spec.name) if resolver is not None else None)
         universe.extend((spec.name, v) for v in values or [] if isinstance(v, str))
+        universe.extend((spec.name, s.name) for s in spec.states)  # declared states ("open")
     for field, value in sorted(universe, key=lambda fv: len(fv[1]), reverse=True):
         folded = value.casefold().strip()
         if len(folded) < 2 or folded in units:
@@ -191,9 +192,19 @@ def _same_typed(a: JsonScalar, b: str) -> bool:
     return False
 
 
+def _is_state(schema: MetadataSchema, field: str, value: str | None) -> bool:
+    """``value`` names a declared state of ``field`` (its predicate is the state's value set)."""
+    spec = schema.field(field)
+    return value is not None and spec is not None and any(s.name.casefold() == value.casefold() for s in spec.states)
+
+
 def unapplied(candidates: Sequence[Qualifier], scope: ScopeSpec, request_filters: dict[str, JsonScalar], schema: MetadataSchema) -> list[UnsupportedConstraint]:
     """The candidates the scope (plus the caller's filters) does not express."""
-    predicates = [*scope.predicates, *(Predicate(field=k, op="eq", value=v) for k, v in request_filters.items())]
+    # Share numerators constrain the question too ("what percentage of X are open"); a text
+    # condition carries its phrase as a value (quoted qualifiers).
+    predicates = [*scope.predicates, *scope.numerator, *(Predicate(field=k, op="eq", value=v) for k, v in request_filters.items())]
+    if scope.text is not None:
+        predicates.append(Predicate(field="text", op="eq", value=scope.text.text))
     temporal = {f.name for f in schema.fields if f.type in {"datetime", "date"}}
     by_value: dict[str, set[str]] = {}
     for c in candidates:
@@ -204,7 +215,7 @@ def unapplied(candidates: Sequence[Qualifier], scope: ScopeSpec, request_filters
     for c in candidates:
         if c.kind == "value":
             fields = by_value.get(c.text.casefold(), set())
-            ok = any(p.field in fields and any(_same(v, c.value or "") for v in _values(p)) for p in predicates)
+            ok = any(p.field in fields and (any(_same(v, c.value or "") for v in _values(p)) or _is_state(schema, p.field, c.value)) for p in predicates)
             suggestion = f"the question names {c.field!r} = this value but the compiled scope does not constrain it; the aggregate covers a wider population"
         elif c.kind == "field":
             on_field = [p for p in predicates if p.field == c.field]

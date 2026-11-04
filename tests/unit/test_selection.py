@@ -123,7 +123,9 @@ def test_packing_fair_share_versus_greedy_and_min_per_record():
     assert [e.id for e in floored.evidence] == ["r0", "r1", "r2", "r3", "r4"] and floored.omitted_ids == [f"r{i}" for i in range(5, 10)]
     assert all(len(e.passage) == 200 for e in floored.evidence)
     extras = [PackExtra(id="aggregate:1", passage='{"count": 3}'), PackExtra(id="aggregate:2", passage="z" * 600)]
-    with_extras = pack(records[:1], PackingConfig(budget_chars=1200, fairness="greedy"), extras)
-    assert [e.id for e in with_extras.evidence] == ["a", "aggregate:1"] and with_extras.omitted_ids == ["aggregate:2"]
+    with_extras = pack(records[:1], PackingConfig(budget_chars=1200, fairness="greedy", aggregate_reserve_max=1.0), extras)
+    # aggregates are reserved first (they are exact derived evidence); the document gets the rest
+    assert [e.id for e in with_extras.evidence] == ["a", "aggregate:1", "aggregate:2"] and with_extras.omitted_ids == []
+    assert len(with_extras.evidence[0].passage) == 1200 - 12 - 600
     assert with_extras.evidence[1].source == "aggregate" and with_extras.evidence[1].passage == '{"count": 3}'
     assert pack([], PackingConfig()).evidence == []

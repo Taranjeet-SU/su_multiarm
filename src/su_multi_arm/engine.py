@@ -27,6 +27,7 @@ outcome, then ``done`` with the same ``AnswerResult`` ``answer`` returns, or ``e
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, timezone
 import os
 import time
 import warnings
@@ -42,7 +43,7 @@ from .backends.sqlite import SqliteBackend
 from .compat.config_v1 import Config as ConfigV1
 from .compat.config_v1 import upgrade
 from .core.component import ArtifactRef, Dependencies, Diagnostic, Environment, is_component_class
-from .core.config import Config, LuceneBackend, MemoryBackendConfig, MongoBackend as MongoBackendConfig, Neo4jBackend as Neo4jBackendConfig
+from .core.config import Config, KuzuBackend as KuzuBackendConfig, LuceneBackend, MemoryBackendConfig, MongoBackend as MongoBackendConfig, Neo4jBackend as Neo4jBackendConfig
 from .core.config import PostgresBackend as PostgresBackendConfig
 from .core.config import SqlAlchemyBackend as SqlAlchemyBackendConfig
 from .core.config import SqliteBackend as SqliteBackendConfig
@@ -121,6 +122,12 @@ def scope_result_of(aggregate: dict[str, Any]) -> ScopeResult:
         zero_match=aggregate.get("zero_match", False),
         matched_ids=aggregate.get("document_ids", []),
         missing_or_invalid=aggregate.get("missing_or_invalid", 0),
+        total=aggregate.get("total"),
+        listed=aggregate.get("listed", []),
+        ties=[GroupRow.model_validate(g) for g in aggregate.get("ties", [])],
+        unknown=aggregate.get("unknown", {}),
+        numerator=aggregate.get("numerator"),
+        basis=aggregate.get("basis", []),
     )
 
 
@@ -263,6 +270,10 @@ class Engine:
                 from .backends.neo4j import Neo4jBackend
 
                 built[name] = Neo4jBackend.from_config(spec)
+            elif isinstance(spec, KuzuBackendConfig):
+                from .backends import kuzu as kuzu_backend
+
+                built[name] = kuzu_backend.from_config(spec)
             elif isinstance(spec, LuceneBackend) and spec.kind == "opensearch":
                 try:
                     built[name] = OpenSearchBackend.from_config(spec)
@@ -487,6 +498,7 @@ class Engine:
             metadata_schema=self.config.metadata_schema,
             max_steps=runtime.config.decision.max_steps,
             id_patterns=runtime.id_patterns(),
+            graph_templates={name: t.description for name, t in graph.templates.items()} if (graph := runtime.config.arms.graph) else {},
         )
 
     def _limits(self) -> BudgetLimits:
@@ -684,6 +696,7 @@ class Engine:
             aggregate=explicit.measure if explicit is not None else None,
             scope=explicit,
             canonical_record=canonical,
+            as_of=self._anchor(ctx, request),
         )
         # The deployment's structured targets bound the aggregate grammar (QA-03): without them the
         # schema-less permissive grammar turns ordinary questions ("the latest release notes") into
@@ -691,6 +704,20 @@ class Engine:
         intents = detect_intents(request.query, capabilities.id_patterns, capabilities.structured_targets())
         decision = pipe.decisions[mode].decide(ctx, decision_request, intents, capabilities)
         return decision_request, capabilities, decision, intents, unresolved
+
+    def _anchor(self, ctx: RunContext, request: SearchRequest) -> date:
+        """The anchor day for relative calendar expressions in ``metadata_schema.timezone``: the
+        request's ``as_of`` (a value without an offset is read in that zone), else today there.
+        Recorded in the trace so every window is reproducible."""
+        from .backends._scope import zone_of
+        from .decision.windows import anchor_date
+
+        zone = zone_of(self.config.metadata_schema)
+        source = "request" if request.as_of else "clock"
+        moment = datetime.fromisoformat(request.as_of.strip()) if request.as_of else datetime.now(timezone.utc)
+        day = anchor_date(moment, zone)
+        ctx.trace.event("time_anchor", as_of=day.isoformat(), timezone=self.config.metadata_schema.timezone or "UTC", source=source)
+        return day
 
     @staticmethod
     def _steps(decision: Decision, decision_request: DecisionRequest) -> list[Any]:
@@ -726,6 +753,7 @@ class Engine:
             acl=acl,
             candidates=candidates,
             aggregate=aggregate,
+            graph=getattr(step, "graph", None),
             incomplete_stages=list(ctx.trace.root.attributes.get("incomplete_stages", [])),
             allow_incomplete=state.pipe.config.allow_incomplete_arms,
         )
@@ -755,7 +783,8 @@ class Engine:
                 for hit in result.hits:
                     state.hits_by_id.setdefault(hit.document_id, hit)
                     pools.setdefault(step.arm, []).append(
-                        Candidate(record_id=hit.document_id, arm=step.arm, score=hit.score, chunk_ids=list(hit.chunk_ids), source=hit.source, provenance=list(hit.provenance), pinned=pinned)
+                        Candidate(record_id=hit.document_id, arm=step.arm, score=hit.score, chunk_ids=list(hit.chunk_ids), source=hit.source, provenance=list(hit.provenance), pinned=pinned,
+                                  leads=any(p.get("lexical_front") for p in hit.provenance))
                     )
                 predicates = [p.model_dump(mode="json", exclude_defaults=True) for p in step.scope.predicates] if isinstance(step, StructuredStep) else []
                 for aggregate in result.aggregates:
@@ -790,6 +819,7 @@ class Engine:
                         "documents": len(result.hits),
                         "aggregate": bool(result.aggregates),
                         "paths": len(result.paths),
+                        **({"graph_template": step.graph.template} if getattr(step, "graph", None) is not None else {}),
                         "incomplete": result.incomplete,
                     }
                 )
@@ -813,6 +843,8 @@ class Engine:
             max_documents=sel.max_documents,
             diversity_field=sel.diversity.field if sel.diversity else None,
             diversity_min_per_value=sel.diversity.min_per_value if sel.diversity else 1,
+            source_order=list(sel.source_order),
+            source_slots=list(sel.source_slots),
             pins=bool(sel.pins),
         )
 
@@ -1035,6 +1067,7 @@ class Engine:
             "fairness": result.fairness,
             "field_priority": result.field_priority,
             "budget_chars": budget,
+            "aggregate_reserve_chars": result.aggregate_reserve_chars,
         }
         ctx.trace.event("packing", **{k: v for k, v in trace.items() if k != "field_priority"}, records=len(records), extras=len(extras))
         state.pack_trace = trace
@@ -1315,7 +1348,7 @@ class Engine:
         from .arms.structured import BUILTIN_FIELDS
 
         declared = {f.name for f in self.config.metadata_schema.fields} | BUILTIN_FIELDS
-        named = [p.field for p in spec.predicates] + list(spec.group_by) + ([spec.measure.field] if spec.measure is not None and spec.measure.field else [])
+        named = [p.field for p in [*spec.predicates, *spec.numerator]] + ([spec.sort.field] if spec.sort is not None else []) + list(spec.group_by) + ([spec.measure.field] if spec.measure is not None and spec.measure.field else [])
         named += list(filters)
         unknown = sorted({f for f in named if f not in declared})
         if unknown:

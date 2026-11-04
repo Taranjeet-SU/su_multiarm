@@ -150,6 +150,21 @@ class SearchRequest(StrictModel):
     # allowlists of the configuration (the default pipeline and its decision kind are always allowed).
     pipeline: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
     mode: Literal["rules", "classifier", "llm", "cascade"] | None = None
+    # Anchor for relative calendar expressions ("this month", "last 7 days"): an ISO date or
+    # datetime, read in ``metadata_schema.timezone`` when it has no offset. Default: now.
+    as_of: str | None = Field(default=None, max_length=64)
+
+    @field_validator("as_of")
+    @classmethod
+    def iso_anchor(cls, value):
+        if value is not None:
+            from datetime import datetime
+
+            try:
+                datetime.fromisoformat(value.strip())
+            except ValueError:
+                raise ValueError("as_of must be an ISO 8601 date or datetime") from None
+        return value
 
     @field_validator("record_context")
     @classmethod

@@ -30,6 +30,7 @@ from ..models import StrictModel
 from ..profiles import apply_profile, available_profiles
 from .component import scan_for_code_references
 from .config_decision import StagePolicies
+from .config_graph import GraphOntology, TraversalTemplate
 from .config_selection import OrderingKind, PackingConfig
 from .errors import ConfigError
 from .request import RequestConfig
@@ -53,11 +54,55 @@ SCAN_EXEMPT_KEYS: frozenset[str] = frozenset({"prompt", "patterns", "gazetteer",
 # --- backends ----------------------------------------------------------------------------------
 
 
+class Bm25Settings(StrictModel):
+    """Okapi BM25 lexical engine (``lexical_engine: bm25``), the formula of ``rank_bm25.BM25Okapi``:
+    ATIRE idf ``log(N - df + 0.5) - log(df + 0.5)`` with negative idf replaced by
+    ``epsilon * mean(idf)``. ``tokenizer``: ``unicode_word`` = ``\\w+`` runs, ``ascii_alnum`` =
+    ``[a-z0-9]+`` runs of the lower-cased text. ``stemming``: ``none`` or a Snowball algorithm name.
+    ``include_title``: the document title's tokens are prepended to every chunk of the document.
+    All of it is index recipe: changing any value needs a rebuild."""
+
+    k1: float = Field(default=1.5, ge=0, le=10)
+    b: float = Field(default=0.75, ge=0, le=1)
+    epsilon: float = Field(default=0.25, ge=0, le=10)
+    tokenizer: Literal["unicode_word", "ascii_alnum"] = "unicode_word"
+    lowercase: bool = True
+    stemming: str = "none"
+    include_title: bool = False
+
+    @field_validator("stemming")
+    @classmethod
+    def known_stemmer(cls, value: str) -> str:
+        import snowballstemmer
+
+        if value != "none" and value not in snowballstemmer.algorithms():
+            raise ValueError(f"unknown stemmer {value!r}; use 'none' or one of {sorted(snowballstemmer.algorithms())}")
+        return value
+
+
 class SqliteBackend(StrictModel):
     kind: Literal["sqlite"]
     path: Path = Path("state")
     vector_engine: Literal["numpy", "faiss"] = "numpy"
     timeout_seconds: float = Field(default=30, gt=0, le=600)
+    # ``fts5`` (default): SQLite FTS5 ``unicode61`` with its bm25(); ``bm25``: an in-process Okapi
+    # BM25 inverted index built at ingest into the generation (memory-mapped segment).
+    lexical_engine: Literal["fts5", "bm25"] = "fts5"
+    bm25: Bm25Settings | None = None
+
+    @model_validator(mode="after")
+    def bm25_settings_need_engine(self):
+        if self.lexical_engine == "bm25" and self.bm25 is None:
+            self.bm25 = Bm25Settings()
+        if self.lexical_engine != "bm25" and self.bm25 is not None:
+            raise ValueError("bm25 settings need lexical_engine: bm25")
+        return self
+
+    def recipe(self) -> dict[str, Any]:
+        """The index-recipe dump. The lexical engine keys enter it only when ``bm25`` is selected, so
+        indexes built before the option existed keep their fingerprint (2.0.0a1 golden values)."""
+        exclude = {"lexical_engine", "bm25"} if self.lexical_engine == "fts5" else set()
+        return self.model_dump(mode="json", exclude=exclude)
 
 
 class MemoryBackendConfig(StrictModel):
@@ -116,6 +161,32 @@ class Neo4jBackend(StrictModel):
     timeout_seconds: float = Field(default=30, gt=0, le=600)
 
 
+class KuzuAttach(StrictModel):
+    """Read-only attachment of an existing Kuzu database: ``mapping`` is a YAML file that maps its node
+    and relationship tables onto the graph contract (``backends/kuzu/attach.py``). Private mappings
+    stay outside the repository; the path is relative to this config file."""
+
+    mapping: Path
+
+
+class KuzuBackend(StrictModel):
+    kind: Literal["kuzu"]
+    # ``native``: the package's own embedded store (created when missing, generation-scoped, writable).
+    # ``attach``: an existing database opened read-only through ``attach.mapping``; never written.
+    path: Path = Path("state/graph.kuzu")
+    mode: Literal["native", "attach"] = "native"
+    namespace: str = Field(default="su_multi_arm", pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    attach: KuzuAttach | None = None
+    timeout_seconds: float = Field(default=30, gt=0, le=600)
+    buffer_pool_mb: int = Field(default=512, ge=16, le=65536)
+
+    @model_validator(mode="after")
+    def coherent_mode(self):
+        if (self.mode == "attach") != (self.attach is not None):
+            raise ValueError("mode: attach requires an attach.mapping block, and only attach mode takes one")
+        return self
+
+
 class MongoBackend(StrictModel):
     kind: Literal["mongodb"]
     uri_env: str
@@ -125,7 +196,7 @@ class MongoBackend(StrictModel):
 
 
 BackendConfig = Annotated[
-    Union[SqliteBackend, MemoryBackendConfig, PostgresBackend, SqlAlchemyBackend, LuceneBackend, Neo4jBackend, MongoBackend],
+    Union[SqliteBackend, MemoryBackendConfig, PostgresBackend, SqlAlchemyBackend, LuceneBackend, Neo4jBackend, KuzuBackend, MongoBackend],
     Field(discriminator="kind"),
 ]
 
@@ -147,15 +218,19 @@ class StorageConfig(StrictModel):
 class CapabilityDeclaration(StrictModel):
     """What a chat role relies on; validated against ``providers/capabilities.py``.
 
-    ``structured_output``: ``none`` (default; schema in the system prompt, strict validation of the
+    ``structured_output``: ``none`` (schema in the system prompt, strict validation of the
     reply), ``json_mode`` (``response_format: json_object``; OpenAI-style providers only),
     ``json_schema`` (``response_format: json_schema``, ``strict: false``; OpenAI-style providers
-    only), ``native`` (provider-enforced: Anthropic forced tool use, OpenAI strict json_schema; only
-    for registry-declared ``(provider, model)`` pairs). ``prompt_caching``: ``controlled`` sends
+    only), ``native`` (provider-enforced: Anthropic forced tool use or ``output_config.format``,
+    OpenAI strict json_schema; only for registry-declared ``(provider, model)`` pairs). When a role
+    does not set ``structured_output``, Anthropic models the registry declares capable get
+    ``native`` (2.0.0a3); every other role gets ``none``. ``prompt_caching``: ``controlled`` sends
     ``cache_control`` (Anthropic); ``passive`` records cached tokens the provider reports.
     """
 
-    structured_output: Literal["none", "json_mode", "json_schema", "native"] = "none"
+    # ``None`` (unset) resolves in ``ChatRole``: ``native`` for registry-capable Anthropic models,
+    # ``none`` otherwise. A validated role always carries the resolved value.
+    structured_output: Literal["none", "json_mode", "json_schema", "native"] | None = None
     prompt_caching: Literal["none", "passive", "controlled"] = "none"
     streaming: bool = False
 
@@ -169,10 +244,13 @@ class ChatRole(StrictModel):
     model: str = Field(min_length=1)
     base_url: str | None = None
     api_key_env: str | None = None
+    # Output ceiling. A model the registry marks as thinking by default (Anthropic Haiku 5.x)
+    # rejects values below its ``min_max_tokens`` (thinking tokens count against the ceiling).
     max_tokens: int = Field(default=2048, ge=128, le=64000)
     timeout_seconds: float = Field(default=60, gt=0, le=600)
     # Output-limit parameter name for ``openai_compatible`` servers; hosted providers use the
-    # registry's name (``openai`` must match it, ``anthropic`` always sends ``max_tokens``).
+    # registry's name (``openai`` must match it, ``anthropic`` always sends ``max_tokens``). Ollama's
+    # ``/v1`` ignores ``max_completion_tokens``: set ``max_tokens`` for it (docs/CONFIGURATION.md).
     max_tokens_parameter: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
     reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
     capabilities: CapabilityDeclaration = Field(default_factory=CapabilityDeclaration)
@@ -185,12 +263,17 @@ class ChatRole(StrictModel):
 
     @model_validator(mode="after")
     def coherent(self):
-        from ..providers.capabilities import check_role
+        from ..providers.capabilities import check_role, default_structured_output
 
         if self.provider == "anthropic" and not self.api_key_env:
             raise ValueError("Anthropic requires api_key_env")
         if self.provider == "openai" and not self.api_key_env:
             raise ValueError("OpenAI requires api_key_env")
+        # Registry-derived default (2.0.0a3): an unset structured_output resolves here, so a
+        # validated role always carries a concrete mode (and dumps it).
+        if self.capabilities.structured_output is None:
+            mode = default_structured_output(self.provider, self.model)
+            self.capabilities = self.capabilities.model_copy(update={"structured_output": mode})
         problems = check_role(
             self.provider,
             self.model,
@@ -198,10 +281,48 @@ class ChatRole(StrictModel):
             self.capabilities.prompt_caching,
             self.reasoning_effort,
             self.max_tokens_parameter if self.provider == "openai" else None,
+            self.max_tokens,
         )
         if problems:
             raise ValueError("; ".join(f"{key}: {message}" for key, message in problems))
         return self
+
+
+class PrecomputedVerify(StrictModel):
+    """Optional content check of imported rows: re-embed ``sample`` matched chunks (seeded, chunk
+    text exactly as keyed, through the configured provider with its ``document_prefix``) and require
+    cosine ``>= min_cosine`` against the imported row for every sampled chunk. This is the only
+    check that can detect a vector row paired with the wrong key."""
+
+    sample: int = Field(default=0, ge=0, le=10000)  # 0 = off
+    min_cosine: float = Field(default=0.98, gt=0, le=1)
+    seed: int = 0
+
+
+class PrecomputedVectors(StrictModel):
+    """Import document vectors computed elsewhere. ``vectors`` is a 2-D float32 ``.npy`` file;
+    ``keys`` is a JSONL file with one object per row ``{"document_id", "field", "text_sha256"}``.
+
+    What is verified: both files' SHA-256 equal the pinned ``sha256`` (vectors) and ``keys_sha256``
+    (keys); row count, dimension, finite and non-zero rows, unique keys; and every chunk is matched
+    to a key by document, field and the SHA-256 of its exact text (never fuzzily). What is NOT
+    verifiable from the files alone: that row ``i`` of the vectors embeds the text named by line
+    ``i`` of the keys. That pairing is positional; the two pinned digests fix the pair as published,
+    and ``verify`` (a re-embedding spot check with the configured provider) is the check that
+    detects a misaligned pair. Index identity comes from the two digests, never from file paths.
+    A chunk with no row is an error unless ``on_missing: embed``. Queries are always encoded by the
+    configured provider, which must be the model that produced the rows."""
+
+    vectors: Path
+    keys: Path
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    keys_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    on_missing: Literal["error", "embed"] = "error"
+    verify: PrecomputedVerify = Field(default_factory=PrecomputedVerify)
+
+    def identity(self) -> dict[str, str]:
+        """Content identity of the import (no paths): enters the index fingerprint and recipe."""
+        return {"sha256": self.sha256, "keys_sha256": self.keys_sha256, "on_missing": self.on_missing}
 
 
 class EmbedderRole(StrictModel):
@@ -215,6 +336,7 @@ class EmbedderRole(StrictModel):
     document_prefix: str = ""
     revision: str | None = None
     device: str = "cpu"
+    precomputed: PrecomputedVectors | None = None
     # Key into budgets.price_table for hosted embedders (falls back to the model id). Not part of the
     # index recipe: the write path excludes it from the fingerprint.
     pricing_key: str | None = None
@@ -357,14 +479,50 @@ class PhraseBoost(StrictModel):
     window_tokens: int = Field(default=6, ge=1, le=64)
 
 
+class VerbatimBoost(StrictModel):
+    """Lexical front policy (off by default): documents whose text holds a quoted string of the query,
+    or at least ``min_windows`` of its ``window_tokens``-token windows verbatim (error messages, pasted
+    excerpts, exact subjects), lead the lexical list, at most ``max_records``, ranked by (quoted,
+    windows matched). A window counts only if one of its tokens is in at most ``common_df`` chunks; a
+    window found in more than ``max_window_hits`` chunks is boilerplate and ignored; a window whose
+    tokens co-occur in more than ``max_candidates`` chunks is not verified (skipped, counted in the
+    trace). Needs a lexical index that exposes its analyzer and term statistics (sqlite
+    ``lexical_engine: bm25``); anything else is a validation error."""
+
+    enabled: bool = False
+    window_tokens: int = Field(default=6, ge=2, le=32)
+    min_windows: int = Field(default=2, ge=1, le=32)
+    common_df: int = Field(default=5000, ge=1)
+    max_window_hits: int = Field(default=300, ge=1)
+    max_candidates: int = Field(default=1200, ge=1)
+    max_records: int = Field(default=5, ge=1, le=50)
+    quoted: bool = True
+
+
+class IdentifierPin(StrictModel):
+    """Lexical front policy (off by default): documents named by an identifier in the query lead the
+    lexical list. Identifiers are matches of the ``pattern`` of ``id`` fields in ``metadata_schema``
+    (``fields`` narrows which; empty = all) and resolve by exact equality on that document field
+    inside the request's scope. No normalisation, no fuzzy match; at most ``max_records``."""
+
+    enabled: bool = False
+    fields: list[str] = Field(default_factory=list)
+    max_records: int = Field(default=5, ge=1, le=50)
+
+
 class LexicalArm(StrictModel):
     backend: str = Field(pattern=IDENTIFIER)
     candidates: int = Field(default=200, ge=1, le=10000)
     phrase_boost: PhraseBoost = Field(default_factory=PhraseBoost)
+    verbatim_boost: VerbatimBoost = Field(default_factory=VerbatimBoost)
+    pin_identifiers: IdentifierPin = Field(default_factory=IdentifierPin)
 
 
 class StructuredArm(StrictModel):
     backend: str = Field(pattern=IDENTIFIER)
+    # Backend whose lexical index resolves literal topic conditions (``ScopeSpec.text``) as
+    # whole-corpus matches; None = ``backend`` when it serves lexical, else topics are unsupported.
+    text_backend: str | None = Field(default=None, pattern=IDENTIFIER)
 
 
 class GraphArm(StrictModel):
@@ -372,6 +530,20 @@ class GraphArm(StrictModel):
     hops: int = Field(default=1, ge=0, le=3)
     predicates: list[str] = Field(default_factory=list)
     direction: Literal["out", "in", "any"] = "any"
+    # Declared traversal templates a decision agent may select by name (``core/config_graph.py``).
+    templates: dict[str, TraversalTemplate] = Field(default_factory=dict)
+    # Optional ontology the templates are validated against (an attached store's mapping is used too).
+    ontology: GraphOntology | None = None
+
+    @model_validator(mode="after")
+    def templates_fit(self):
+        for name, template in self.templates.items():
+            if not re.fullmatch(IDENTIFIER, name):
+                raise ValueError(f"template name {name!r} must be an identifier")
+            problems = template.problems(self.ontology)
+            if problems:
+                raise ValueError(f"template {name!r} does not fit the ontology: {'; '.join(problems)}")
+        return self
 
 
 class CommunityArm(StrictModel):
@@ -427,6 +599,13 @@ class SelectionConfig(StrictModel):
     max_documents: int | None = Field(default=None, ge=1)
     diversity: DiversityConfig | None = None
     pins: list[Literal["exact_id"]] = Field(default_factory=lambda: ["exact_id"])
+    # Strict, stable source order applied to the selected union after ordering and diversity, before
+    # pins: records whose ``source`` is listed come first in list order, unlisted sources keep their
+    # relative order after them. It never changes membership.
+    source_order: list[str] = Field(default_factory=list)
+    # Reserved source slots inside each arm's ``per_arm`` budget (see ``selection.limits``): position
+    # ``i`` takes the best remaining record of that source, then the budget fills by score.
+    source_slots: list[str] = Field(default_factory=list, max_length=1000)
     rerank: bool = False  # uses models.roles.reranker; off by default (measured negative, plan §6.4)
     packing: PackingConfig = Field(default_factory=PackingConfig)
 
@@ -452,9 +631,12 @@ class ReviewConfig(StrictModel):
 
 
 class AnswerContractConfig(StrictModel):
-    # abstain_with_reason: abstain (a non-narrative claim on an answer whose text states no
-    # count/list/absence is stripped instead); strip: also remove unbacked sentences; fail: raise.
-    on_violation: Literal["abstain_with_reason", "strip", "fail"] = "abstain_with_reason"
+    # strip (default since 2.0.0a3): remove unbacked aggregate claims and, when the question asks
+    # no aggregate, the unbacked count/list/absence sentences of a narrative answer (recorded); an
+    # unbacked statement answering an aggregate question still abstains. abstain_with_reason:
+    # abstain (a non-narrative claim on an answer whose text states no count/list/absence is
+    # stripped instead). fail: raise. See generation/contract.py.
+    on_violation: Literal["abstain_with_reason", "strip", "fail"] = "strip"
 
 
 class GenerationStageConfig(StrictModel):
@@ -539,11 +721,41 @@ class ExtractionConfig(StrictModel):
         return self
 
 
+class CommunityHierarchy(StrictModel):
+    """``louvain_hierarchical``: level 0 is the coarsest partition; each level-``n`` community with at
+    least ``min_split`` documents is re-partitioned (seeded) into level ``n+1`` children."""
+
+    levels: int = Field(default=3, ge=1, le=3)
+    resolution: float = Field(default=1.0, gt=0, le=10)
+    min_split: int = Field(default=4, ge=2)
+
+
+class CommunityStats(StrictModel):
+    """Deterministic per-community statistics from declared fields only (``communities/stats.py``)."""
+
+    time_basis: str | None = Field(default=None, pattern=IDENTIFIER)  # a datetime/date metadata field
+    granularity: Literal["month", "year"] = "month"
+    top_entities: int = Field(default=5, ge=0, le=50)
+
+
 class CommunitiesConfig(StrictModel):
-    strategy: Literal["entity", "louvain"] = "entity"
+    strategy: Literal["entity", "louvain", "louvain_hierarchical"] = "entity"
     min_documents: int = Field(default=2, ge=1)
     seed: int = 42
     prompt: str | None = None
+    # Both enter the index recipe only when set, so existing generations keep their fingerprint.
+    hierarchy: CommunityHierarchy | None = None
+    stats: CommunityStats | None = None
+
+    @model_validator(mode="after")
+    def hierarchy_only_when_hierarchical(self):
+        if self.hierarchy is not None and self.strategy != "louvain_hierarchical":
+            raise ValueError("communities.hierarchy applies to strategy louvain_hierarchical only")
+        return self
+
+    def recipe(self) -> dict[str, Any]:
+        """The index-recipe view: unset optional blocks are omitted (2.0.0a1 golden values hold)."""
+        return self.model_dump(mode="json", exclude={k for k in ("hierarchy", "stats") if getattr(self, k) is None})
 
 
 class ChunkingConfig(StrictModel):
@@ -880,6 +1092,10 @@ def _resolve_paths(config: Config, base: Path) -> Config:
     for name, backend in config.backends.items():
         if isinstance(backend, SqliteBackend):
             backend.path = (base / backend.path.expanduser()).resolve()
+        if isinstance(backend, KuzuBackend):
+            backend.path = (base / backend.path.expanduser()).resolve()
+            if backend.attach is not None:
+                backend.attach.mapping = (base / backend.attach.mapping.expanduser()).resolve()
     for pipeline in config.all_pipelines().values():
         for stage in (pipeline.decision, pipeline.generation):
             if stage.prompt_file:
@@ -889,6 +1105,10 @@ def _resolve_paths(config: Config, base: Path) -> Config:
             pipeline.arms.exact_id.alias_map = (base / pipeline.arms.exact_id.alias_map).resolve()
     if config.budgets.price_table:
         config.budgets.price_table = (base / config.budgets.price_table).resolve()
+    embedder = config.models.roles.embedder
+    if embedder is not None and embedder.precomputed is not None:
+        embedder.precomputed.vectors = (base / embedder.precomputed.vectors.expanduser()).resolve()
+        embedder.precomputed.keys = (base / embedder.precomputed.keys.expanduser()).resolve()
     return config
 
 
@@ -902,8 +1122,10 @@ def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
             slots.append((mapping, key, path))
 
     for name, backend in (data.get("backends") or {}).items():
-        if isinstance(backend, dict) and backend.get("kind") == "sqlite":
+        if isinstance(backend, dict) and backend.get("kind") in {"sqlite", "kuzu"}:
             add(backend, "path", f"backends.{name}.path")
+        if isinstance(backend, dict) and backend.get("kind") == "kuzu":
+            add(backend.get("attach"), "mapping", f"backends.{name}.attach.mapping")
     pipelines = [("pipeline", data.get("pipeline"))] + [(f"pipelines.{n}", p) for n, p in (data.get("pipelines") or {}).items()]
     for prefix, pipeline in pipelines:
         if not isinstance(pipeline, dict):
@@ -912,6 +1134,10 @@ def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
             add(pipeline.get(stage), "prompt_file", f"{prefix}.{stage}.prompt_file")
         add((pipeline.get("arms") or {}).get("exact_id"), "alias_map", f"{prefix}.arms.exact_id.alias_map")
     add(data.get("budgets"), "price_table", "budgets.price_table")
+    embedder = ((data.get("models") or {}).get("roles") or {}).get("embedder")
+    precomputed = embedder.get("precomputed") if isinstance(embedder, dict) else None
+    add(precomputed, "vectors", "models.roles.embedder.precomputed.vectors")
+    add(precomputed, "keys", "models.roles.embedder.precomputed.keys")
     return slots
 
 

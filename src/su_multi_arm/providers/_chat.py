@@ -7,6 +7,10 @@ usage), so a streamed call fails exactly where the non-streamed one would. Each 
 handed to ``on_delta`` as it arrives; deltas are provisional raw reply text (JSON in structured
 modes) and the validated reply is the only result. Streaming requires the role to declare
 ``capabilities.streaming: true`` (``CapabilityMismatch`` otherwise, before any call).
+
+Output ceiling (QQ-01): a reply whose reported output tokens exceed the role's ``max_tokens`` is
+``ProviderLimitIgnored`` (the server did not honour the ceiling the package sent); the call is
+still metered with the reported usage.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from .base import (
     HttpCall,
     MeteredCall,
     ProviderError,
+    ProviderLimitIgnored,
     RoleSpec,
     T,
     Usage,
@@ -72,6 +77,7 @@ class HttpChatProvider:
             self.role.structured_output,
             self.role.prompt_caching,
             self.role.reasoning_effort,
+            max_tokens=self.role.max_tokens,
         )
         if problems:
             raise CapabilityMismatch("; ".join(f"{key}: {message}" for key, message in problems))
@@ -133,7 +139,7 @@ class HttpChatProvider:
         key = secret(self.role.api_key_env, ctx.stage)
         headers = {**headers, **self._auth(key)}
         url = (self.role.base_url or self.default_base_url).rstrip("/") + path
-        estimate = CallEstimate.of(len(system) + len(user) + len(str(body.get("tools") or body.get("response_format") or "")), self.role.max_tokens)
+        estimate = CallEstimate.of(len(system) + len(user) + len(str(body.get("tools") or body.get("response_format") or body.get("output_config") or "")), self.role.max_tokens)
         with MeteredCall(self, budget, ctx, mode, estimate) as call:
             if on_delta is None:
                 data = self.http.post(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage)
@@ -142,9 +148,19 @@ class HttpChatProvider:
                 call.extra["stream"] = True
                 data = self.http.post_stream(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage, consumer=consumer)
             text = self._parse(data, mode, ctx, call, body)
+            if call.usage.reported and call.usage.output_tokens > self.role.max_tokens:
+                raise ProviderLimitIgnored(
+                    f"reply used {call.usage.output_tokens} output tokens, more than max_tokens {self.role.max_tokens} "
+                    f"sent as {self._ceiling_param(body)}; the server ignored the output ceiling",
+                    stage=ctx.stage,
+                )
         if mode.startswith("native:") or mode == "text":
             return text, call.usage
         return FENCE.sub("", text.strip()), call.usage
+
+    @staticmethod
+    def _ceiling_param(body: dict[str, Any]) -> str:
+        return next((k for k in ("max_tokens", "max_completion_tokens") if k in body), "max_tokens")
 
     def _auth(self, key: str | None) -> dict[str, str]:  # pragma: no cover - overridden
         raise NotImplementedError

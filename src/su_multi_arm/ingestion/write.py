@@ -46,6 +46,7 @@ from ..backends import extras
 from ..backends._scope import document_values
 from ..communities.base import build_communities
 from ..communities.reports import ReportFailure, community_report, disabled_report
+from ..communities.stats import community_stats
 from ..core.errors import BackendError, BudgetExhausted, ConfigError, GenerationInUse, IndexNotReady, WriteConflict
 from ..core.types import (
     Chunk,
@@ -70,6 +71,7 @@ from .budget import IngestMeter, check_prices, require_ingest_cap
 from .normalize import redact_document
 from .generations import GenerationSet
 from .policy import ExtractionPolicy, PolicyViolation
+from .precomputed import IMPORTED_INPUT, PrecomputedVectorError, PrecomputedVectors, spot_check
 from .release import GenerationRegistry, generation_id
 
 INDEX_FORMAT = 3
@@ -160,10 +162,15 @@ class WritePath:
             "chunking": self.cfg.ingestion.chunking.model_dump(mode="json"),
             "privacy": self.cfg.privacy.model_dump(mode="json", exclude={"trace_masking"}),
             "extractor": self.extractor.recipe_fingerprint(),
-            "embedder": roles.embedder.model_dump(mode="json", exclude={"pricing_key"}),
-            "communities": self.cfg.communities.model_dump(mode="json"),
+            # ``precomputed`` enters only when set (2.0.0a1 golden values unchanged) and only as its
+            # content identity (file digests), never its paths: moving the files keeps the index.
+            "embedder": {
+                **roles.embedder.model_dump(mode="json", exclude={"pricing_key", "precomputed"}),
+                **({"precomputed": roles.embedder.precomputed.identity()} if roles.embedder.precomputed is not None else {}),
+            },
+            "communities": self.cfg.communities.recipe(),
             "community_model": None if roles.community is None else roles.community.model,
-            "backends": {slot: self.cfg.backends[name].model_dump(mode="json") for slot, name in sorted(self.slots.items())},
+            "backends": {slot: _backend_recipe(self.cfg.backends[name]) for slot, name in sorted(self.slots.items())},
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
@@ -484,7 +491,14 @@ class WritePath:
         for mention in mentions:
             membership_map.setdefault(mention.id, set()).add(mention.span.document_id)
             names.setdefault(mention.id, mention.name)
-        communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed)
+        communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed, cfg.communities.hierarchy)
+        if cfg.communities.stats is not None:
+            stats_cfg = cfg.communities.stats
+            by_id = {d.id: d for d in corpus}
+            for community in communities:
+                community.stats = community_stats(
+                    community, by_id, membership_map, len(corpus), cfg.metadata_schema, stats_cfg.time_basis, stats_cfg.granularity, stats_cfg.top_entities, names
+                )
         report_meter = meter.role(roles.community.price_key() if roles.community else None, "community_reports")
         communities = self._reports(communities, all_chunks, policy, report_meter)
         memberships = [Membership(community_id=c.id, member_id=doc_id, basis="entity") for c in communities for doc_id in c.document_ids]
@@ -550,9 +564,15 @@ class WritePath:
             "llm_calls": meter.calls,
             "embedded": embedded.embedded if embedded else 0,
             "reused_embeddings": embedded.reused if embedded else 0,
+            "imported_embeddings": embedded.imported if embedded else 0,
+            **({"precomputed_vectors": embedded.precomputed} if embedded and embedded.precomputed else {}),
             "budget": meter.summary(),
             "incremental": INCREMENTAL,
-            "embedding": cfg.models.roles.embedder.model_dump(mode="json"),
+            "embedding": {
+                **cfg.models.roles.embedder.model_dump(mode="json", exclude={"precomputed"}),
+                **({"precomputed": cfg.models.roles.embedder.precomputed.identity()} if cfg.models.roles.embedder.precomputed is not None else {}),
+            },
+            "embedding_recipe": self.embedding_recipe(),
             "coverage": policy.coverage.to_manifest(),
             "projections": projections,
             "backends": dict(sorted(self.slots.items())),
@@ -611,7 +631,7 @@ class WritePath:
         revision, dimension, endpoint of hosted models, document prefix, normalisation and the input
         template (title and field name are embedded with the chunk text)."""
         role = self.cfg.models.roles.embedder
-        return {
+        recipe = {
             "provider": role.provider,
             "model": role.model,
             "revision": role.revision,
@@ -621,6 +641,10 @@ class WritePath:
             "normalisation": "l2",
             "input": EMBEDDING_INPUT,
         }
+        if role.precomputed is not None:  # absent otherwise, so earlier embedding reuse keys stay valid
+            recipe["precomputed"] = role.precomputed.identity()
+            recipe["input"] = IMPORTED_INPUT  # imported rows do not embed the engine's input template
+        return recipe
 
     @staticmethod
     def embedding_input(title: str, chunk: Chunk) -> str:
@@ -642,6 +666,19 @@ class WritePath:
         titles = {d.id: d.title for d in corpus}
         vector = self._facet("vector")
         result = Embedded()
+        imported: PrecomputedVectors | None = None
+        if role.precomputed is not None:
+            try:
+                imported = PrecomputedVectors(role.precomputed, role.dimensions)
+                check = role.precomputed.verify
+                if check.sample:
+                    reservations = meter.reserve_embedding(sum(len(c.text) for c in chunks[: check.sample]), role.price_key())
+                    try:
+                        imported.audit.verify = spot_check(imported, chunks, self.embedder.encode, check.sample, check.min_cosine, check.seed)
+                    finally:
+                        meter.commit_embedding(reservations, getattr(getattr(self.embedder, "provider", None), "last_usage", None))
+            except PrecomputedVectorError as exc:
+                raise ProjectionError("vector", exc.unit, str(exc)) from exc
         sample_ids = {c.id for c in chunks[:SAMPLE]}
         price_key = role.price_key()
         window: list[Chunk] = []
@@ -650,7 +687,17 @@ class WritePath:
                 window = chunks[start : start + role.batch_size]
                 texts = [self.embedding_input(titles[c.document_id], c) for c in window]
                 keys = [self.embedding_key(recipe_sha, t) for t in texts]
-                rows: list[np.ndarray | None] = [self._cached_vector(ledger, k, role.dimensions) for k in keys]
+                if imported is not None:
+                    # Imported rows are matched by (document, field, exact text digest), never by position.
+                    rows = [imported.lookup(c.document_id, c.field, c.text) for c in window]
+                    absent = [c for c, row in zip(window, rows) if row is None]
+                    if absent and role.precomputed.on_missing == "error":
+                        first = absent[0]
+                        raise ProjectionError("vector", first.id, f"no precomputed vector for document {first.document_id!r} field {first.field!r} ({len(absent)} in this batch)")
+                    imported.audit.matched += len(window) - len(absent)
+                    imported.audit.embedded += len(absent)
+                else:
+                    rows = [self._cached_vector(ledger, k, role.dimensions) for k in keys]
                 missing = [i for i, row in enumerate(rows) if row is None]
                 if missing:
                     reservations = meter.reserve_embedding(sum(len(texts[i]) for i in missing), price_key)
@@ -667,7 +714,8 @@ class WritePath:
                 matrix = np.vstack(rows).astype(np.float32)
                 vector.upsert(gen, [c.id for c in window], matrix)
                 result.embedded += len(missing)
-                result.reused += len(window) - len(missing)
+                result.reused += len(window) - len(missing) if imported is None else 0
+                result.imported += len(window) - len(missing) if imported is not None else 0
                 result.ids.update(c.id for c in window)
                 for chunk, row in zip(window, matrix):
                     if chunk.id in sample_ids:
@@ -681,6 +729,8 @@ class WritePath:
         else:
             policy.stage_complete("embeddings", len(chunks))
         vector.refresh(gen)
+        if imported is not None:
+            result.precomputed = imported.finish().manifest()
         return result
 
     @staticmethod
@@ -759,7 +809,9 @@ class WritePath:
             lexical = extras.require(holder.backend, extras.Countable, "lexical", "validate")
             _expect("lexical", lexical.count(gen), len(chunks), "indexed chunks")
             for chunk in sample:
-                words = [w for w in chunk.text.split() if w.isalnum()][:3]
+                # Words the lexical analyzer keeps (an ASCII-only tokenizer drops non-ASCII words).
+                analyze = getattr(lexical, "analyze", None)
+                words = [w for w in chunk.text.split() if w.isalnum() and (analyze is None or analyze(w))][:3]
                 if not words:
                     continue
                 hits = lexical.search(gen, LexicalQuery(text=" ".join(words)), Scope(document_ids=[chunk.document_id]), 50)
@@ -830,6 +882,8 @@ class Embedded:
         self.ids: set[str] = set()
         self.embedded = 0
         self.reused = 0
+        self.imported = 0
+        self.precomputed: dict[str, Any] | None = None
         self.sample: dict[str, np.ndarray] = {}
 
 
@@ -847,6 +901,12 @@ class ActivationError(RuntimeError):
         failed = [c["backend"] for c in compensation if not c["ok"]]
         suffix = f"; compensation FAILED on {failed}" if failed else (f"; {len(compensation)} pointer(s) restored" if compensation else "")
         super().__init__(f"activation failed on {backend!r}: {type(cause).__name__}: {cause}{suffix}; CURRENT unchanged")
+
+
+def _backend_recipe(spec: Any) -> dict[str, Any]:
+    """A backend's part of the index recipe; a backend config may narrow its dump (``recipe()``)."""
+    recipe = getattr(spec, "recipe", None)
+    return recipe() if callable(recipe) else spec.model_dump(mode="json")
 
 
 def _delete_on(backend: Any, gen: GenerationId) -> None:

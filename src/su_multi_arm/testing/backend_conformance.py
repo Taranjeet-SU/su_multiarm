@@ -30,21 +30,26 @@ from ..core.types import (
     Measure,
     Membership,
     MetadataSchema,
+    NamedState,
     Occurrence,
     Page,
+    Period,
     Predicate,
     Provenance,
     Relation,
     Scope,
     ScopeSpec,
     SessionRecord,
+    Sort,
     Span,
     StructuredRecord,
+    TextMatch,
     TraversalSpec,
 )
 
 GEN = GenerationId(dataset="conformance", generation="a" * 32, index_format=3, fingerprint="f" * 64)
 GEN2 = GEN.model_copy(update={"generation": "b" * 32})
+GENQ = GEN.model_copy(update={"generation": "c" * 32})
 PROV = Provenance(extractor="conformance")
 SCHEMA = MetadataSchema(
     fields=[
@@ -301,6 +306,99 @@ def check_records(adapter: Any) -> None:
             raise AssertionError("non-listable fields must not be enumerated")
         except BackendError:
             pass
+    check_query_operations(adapter)
+    if caps.satisfied(adapter, "lexical"):
+        check_text_count(adapter)
+
+
+# --- query-compiler operations (2.0.0a3): every records adapter, identical semantics -------------
+
+QSCHEMA = MetadataSchema(
+    canonical_unit="item",
+    fields=[
+        FieldSpec(name="team", type="string", listable=True, groupable=True),
+        FieldSpec(name="state", type="string", listable=True, groupable=True, states=[NamedState(name="open", values=["done"], negate=True)]),
+        FieldSpec(name="opened_at", type="datetime", time_basis="opened", groupable=True, sortable=True),
+        FieldSpec(name="score", type="number", sortable=True),
+        FieldSpec(name="org", type="string", groupable=True),
+    ],
+)
+_QROWS = [
+    ("q1", {"team": "A", "state": "done", "opened_at": "2024-01-05T10:00:00+00:00", "score": 3, "org": "X"}),
+    ("q2", {"team": "A", "state": "new", "opened_at": "2024-01-20T10:00:00+00:00", "score": 5, "org": "Y"}),
+    ("q3", {"team": "B", "state": None, "opened_at": "2024-02-03T10:00:00+00:00", "score": None, "org": None}),
+    ("q4", {"team": "B", "state": "new", "opened_at": "2024-02-10T10:00:00+00:00", "score": 1}),
+    ("q5", {"team": "C", "state": "done", "opened_at": "2024-03-01T10:00:00+00:00", "score": 4, "org": "X"}),
+    ("q6", {"team": "C", "state": "new", "opened_at": "2024-03-15T10:00:00+00:00", "score": 4, "org": None}),
+]
+
+
+def _keys(result: Any) -> list[tuple]:
+    return [(tuple(g.key.values()), g.value, g.rank) for g in result.groups]
+
+
+def check_query_operations(adapter: Any) -> None:
+    """Ranking with ties, nth, calendar groups, cross-tab, period comparison, shares, distinct
+    counts with nulls (review B1), numeric measures with null coverage, negated states with their
+    unknown count, list with total, record-identity predicates and an unresolved text condition."""
+    records = adapter.records
+    rows = [StructuredRecord(schema_id="document", id=i, values={"id": i, **v}, provenance=PROV) for i, v in _QROWS]
+    adapter.catalog.put_documents(GENQ, [], [])  # its own generation: no rows of the other checks
+    records.upsert(GENQ, rows, QSCHEMA)
+    run = lambda spec: records.execute(GENQ, spec, [])  # noqa: E731
+    top = run(ScopeSpec(group_by=["team"], top_n=1))
+    _ensure(_keys(top) == [(("A",), 2, 1)] and [g.key["team"] for g in top.ties] == ["B", "C"], "top_n keeps the first by key and reports the tied groups")
+    avg = Measure(kind="avg", field="score")
+    _ensure(_keys(run(ScopeSpec(group_by=["team"], measure=avg, nth=2))) == [(("B",), 1.0, 2)], "nth uses dense ranks of the measure value")
+    _ensure(_keys(run(ScopeSpec(group_by=["team"], measure=avg, nth=1))) == [(("A",), 4.0, 1), (("C",), 4.0, 1)], "nth keeps every group of a tied rank")
+    tied = run(ScopeSpec(group_by=["team"], measure=avg, top_n=1))
+    _ensure(_keys(tied) == [(("A",), 4.0, 1)] and [g.key["team"] for g in tied.ties] == ["C"], "a tie at the top_n boundary is reported")
+    _ensure(_keys(run(ScopeSpec(group_by=["team"], measure=avg, order="asc", nth=1))) == [(("B",), 1.0, 1)], "ascending order")
+    _ensure(tied.missing_or_invalid == 1, "groups report records without a numeric value")
+    monthly = run(ScopeSpec(group_by=["opened_at"], granularity="month"))
+    _ensure(monthly.value == {"2024-01": 2, "2024-02": 2, "2024-03": 2}, "calendar month groups")
+    cross = run(ScopeSpec(group_by=["team", "state"]))
+    _ensure(len(cross.groups) == 6 and {"team": "B", "state": None} in [g.key for g in cross.groups], "cross-tab keeps the unknown group")
+    periods = [Period(label="jan", lower="2024-01-01T00:00:00+00:00", upper="2024-02-01T00:00:00+00:00"), Period(label="feb", lower="2024-02-01T00:00:00+00:00", upper="2024-03-01T00:00:00+00:00")]
+    compared = run(ScopeSpec(time_basis="opened_at", periods=periods))
+    _ensure(compared.value == {"jan": 2, "feb": 2} and compared.exactness == "exact", "period comparison")
+    shares = run(ScopeSpec(group_by=["team"], with_share=True))
+    _ensure(all(abs((g.share or 0) - 1 / 3) < 1e-9 for g in shares.groups), "group shares of the matched total")
+    share = run(ScopeSpec(measure=Measure(kind="share"), numerator=[Predicate(field="state", op="eq", value="new")]))
+    _ensure((share.value, share.numerator, share.total) == (0.5, 3, 6), "share with a numerator")
+    distinct = run(ScopeSpec(measure=Measure(kind="count_distinct", field="org")))
+    _ensure((distinct.value, distinct.missing_or_invalid) == (2, 3), "count_distinct excludes missing and null values and reports them (B1)")
+    mean = run(ScopeSpec(measure=avg))
+    _ensure(abs(mean.value - 3.4) < 1e-9 and mean.missing_or_invalid == 1, "avg over non-null values with null coverage")
+    open_ = run(ScopeSpec(predicates=[Predicate(field="state", op="in", value=["done"], negate=True)]))
+    _ensure(open_.matched_ids == ["q2", "q3", "q4", "q6"] and open_.unknown == {"state": 1}, "a negated state includes and reports null values")
+    listed = run(ScopeSpec(sort=Sort(field="score", descending=True), limit=2))
+    _ensure([r.id for r in listed.listed] == ["q2", "q5"] and listed.total == 6, "list: sort with id tie-break, total reported")
+    ascending = run(ScopeSpec(sort=Sort(field="score"), limit=6))
+    _ensure([r.id for r in ascending.listed] == ["q4", "q1", "q5", "q6", "q2", "q3"], "list: missing values last")
+    window = run(ScopeSpec(predicates=[Predicate(field="opened_at", op="date_interval", lower="2024-02-01T00:00:00+00:00", upper="2024-03-01T00:00:00+00:00", granularity="day")]))
+    _ensure(window.matched_ids == ["q3", "q4"], "half-open window")
+    ids = run(ScopeSpec(predicates=[Predicate(field="id", op="in", value=["q1", "q5"])]))
+    _ensure(ids.matched_ids == ["q1", "q5"] and ids.exactness == "exact", "record identity predicate")
+    text = run(ScopeSpec(text=TextMatch(text="anything")))
+    _ensure(text.exactness == "bounded" and text.unsupported[0].reason == "not_supported_by_backend", "an unresolved text condition is reported, never ignored")
+
+
+def check_text_count(adapter: Any) -> None:
+    """A literal topic counted over every matching chunk of the lexical index (whole corpus)."""
+    from ..arms.structured import text_match_ids, text_query
+
+    seed(adapter)
+    rows = [StructuredRecord(schema_id="document", id=f"d{i}", values={"id": f"d{i}", "source": "case"}, provenance=PROV) for i in (1, 2, 3, 4)]
+    adapter.records.upsert(GEN, rows, SCHEMA)
+    terms = text_match_ids(adapter.lexical, GEN, text_query(TextMatch(text="certificate exemption")), Scope())
+    _ensure(terms == ["d1", "d3"], "all_terms: every document with every word")
+    if caps.flags(adapter.kind, "lexical").get("phrase"):
+        _ensure(text_match_ids(adapter.lexical, GEN, text_query(TextMatch(kind="phrase", text="exemption certificate")), Scope()) == ["d1"], "phrase")
+    scoped = text_match_ids(adapter.lexical, GEN, text_query(TextMatch(text="rounding")), Scope(exclude_ids=["d1"]))
+    _ensure(scoped == ["d2"], "text matches honour the eligibility scope")
+    count = adapter.records.execute(GEN, ScopeSpec(predicates=[Predicate(field="id", op="in", value=terms)]), [])
+    _ensure((count.value, count.exactness) == (2, "exact"), "the matched ids count exactly")
 
 
 GRAPH_TEXTS = {"d6": "The AACTA awarded the Film at the Gala", "d7": "The Film screened at the Gala in Paris"}
@@ -459,6 +557,158 @@ def check_graph(adapter: Any) -> None:
     graph.put_communities(GEN, [Community(id="k1", label="AACTA", document_ids=["d6", "d7"], entity_ids=["aacta", "film"])])
     communities = graph.communities(GEN)
     _ensure([c.id for c in communities] == ["k1"] and communities[0].status() == "disabled" and communities[0].document_ids == ["d6", "d7"], "communities round-trip")
+    check_traversal_templates(adapter)
+
+
+# --- typed traversal templates (core/config_graph.py, arms/traversal.py) ----------------------------
+
+GEN3 = GEN.model_copy(update={"generation": "e" * 32})
+TRAVERSAL_TEXTS = {
+    "t1": "Ticket Alpha reports Login Timeout; root cause Token Expiry, fixed by Token Refresh on the Portal",
+    "t2": "Ticket Beta reports Login Timeout; resolved by Cache Flush on the Portal",
+}
+
+
+def traversal_fixture() -> tuple[list[Entity], list[Relation]]:
+    """A neutral support-desk graph. t1: alpha -has_symptom-> login_timeout, alpha -has_root_cause->
+    token_expiry -resolved_by-> token_refresh, alpha -resolved_by-> token_refresh, alpha -about-> portal.
+    t2: beta -has_symptom-> login_timeout, beta -resolved_by-> cache_flush, portal ~ cache_flush
+    (co-occurrence only)."""
+
+    def span(doc: str, text: str, after: int = 0) -> Span:
+        start = TRAVERSAL_TEXTS[doc].index(text, after)
+        return Span(document_id=doc, chunk_id="c" + doc, field="body", start=start, end=start + len(text), text=text, match_level="exact")
+
+    def whole(doc: str) -> Span:
+        text = TRAVERSAL_TEXTS[doc]
+        return Span(document_id=doc, chunk_id="c" + doc, field="body", start=0, end=len(text), text=text, match_level="exact")
+
+    entities = [
+        Entity(id="alpha", name="Ticket Alpha", type="issue", span=span("t1", "Ticket Alpha")),
+        Entity(id="login_timeout", name="Login Timeout", type="symptom", span=span("t1", "Login Timeout")),
+        Entity(id="token_expiry", name="Token Expiry", type="cause", span=span("t1", "Token Expiry")),
+        Entity(id="token_refresh", name="Token Refresh", type="fix", span=span("t1", "Token Refresh")),
+        Entity(id="portal", name="Portal", type="product", span=span("t1", "Portal")),
+        Entity(id="beta", name="Ticket Beta", type="issue", span=span("t2", "Ticket Beta")),
+        Entity(id="login_timeout", name="Login Timeout", type="symptom", span=span("t2", "Login Timeout")),
+        Entity(id="cache_flush", name="Cache Flush", type="fix", span=span("t2", "Cache Flush")),
+        Entity(id="portal", name="Portal", type="product", span=span("t2", "Portal")),
+    ]
+
+    def fact(subject: str, predicate: str, obj: str, doc: str) -> Relation:
+        return Relation(subject_id=subject, predicate=predicate, object_id=obj, span=whole(doc), edge_kind="fact", support="trigger_in_span", provenance=PROV)
+
+    relations = [
+        fact("alpha", "has_symptom", "login_timeout", "t1"),
+        fact("alpha", "has_root_cause", "token_expiry", "t1"),
+        fact("token_expiry", "resolved_by", "token_refresh", "t1"),
+        fact("alpha", "resolved_by", "token_refresh", "t1"),
+        fact("alpha", "about", "portal", "t1"),
+        fact("beta", "has_symptom", "login_timeout", "t2"),
+        fact("beta", "resolved_by", "cache_flush", "t2"),
+        Relation(subject_id="portal", predicate="near", object_id="cache_flush", span=whole("t2"), edge_kind="co_occurrence", support="unchecked", provenance=PROV),
+    ]
+    return entities, relations
+
+
+def traversal_templates() -> dict[str, Any]:
+    """The template library the conformance check runs (also used by the arm tests)."""
+    from ..core.config_graph import TraversalTemplate
+
+    return {
+        "issue_facts": TraversalTemplate(kind="neighbors", hop={"direction": "out"}, hops=1, seed_types=["issue"]),
+        "troubleshoot": TraversalTemplate(
+            kind="chain",
+            seed_match="tokens",
+            seed_types=["symptom"],
+            steps=[{"predicates": ["has_symptom"], "direction": "in"}, {"predicates": ["resolved_by", "has_root_cause"], "direction": "out"}],
+        ),
+        "cause_fix": TraversalTemplate(kind="chain", steps=[{"predicates": ["has_root_cause"], "direction": "out"}, {"predicates": ["resolved_by"], "direction": "out"}]),
+        "related": TraversalTemplate(kind="connect", hop={"direction": "any"}, hops=2),
+        "fixes_only": TraversalTemplate(kind="neighbors", hop={"direction": "out"}, hops=2, target_types=["fix"]),
+        "mentioned_in": TraversalTemplate(kind="mentioned_in"),
+        "any_kind": TraversalTemplate(kind="neighbors", hop={"direction": "any", "edge_kinds": ["fact", "co_occurrence"]}, hops=1),
+    }
+
+
+TRAVERSAL_CASES: tuple[tuple[str, tuple[str, ...], Scope | None], ...] = (
+    ("issue_facts", ("Ticket Alpha",), None),
+    ("issue_facts", ("Login Timeout",), None),  # a symptom is not an issue seed
+    ("troubleshoot", ("users see login timeout errors",), None),
+    ("troubleshoot", ("users see login timeout errors",), Scope(exclude_ids=["t2"])),
+    ("cause_fix", ("alpha",), None),  # a stored entity id resolves to itself
+    ("related", ("Ticket Beta", "Ticket Alpha"), None),
+    ("fixes_only", ("Ticket Alpha", "Ticket Beta"), None),
+    ("mentioned_in", ("Token Refresh", "Portal"), Scope(document_ids=["t1"])),
+    ("any_kind", ("Portal",), None),
+    ("issue_facts", ("Ticket Gamma",), None),
+)
+
+
+def traversal_signature(result: Any) -> dict[str, Any]:
+    """Backend-independent view of a ``TemplateResult`` (ids, predicates, kinds, spans)."""
+    return {
+        "seeds": sorted(s.id for s in result.seeds),
+        "unresolved": list(result.unresolved),
+        "paths": [
+            [tuple(p.nodes), tuple((e.predicate, e.edge_kind, e.span.document_id, e.span.start, e.span.end, e.provenance.extractor) for e in p.edges)]
+            for p in result.paths
+        ],
+        "mentions": [(m.id, m.span.document_id, m.span.start, m.span.end) for m in result.mentions],
+        "truncated": result.truncated,
+    }
+
+
+EXPECTED_TRAVERSALS: tuple[dict[str, Any], ...] = (
+    {"seeds": ["alpha"], "unresolved": [], "nodes": [["alpha", "login_timeout"], ["alpha", "token_expiry"], ["alpha", "token_refresh"], ["alpha", "portal"]]},
+    {"seeds": [], "unresolved": ["Login Timeout"], "nodes": []},
+    {"seeds": ["login_timeout"], "unresolved": [], "nodes": [["login_timeout", "alpha", "token_expiry"], ["login_timeout", "alpha", "token_refresh"], ["login_timeout", "beta", "cache_flush"]]},
+    {"seeds": ["login_timeout"], "unresolved": [], "nodes": [["login_timeout", "alpha", "token_expiry"], ["login_timeout", "alpha", "token_refresh"]]},
+    {"seeds": ["alpha"], "unresolved": [], "nodes": [["alpha", "token_expiry", "token_refresh"]]},
+    {"seeds": ["alpha", "beta"], "unresolved": [], "nodes": [["beta", "login_timeout", "alpha"]]},
+    {"seeds": ["alpha", "beta"], "unresolved": [], "nodes": [["alpha", "token_refresh"], ["beta", "cache_flush"], ["alpha", "token_expiry", "token_refresh"]]},
+    {"seeds": ["portal", "token_refresh"], "unresolved": [], "mentions": [("token_refresh", "t1"), ("portal", "t1")]},
+    {"seeds": ["portal"], "unresolved": [], "nodes": [["portal", "alpha"], ["portal", "cache_flush"]]},
+    {"seeds": [], "unresolved": ["Ticket Gamma"], "nodes": []},
+)
+
+
+def run_traversal_cases(adapter: Any, gen: GenerationId = GEN3) -> list[dict[str, Any]]:
+    """Load the traversal fixture into ``gen`` and run every case; returns the signatures."""
+    from ..arms.traversal import run_template
+    from ..core.config_graph import GraphIntent
+
+    entities, relations = traversal_fixture()
+    if caps.satisfied(adapter, "catalog"):
+        adapter.catalog.put_documents(
+            gen,
+            [Document(id=d, dataset="conformance", source="case") for d in TRAVERSAL_TEXTS],
+            [Chunk(id="c" + d, document_id=d, field="body", start=0, end=len(t), text=t) for d, t in TRAVERSAL_TEXTS.items()],
+        )
+    adapter.graph.upsert(gen, entities, relations, [])
+    templates = traversal_templates()
+    return [
+        traversal_signature(run_template(adapter.graph, gen, name, templates[name], GraphIntent(template=name, seeds=list(seeds)), scope))
+        for name, seeds, scope in TRAVERSAL_CASES
+    ]
+
+
+def check_traversal_templates(adapter: Any) -> list[dict[str, Any]]:
+    """Every template kind gives the documented result on this backend (identical semantics across
+    backends: the expectations are backend-independent literals)."""
+    signatures = run_traversal_cases(adapter)
+    for (name, seeds, _), got, want in zip(TRAVERSAL_CASES, signatures, EXPECTED_TRAVERSALS):
+        label = f"template {name} {seeds}"
+        _ensure(got["seeds"] == want["seeds"], f"{label}: seeds {got['seeds']} != {want['seeds']}")
+        _ensure(got["unresolved"] == want["unresolved"], f"{label}: unresolved {got['unresolved']}")
+        if "mentions" in want:
+            _ensure([(m[0], m[1]) for m in got["mentions"]] == want["mentions"], f"{label}: mentions {got['mentions']}")
+        else:
+            _ensure([list(p[0]) for p in got["paths"]] == want["nodes"], f"{label}: paths {[p[0] for p in got['paths']]}")
+    by_kind = {kind for path in signatures[8]["paths"] for kind in (e[1] for e in path[1])}
+    _ensure(by_kind == {"fact", "co_occurrence"}, "co-occurrence only through a template that requests it")
+    _ensure(all(e[1] == "fact" for s in signatures[:8] for p in s["paths"] for e in p[1]), "fact-only templates never reach co-occurrence")
+    return signatures
 
 
 def check_cache(adapter: Any, clock: dict[str, float]) -> None:

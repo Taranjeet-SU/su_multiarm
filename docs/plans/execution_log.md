@@ -967,3 +967,192 @@ Anthropic smoke: first call (extraction, native tool_use + cache_control) → HT
 $0.00 spent (ledger). `$defs`, streaming and cache-token reporting remain unverified on the real API.
 Follow-ups: rerun the Anthropic smoke when the key has quota; N3 (time-range intersection), N6, N7
 (server-time lease expiry), N10; measure the detector abstain rate on a larger narrative set.
+
+### 2026-11-04 — parity/query-compiler: structured-question operations — DONE (synthetic/mocked evidence)
+Branch `worktree-agent-ad7184475f36fdbf0`, base `b99eae2`, commit `df872d4`. Goal: close the SU
+structured-question gap (rankings, nth, windows, comparisons, shares, distinct, measures, lists,
+topic counts) generically. Done: `ScopeSpec` (`order`, `nth`, `granularity`, `periods`,
+`with_share`, `numerator`, `text`, `limit`) and `ScopeResult` (`total`, `listed`, `ties`, `unknown`,
+`numerator`, `basis`; `GroupRow.rank/share`) — all additive; semantics in `backends/_scope.py` so
+every records adapter (memory, sqlite, sqlalchemy, postgres, mongodb, opensearch, elasticsearch)
+shares them; kit `check_query_operations` (all records adapters) and `check_text_count` (records +
+lexical). `decision/windows.py`, `ValueResolver.window` (anchor + `metadata_schema.timezone`),
+`FieldSpec.states`, `decision/grammar.py` (rules), planner `ScopeDraft` (`windows`, `periods`, ...),
+new intent kinds `rank|breakdown|measure|share|compare`, structured-arm text resolution
+(`text_backend`), `SearchRequest.as_of` (+ MCP args), contract number check, generator/planner prompt
+lines (neutral). Coordinator extras: review B1 (count_distinct nulls; unit test + kit case) and N1
+(`packing.aggregate_reserve_max`, default 0.5, traced `aggregate_reserve_chars`).
+Deviations: (1) relative windows are a separate draft field (`ScopeDraft.windows`/`periods` as
+expressions), not a new `Predicate` op, so no unresolved expression can reach an adapter; (2)
+`metadata_schema.timezone` defaults to None (undeclared): calendar expressions on `require_offset`
+datetime fields are refused (`timezone_missing`), date/`assume_utc` fields read UTC — keeps the
+"calendar qualifier without an offset" probe failing closed; (3) ranks are dense (1,1,2) and `nth`
+keeps every tied group; "which X has the most" compiles to `nth: 1` (all tied leaders); (4) negated
+predicates/states include null values (as every adapter already did) and report them in `unknown`
+rather than excluding them; (5) text topics are chunk-level literal matches through
+`LexicalIndex.search` paged to exhaustion (cap 50,000 chunks, typed refusal above) — no new lexical
+adapter method, to stay out of the lexical slice; (6) `unsupported_reason` now accepts `eq`/`in` on
+undeclared record keys (`id`, `source`, `dataset`, `kind`); (7) a declared state wins over an
+observed value of the same text for agent-compiled predicates; caller filters stay literal; (8)
+packing default cap changes behaviour (aggregates above half the budget are omitted, reported).
+Tests replaced: the "exhaustive list over an unbound topic" probe (unit + engine harness) now asks
+"List all billing records" (same edge: an unbound topic word), because "records about billing" is now
+a labelled literal text match; the packing test that relied on the uncapped reservation sets
+`aggregate_reserve_max: 1.0`. Tests: `not external` 1032 → **1073 passed**; `pytest -q -o
+pythonpath=src` 1076 passed / 123 skipped; ruff clean; schema regenerated (`write_all`); golden
+fingerprints unchanged. Not run: PostgreSQL/MongoDB/OpenSearch/Elasticsearch conformance (no
+isolated stack); SU 45-question re-measure (needs live planner + private corpus).
+Follow-ups: `engine.aggregate_in` (tool path) does not resolve `text` (reported unsupported);
+"week" granularity; per-period breakdowns; non-English grammar; v1 downgrade silently drops the new
+settings (cf. review N10).
+
+### 2026-11-04 — 2.0.0a3/a3 contract-providers: strip default, Anthropic native default, QQ-01..06, real Anthropic smoke — DONE
+Branch `worktree-agent-abd4d0094f6cca9a3` (base `b99eae2`), commit `c0634b6`.
+
+**Done**
+
+1. **Owner decisions.**
+   - `on_violation` defaults to `strip` in config and in `AnswerContract()`. When the question asks no
+     aggregate (targeted or untargeted), unbacked count/list/absence sentences of a narrative answer
+     are stripped and recorded. When it does ask one, an unbacked statement abstains. A factual
+     answer with no citation left abstains; an `insufficient_evidence` answer may keep no citations.
+   - Anthropic roles with no `structured_output` resolve to `native` for registry-capable models.
+     `CapabilityDeclaration.structured_output` defaults to `None` and resolves in `ChatRole`, so an
+     explicit `none` survives an `exclude_defaults` dump.
+   - Registry `native_kind: output_format` (`output_config.format`) for `claude-haiku-5*` and
+     `claude-sonnet-5*`; `tool_use` elsewhere. `base.output_format_schema` drops the bounds the API
+     refuses and closes objects.
+   - Registry `thinks_by_default` and `min_max_tokens` (1024) for Haiku 5.x, checked by `check_role`
+     in config and at provider construction. The v1 upgrade raises the value with a
+     `max_tokens_raised` warning; strict mode refuses.
+   - Anthropic `thinking_tokens` is recorded as `reasoning_tokens`, truncation messages name the
+     thinking share, and `stop_details` is recorded.
+2. **QQ findings.**
+   - QQ-01: `ProviderLimitIgnored` (`output_limit_ignored`) is raised in `_chat._exchange` when the
+     reported output exceeds `max_tokens`. CONFIGURATION documents that Ollama requires
+     `max_tokens_parameter: max_tokens`.
+   - QQ-02: a number after a declared field name is a value label (`detect_statements(fields=)`).
+   - QQ-03: total/sum amount statements (`Statement.amount`) are matched against the exact aggregate.
+   - QQ-04: `Intents.untargeted`, `asks_list` and `asks_aggregate`, plus
+     `intent.untargeted_constraint`. `check_qualifiers` uses it instead of `NO_OPERATOR`.
+   - QQ-05: OpenAI-compatible calls record `reasoning_chars`, and the docs explain Ollama's thinking
+     attribution.
+   - QQ-06: the `insufficient_evidence` exemption is removed for statements and number mismatches.
+   - Also fixed: when the nearest unit after a number reads as a label, the farther unit is retried.
+     Before, "111 open CloudTax tickets" was undetected when the question made "open" a unit.
+3. **Real Anthropic smoke** (first real calls): Haiku 5.5 and Sonnet 5.5, 44 requests, **$0.0467**
+   by the guard ledger. Planner `output_format` and `tool_use` with `$defs`, streaming, cache
+   write/read tokens, thinking and truncation, LLM extraction with grounding, and the planned answer
+   are all verified. Refusal remains mocked. The QA guard (`~/su_mutliarm_tests/qa`, outside the
+   repo) gained Sonnet pricing and a per-tag cap (`QA_TAG_CAP_USD`).
+4. Version 2.0.0a3, CHANGELOG, VALIDATION (status and entry), CONFIGURATION, ARCHITECTURE. Schema
+   and capability tables regenerated; the generator script gained per-pattern evidence and an
+   accurate OpenAI note.
+
+**Deviations**
+
+- (a) The thinking minimum is a rejection only. A role default derived from the registry was tried
+  and dropped: `exclude_defaults` dumps lost the explicit 2048 and reloads changed it.
+- (b) v1 configs are raised with a warning rather than rejected, so v1 files keep loading.
+  `examples/anthropic.yaml` reviewer 512 → 1024 keeps the example's upgrade/downgrade round trip
+  exact.
+- (c) `output_format` is declared only for the two 5.x families the smoke verified. Opus 5 and the
+  4.x families stay `tool_use`.
+- (d) QQ-04 is not a new aggregate kind. Untargeted list operators fire only on common record nouns
+  (`COUNT_NOUNS`, moved to `decision/intent.py` and re-exported from `statements`), so "list all the
+  steps" is unaffected.
+- (e) `untargeted_constraint` reuses the reason `aggregate_intent_without_scope`; no new reason
+  literal was added.
+
+**Tests replaced**
+
+- `test_anthropic_prompt_mode_request_shape_and_usage` and
+  `test_anthropic_text_stream_folds_usage_from_start_and_delta_events` now set
+  `structured_output: none` explicitly. They cover the same prompt-mode edges.
+- Release identity is set to 2.0.0a3.
+
+**Tests:** `not external` 1031 passed and 1 skipped → **1069 passed**. Bare `pytest -q` gives 1072
+passed and 123 skipped. ruff is clean and the golden fingerprint test is green.
+
+**Follow-ups**
+
+- Provoke a real refusal only with a benign documented trigger, if one exists.
+- Measure the narrative strip rate on a real QA set.
+- Opus 5 `output_format` is unverified (0 rpm).
+- `reasoning_chars` is not folded from streams.
+- `max_tokens_parameter` is not enforced for Ollama by host detection: documented plus a runtime
+  fail-closed check.
+
+### 2026-11-04 — parity/kuzu-graph: Kuzu graph backend, typed traversal templates, hierarchical communities — DONE (neo4j template identity not run)
+Branch `worktree-agent-a8eb44081b2f714d2` (base `b99eae2`), commit `7c9613a`. Done: (1) `backends/kuzu/` — `KuzuBackend`
+(native: fixed Cypher in `_cypher.py`, `g`-keyed tables, MERGE-idempotent one-transaction load, one relationship table per edge
+kind, provenance + occurrences, document-id eligibility with `predicate_scope: false`, CAS pointer row, `delete_generation`,
+namespaces) and `KuzuAttachedBackend` (read-only existing store + declared `AttachMapping` file; catalog-validated; built
+statements only; quote/verified/document rules; per-node paging; communities read once; writes refused); capability row `kuzu`
+(graph, memberships); extra `kuzu`; engine/config wiring (`backends.<n>: {kind: kuzu, mode, path, attach.mapping}`, paths
+relative to the config). (2) `core/config_graph.py` (TraversalTemplate, GraphOntology, GraphIntent) + `arms/traversal.py`;
+`RetrievalStep.graph`, `ArmInput.graph`, `Capabilities.graph_templates`, LLM planner `template`/`seeds` (undeclared →
+`invalid_step`); graph arm returns path provenance as document hits; the conformance kit's graph check runs the template
+cases on every graph backend. (3) `communities/hierarchy.py` (`louvain_hierarchical`, seeded dendrogram, levels 0–2,
+`parent_id`) and `communities/stats.py` (size, members_by_kind, trend over a declared `time_basis`, top entities by lift);
+`Community.level/parent_id/stats` stored under the report's `_community` key. Private parity run: see
+`~/su_mutliarm_tests/parity/REPORT.md` §11 and the VALIDATION.md entry (aggregate only).
+Deviations: (a) Kuzu was a Phase 5 item; brought forward for parity, graph only. (b) No ontology contract exists yet
+(Phase 3): a minimal `GraphOntology` view lives on `pipeline.arms.graph.ontology` and attached mappings expose one;
+`extraction.ontology` stays refused. (c) Leiden replaced by the Louvain dendrogram (`louvain_hierarchical`, plan open
+decision 7); strategy name differs from the plan's `leiden_hierarchical` on purpose. (d) Hierarchy/stats are stored inside
+the stored report JSON (`_community` key) instead of new columns, so existing rows/indexes stay readable. (e) Attach-mode
+spans anchor the stored quote (`<REL>.<col>`, offsets 0..len), not package catalog offsets; attached facts carry
+`support: unchecked` as declared by the mapping (PathEdge allows it; Relation would not). (f) Attach `find_entities`
+builds an in-memory name index of `lookup` tables once (bounded by `max_lookup_rows`); under a scope an entity needs an
+eligible mention. (g) `GraphExtras`-optional `entity_types(ids)` used by templates when a facet offers it.
+Tests: `not external` 1031 passed / 1 skipped → **1068 passed**; bare `pytest -q` 1071 passed, 124 skipped; ruff clean;
+schema regenerated with `core.schema.write_all`; golden fingerprints unchanged. New: `tests/conformance/test_kuzu_conformance.py`,
+`test_traversal_templates.py` (neo4j case `external`, not run: no server), `tests/unit/test_kuzu_attach.py`,
+`test_communities_hierarchy.py`, `tests/contract/test_graph_templates_engine.py`; `test_backends.py` matrix expectations
+extended with `kuzu`.
+Follow-ups: run the neo4j template identity test on the service stack; seed resolution by description substring (the
+measured troubleshoot gap) would need a typed "match text" lookup in GraphExtras; `connect` over hub nodes is slow on
+large attached stores (53 s); community reports from external stores need grounded quotes to count; incremental community
+augmentation (Jaccard attach, stale flags) not done.
+
+### 2026-11-04 — parity/lexical-latency: sqlite `bm25` lexical engine, lexical front policies, request-path latency — DONE (latency target not met)
+Branch `worktree-agent-a0dd61f541791a8d6` (base `b99eae2`, `v2/phase-0`). Done: (1) `backends/sqlite/bm25.py`
+— Okapi BM25 segment per generation, built at `refresh` from the indexed chunks in chunk-id order
+(memory-mapped `offsets/post_rows/post_freqs/idf/doc_len/row_doc/row_field.npy`, id lists as JSON,
+vocabulary in the generation catalog's `bm25_terms`); scores bit-identical to `rank_bm25.BM25Okapi`
+(first-occurrence term order, same running idf sum and epsilon floor, repeated query tokens counted);
+a row matches when it holds a query token, ties by chunk id; `phrase`/`boolean` verify adjacency on
+candidate text; settings mismatch / missing segment are typed `BackendError`s. Config:
+`backends.<sqlite>.lexical_engine: fts5|bm25` + `bm25: {k1, b, epsilon, tokenizer: unicode_word|ascii_alnum,
+lowercase, stemming: none|<snowball>, include_title}`; `SqliteBackend.recipe()` adds the keys to the index
+fingerprint only for `bm25` (golden fingerprints unchanged); manifest `analyzer_id` `bm25_okapi:…`.
+(2) Scope pushdown as a document bitset (`SqliteBackend.document_mask`) for bm25 and vector search:
+Faiss `IDSelectorBitmap` / NumPy masked exact top-k, no depth growth and no per-candidate catalog reads;
+vector row→document map built once per generation (re-built when the catalog file changes).
+(3) Lexical arm policies, off by default: `verbatim_boost` (quoted strings and N-token windows with DF,
+boilerplate and verification guards; needs `analyze`/`doc_freqs`/`phrase_rows`, else a validation error)
+and `pin_identifiers` (id-field patterns, exact field equality inside the scope); front hits carry
+`lexical_front` provenance and selection keeps them first under `source_slots` (`Candidate.leads`).
+Repeated query words reach only an index that declares `scores_query_repeats`. (4) Request path:
+`extras.HitParts` / `SqliteCatalog.hit_parts` (arm collapse without whole-document parses), selection
+collapse without deep copies. (5) Write-path lexical validation samples only words the index analyzer
+keeps (an ASCII tokenizer drops non-ASCII words).
+Deviations: (a) the task's "zero-score hits dropped" was not kept: the `LexicalIndex` conformance
+contract requires every chunk with a query term, so idf-0 rows (a token in exactly half the rows) match
+with score 0 and rank last; (b) `Candidate.leads` is a selection change outside the lexical arm, needed
+because `source_slots` re-ordered front records (measured: lexical MRR 0.384 → 0.426 with it); it is
+inert unless an arm marks hits `lexical_front`; (c) the vector row map reads `chunks(id, document_id)`
+once per generation and process (an index structure like `chunk_ids.json`, not a per-request read);
+(d) `gc.freeze()` is not applied by the package (process-global); documented as a deployment note.
+Tests: `not external` 1032 → **1066 passed** (new `tests/unit/test_bm25_lexical.py`, `sqlite_bm25`
+conformance adapter, `sqlite_bm25` arm contract parametrisation); ruff clean; schema regenerated.
+Measured (private corpus, 630 queries; numbers in `~/su_mutliarm_tests/parity/reports/lexical_latency_2026-11-04.json`):
+bm25 + policies lexical R@10/MRR 0.703/0.426 vs service 0.698/0.426 (FTS5 0.676/0.389; bm25 alone
+0.668/0.383); fused 0.837/0.639 vs 0.826/0.645; FTS5 lists unchanged 630/630 by the latency work.
+Latency p50/p95: before 1.21/2.47 s (2 threads) → bm25 0.74/1.32 s (2 threads), 0.41/1.03 s
+(8 threads); lexical search 0.72 → 0.028 s. **Target p50 ≤ 0.3 s not met**: the CPU query encode
+(0.19–0.44 s in-process) dominates; without it ~0.25–0.29 s.
+Follow-ups: query-encode cost (ONNX/quantised encoder, or encode cache for repeated queries); GC tail
+(serving-level `gc.freeze()` option); `bm25` segment for incremental (delta) ingest is a full rebuild;
+`hit_parts` document heads still parse the stored document JSON (a heads column would avoid it).

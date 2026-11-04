@@ -40,7 +40,7 @@ routing:
     provider: anthropic
     model: claude-haiku-5-5
     api_key_env: ANTHROPIC_API_KEY
-    max_tokens: 512
+    max_tokens: 1024
 generation:
   model:
     provider: anthropic

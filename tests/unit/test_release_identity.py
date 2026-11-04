@@ -29,7 +29,7 @@ V1_EXAMPLES = sorted(p for p in (ROOT / "examples").glob("*.yaml"))
 
 def test_one_version_everywhere(monkeypatch, capsys):
     version = PYPROJECT["project"]["version"]
-    assert version == "2.0.0a2" and su_multi_arm.__version__ == version
+    assert version == "2.0.0a3" and su_multi_arm.__version__ == version
     pytest.importorskip("fastapi")
     from su_multi_arm.serving.http import create_app
     from serving_support import memory_config

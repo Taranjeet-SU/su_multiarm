@@ -12,6 +12,7 @@ Use `Config.model_json_schema()` to regenerate the schema after changing public 
 | `postgres` | psycopg 3 for the `postgres` backend; the database needs the pgvector extension for vectors |
 | `sql` | SQLAlchemy 2 for the generic `sqlalchemy` backend (plus the dialect's driver, e.g. psycopg for PostgreSQL) |
 | `neo4j` | Neo4j driver; database is external |
+| `kuzu` | embedded Kuzu (`kuzu>=0.11,<0.12`) for the `kuzu` graph backend; no service |
 | `elasticsearch` | official Elasticsearch 8.x client for the `elasticsearch` backend kind; server is external |
 | `semantic` | sentence-transformers embedding and cross-encoder support |
 | `spacy` | spaCy; separately install a licensed language pipeline |
@@ -72,10 +73,31 @@ against the per-`(provider, model-pattern)` registry in `su_multi_arm/providers/
 
 | `structured_output` | Wire behaviour | Allowed for |
 |---|---|---|
-| `none` (default) | schema appended to the system prompt; reply validated strictly | every provider |
+| `none` (default except below) | schema appended to the system prompt; reply validated strictly | every provider |
 | `json_mode` | `response_format: {type: json_object}` + prompt schema | `openai`, `openai_compatible` |
 | `json_schema` | `response_format: json_schema` with `strict: false` + prompt schema | `openai`, `openai_compatible` |
-| `native` | Anthropic: one forced tool whose `input_schema` is the schema; OpenAI: `json_schema` with `strict: true` (schema converted to strict form) | registry-declared pairs only: Anthropic `claude-3*`, `claude-{sonnet,opus,haiku}-4*`/`-5*`; OpenAI `gpt-4o*` (not `gpt-4o-2024-05-13`), `gpt-4.1*`, `gpt-5*`, `o1*` (not `o1-mini`/`o1-preview`), `o3*`, `o4-mini*`; never `openai_compatible` |
+| `native` | Anthropic: `output_config.format` (`claude-haiku-5*`, `claude-sonnet-5*`) or one forced tool whose `input_schema` is the schema (other Claude 3+ families); OpenAI: `json_schema` with `strict: true` (schema converted to strict form) | registry-declared pairs only: Anthropic `claude-3*`, `claude-{sonnet,opus,haiku}-4*`/`-5*`; OpenAI `gpt-4o*` (not `gpt-4o-2024-05-13`), `gpt-4.1*`, `gpt-5*`, `o1*` (not `o1-mini`/`o1-preview`), `o3*`, `o4-mini*`; never `openai_compatible` |
+
+**Anthropic defaults (2.0.0a3).** An `anthropic` role that does not set `capabilities.structured_output`
+gets `native` when the registry declares the model capable (every Claude 3 and later family), and
+`none` otherwise; set `structured_output: none` explicitly to keep prompt mode. A validated role
+always carries the resolved value (a config dump writes it). The registry decides the wire form:
+`output_config.format` for Haiku/Sonnet 5.x (a JSON-schema-constrained text reply; the wire schema
+drops `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`/`multipleOf`/`maxItems` and
+`minItems` above 1, which the API refuses, and closes every object; the reply is still validated with
+the full schema; a free-form mapping is refused with `StrictSchemaError` before any call), forced tool
+use elsewhere (`$defs`/`$ref` are sent as they are; the real API accepts them).
+
+**Models that think by default.** Anthropic Haiku 5.x thinks before it answers; the thinking tokens
+count against `max_tokens` and are reported as `Usage.reasoning_tokens`
+(`usage.output_tokens_details.thinking_tokens`). The registry declares a minimum `max_tokens` of
+**1024** for such models: a smaller value is rejected at validation (`max_tokens: ... thinks by
+default ... below the minimum 1024`); a v1 file is upgraded with the value raised to 1024 and a
+`max_tokens_raised` warning (`config upgrade --strict` refuses instead). The role default (2048) is
+above the minimum. Measured in the 2.0.0a3 smoke: 117–379 thinking tokens per LLM-extraction call and
+464 for a short arithmetic prompt, so keep generator and extractor roles at 2048 or more. A reply
+that still hits the ceiling is `ProviderIncomplete` and names the thinking share ("truncated at
+max_tokens 1024 (1024 of 1024 output tokens were thinking)"). A forced tool call does not think.
 
 `prompt_caching: controlled` (Anthropic only) sends `cache_control: {type: ephemeral}` on the system
 block and the tool definition; `passive` (OpenAI and compatible servers) records the cached tokens the
@@ -149,7 +171,7 @@ models:
       base_url: http://127.0.0.1:11434/v1
       model: "<local-model-id>"
       max_tokens: 2048
-      max_tokens_parameter: max_tokens  # if the server requires that name
+      max_tokens_parameter: max_tokens  # required for Ollama (see below)
       timeout_seconds: 120
       capabilities: {structured_output: json_schema}   # only if the server supports it; else none
     embedder:
@@ -158,6 +180,20 @@ models:
       model: "<local-embedding-id>"
       dimensions: 768
 ```
+
+**Output ceiling on local servers (QQ-01).** Ollama's `/v1` (0.33.0 observed) ignores
+`max_completion_tokens` — the default parameter name — and honours `max_tokens`: **set
+`max_tokens_parameter: max_tokens` for Ollama.** Whatever the server, a reply that reports more
+output tokens than the role's `max_tokens` is a typed `ProviderLimitIgnored` failure (category
+`output_limit_ignored`; the call is still metered), never a silently accepted long reply.
+
+**Thinking usage on local servers (QQ-05).** Thinking-capable local models (for example Qwen-family
+models served by Ollama) return their thinking beside the reply (`message.reasoning`), outside the
+answer. Observed on Ollama 0.33.0: `completion_tokens` then counts the visible reply only, no
+`reasoning_tokens` are reported, yet thinking does consume the `max_tokens` ceiling (a truncated
+reply can arrive with empty content and `finish_reason: length`). The package records the thinking
+text's size as `reasoning_chars` in the call record; token usage and budgets for such servers are a
+lower bound, and their `max_tokens` must leave room for the thinking.
 
 `openai_compatible` without `base_url` keeps the v1 default (`https://api.openai.com/v1`); set it for
 a local server. A local endpoint may omit `api_key_env`. Embedding roles take `provider: hash |
@@ -189,7 +225,7 @@ names its own backend. In this release the engine wires these kinds on the froze
 
 | Kind | Capabilities | Notes |
 |---|---|---|
-| `sqlite` (local default) | all eight | `path` (state directory), `vector_engine: numpy|faiss`, `timeout_seconds`. Per generation: `snapshots/<gen>/catalog.sqlite` (documents, chunks, FTS5 `unicode61` — the query is tokenised and case-folded by the same tokenizer as the text, so `Straße` and `ﬁle` match their own words but not `strasse`/`file`, typed field rows for scope pushdown, records, mentions, relations with provenance and occurrences, memberships, communities) plus `vectors.npy`/`chunk_ids.json` (and `vectors.faiss`); `runtime.sqlite` holds the cache, the ingestion ledger with raw model replies and sessions. `CURRENT` and `manifest.json` are owned by the generation registry, never read by the adapter. |
+| `sqlite` (local default) | all eight | `path` (state directory), `vector_engine: numpy|faiss`, `timeout_seconds`, `lexical_engine: fts5|bm25` and `bm25` settings (see "Lexical engine `bm25`" below; with `bm25` the FTS5 table stays empty and `snapshots/<gen>/bm25/` holds the segment). Vector and `bm25` search apply the scope as a document bitset over the generation's rows (exact top-k over eligible rows; Faiss through an `IDSelectorBitmap`). Per generation: `snapshots/<gen>/catalog.sqlite` (documents, chunks, FTS5 `unicode61` — the query is tokenised and case-folded by the same tokenizer as the text, so `Straße` and `ﬁle` match their own words but not `strasse`/`file`, typed field rows for scope pushdown, records, mentions, relations with provenance and occurrences, memberships, communities) plus `vectors.npy`/`chunk_ids.json` (and `vectors.faiss`); `runtime.sqlite` holds the cache, the ingestion ledger with raw model replies and sessions. `CURRENT` and `manifest.json` are owned by the generation registry, never read by the adapter. |
 | `memory` | all eight | In-process fake for tests and contract suites; not persistent. |
 | `postgres` (extra `postgres`, psycopg 3; pgvector for vectors) | `catalog`, `lexical`, `vector`, `records`, `cache`, `ledger`, `session` | `dsn_env` (environment variable holding the DSN; never the DSN itself), `table_prefix`, `text_search_config` (default `english`), `vector` (`index: exact\|hnsw`, `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `min_filter_recall`, default 0.95), `timeout_seconds` (connect timeout and `statement_timeout`). **One schema per generation**, `<prefix>_<dataset>_<generation>` when that fits PostgreSQL's 63-byte identifier limit and the dataset is a lowercase identifier, otherwise `<prefix>_g<sha256(dataset/generation)[:20]>`; it holds documents, chunks, typed field rows (native `double precision` and `timestamptz` columns), records, the FTS table and the pgvector tables, and `delete_generation` is one `DROP SCHEMA ... CASCADE`. Schema `<prefix>` holds `generations` (dataset, generation, schema name, text-search configuration, metadata schema), `meta` (the `CURRENT` pointer row, replaced by a single-row upsert only by `activate`; failed builds write `failure:<gen>` and never touch it; manifests), `cache`, `ledger`, `jobs`, `raw_replies`, `sessions`. The write lock is a session-level `pg_try_advisory_lock` (held = typed error, never a wait). Typed scope, ACL predicates and id allow/deny lists compile to bound-parameter `EXISTS` subqueries; temporal values compare as UTC instants (naive = UTC, dates by calendar day); `values` is `SELECT DISTINCT` under `max_values_cardinality` (10000; more is a typed error). Lexical: title and body `tsvector`s built with the generation's recorded configuration (`analyzer_id` `pg_ts_<config>`); terms = any term, `phrase` = `phraseto_tsquery` per column, `boolean` = terms plus `must` phrases minus `must_not` phrases; every user token is a bound parameter, never tsquery syntax; scores are `2*ts_rank_cd(title)+ts_rank_cd(body)`, **not BM25**; stop words never match and stemming conflates inflections (FTS5 differs). Vector: L2-normalised, inner product = cosine; **exact** by default (scope in the `WHERE` clause, order `(distance, chunk_id)`); `vector.index: hnsw` builds a partial HNSW index per namespace at `refresh` and then measures recall@10 of the forced index path against exact search (unfiltered and with an allow-list filter); below `min_filter_recall` the refresh fails with a typed error so that build never activates; HNSW searches use `hnsw.iterative_scan = strict_order` (pgvector >= 0.8). Up to 2000 dimensions with HNSW, 16000 exact. `graph` is `planned`. |
 | `sqlalchemy` (extra `sql`, SQLAlchemy 2 + driver) | `catalog`, `records`, `cache`, `ledger`, `session` | `url_env` (environment variable holding the SQLAlchemy URL, e.g. `sqlite:///state/rel.db` or `postgresql+psycopg://...`), `table_prefix`, `timeout_seconds`. SQLAlchemy Core only (portable types, delete+insert instead of dialect upserts). Per generation: tables `<prefix>_<token>_{docs,chunks,dfields,records,rfields}` with `token = sha256(dataset/generation)[:12]` (the readable name does not fit the 63/64-byte identifier limits; `<prefix>_generations` maps it); runtime tables `<prefix>_{generations,meta,cache,ledger,jobs,raw_replies,sessions}`; `CURRENT` pointer row replaced in one transaction only by `activate`; write lock = lease row (held = typed error; a lease older than 600 s is taken over). Temporal values are stored as UTC epoch seconds (no portable timezone-aware type). Ids are limited to 512 characters (typed error beyond). **Tested dialects: SQLite and PostgreSQL** (the conformance kit runs on both); any other dialect builds and `ping()` reports `dialect_tested: false` — MySQL/MariaDB in particular compare text with the column collation (usually case-insensitive), which would change `eq`. `lexical` and `vector` are dialect-specific and `planned`; configuration naming them is rejected. |
@@ -197,11 +233,12 @@ names its own backend. In this release the engine wires these kinds on the froze
 | `opensearch` | `catalog`, `lexical`, `vector`, `records` | `hosts_env` (environment variable holding one or more comma-separated `http(s)://host:port` URLs), `index_prefix`, `knn: {method: exact|hnsw, exact_rescore: true}`, `timeout_seconds`. Needs `pip install 'su-multi-arm[opensearch]'` (`opensearch-py`); OpenSearch 2.x. Per generation three indices `<index_prefix>_<dataset>_<generation>_{docs,chunks,records}` (one shard, strict mappings tagged with the adapter's mapping version); dataset aliases `<index_prefix>_<dataset>_{docs,chunks,records}` are switched atomically by `OpenSearchBackend.activate(gen)`, and `delete_generation` refuses the generation an alias serves. Datasets must match `[a-z0-9][a-z0-9_-]*` (index names are never mangled). See "OpenSearch semantics" below. |
 | `elasticsearch` | `catalog`, `lexical`, `vector`, `records` | Same options as `opensearch` (`hosts_env`, `index_prefix`, `knn`, `timeout_seconds`); needs `pip install 'su-multi-arm[elasticsearch]'` (official `elasticsearch` 8.x client) and an Elasticsearch 8.x server (other majors and OpenSearch are refused by `probe`). The adapter is the OpenSearch adapter's classes over `backends/_lucene_common.py` with the engine-specific parts replaced: transport, probe, `dense_vector` fields (exact: `index: false` + `script_score` cosine; `knn.method: hnsw`: float HNSW without quantisation, candidates from the top-level `knn` search with the scope as pre-filter, then the same exact rescore), and no `index.knn` setting. Same three indices per generation, same dataset aliases switched atomically by `activate(gen)`, same typed-field pushdown, lexical and records semantics as the section below. `generation_registry()` (what the write path needs to own `storage.catalog`) keeps manifests, failure records and the ingestion lock in `<index_prefix>__registry` and resolves `CURRENT` through the `docs` alias. |
 | `neo4j` (extra `neo4j`, official driver) | `graph` (with `memberships`) | `uri`, `user`, `password_env` (environment variable holding the password; never the password itself), `database`, `namespace` (default `su_multi_arm`; letters, digits, `_`, `.`, `-`), `timeout_seconds` (connection, pool acquisition and per-transaction timeout). Fixed labels; every node and edge carries the generation key `g = <namespace>\|<dataset>\|<generation>`, so namespaces and generations never touch each other. Mentions are `SuGraphMention` nodes (span offsets, quote, match level, canonical id, aliases), entities `SuGraphEntity` nodes, relations one relationship type per edge kind (`SU_FACT`, `SU_CO_OCCURRENCE`, ...) carrying predicate, `edge_kind`, `support`, status, span, provenance and every occurrence; communities are `SuGraphCommunity` nodes with their report, memberships `SuGraphMembership` nodes. Loads are `MERGE`-idempotent and one explicit transaction per call (a dangling relation endpoint or any server error rolls the whole call back; never retried). Traversal runs only fixed parameterised Cypher templates, one statement per hop, `fact` edges unless other kinds are requested, the hop bound a validated integer 0..3. Eligibility is pushed down as a document-id allow/deny list only (`predicate_scope: false`): the graph and community arms first resolve request filters and ACL predicates to document ids through the catalog (at most 10000 eligible documents; more is a typed error, never a truncated list). `<namespace>\|<dataset>` has one `SuGraphPointer` node naming the active generation; the write path moves it just before the authoritative `CURRENT` switch, moves it back if that switch fails, and a failed load never reaches it; `delete_generation` refuses the generation it names. Needs Neo4j 5.23 or later (scoped `CALL` subqueries); tested on 5.26 community. No catalog: `storage.catalog` must name another backend. |
+| `kuzu` (extra `kuzu`, embedded) | `graph` (with `memberships`) | `path` (database file, relative to the config; default `state/graph.kuzu`), `mode: native\|attach`, `namespace`, `timeout_seconds` (per-query timeout), `buffer_pool_mb`. **`native`**: the package's own embedded store with the same contract and semantics as `neo4j` (fixed tables `SuGraphEntity`/`SuGraphMention`/`SuGraphMembership`/`SuGraphCommunity`/`SuGraphGeneration`/`SuGraphPointer`, one relationship table per edge kind, every row keyed by `g = <namespace>\|<dataset>\|<generation>`; `MERGE`-idempotent loads in one explicit transaction; fixed parameterised Cypher only; `fact` edges unless other kinds are requested; document-id allow/deny eligibility, `predicate_scope: false`; a per-dataset pointer row moved by the write path with compare-and-set). The conformance kit runs in-process (no service). **`attach`** (`attach: {mapping: <file>}`): an **existing** Kuzu database opened read-only and mapped onto the contract by a declared mapping file (`backends/kuzu/attach.py::AttachMapping`): `dataset`, `generations` (or `any_generation: true`), `nodes` (`table`, `type`, `key`, `name`, `lookup`, `document: {column, pattern, template}`, `mention_text`), `edges` (`table`, `predicate`, `edge_kind`, `support`, `quote`, `source`, `document_pattern`/`document_template`, `verified`, `status`, `provenance` columns), optional `communities` (`table`, `label`, `level`, `summary`, `quote`, `quote_source`, `member_edge`) and `require_verified` (default true). Every table and column is checked against the store's catalog when the backend opens; only statements built from the validated mapping run; an edge without a quote, without a document id, or (with `require_verified`) without a verified quote is never surfaced; the edge span anchors the stored quote (`field: <REL>.<quote column>`), not package catalog offsets. Writes (`upsert`, `put_communities`, `delete_generation`) are refused. Keep private mappings outside the repository. |
 
 An adapter may be named only for the capabilities it serves: naming `opensearch` or
 `elasticsearch` for `ledger`, `sessions`, `cache`, `communities` or the `graph`/`community` arms,
 `mongodb` for `vector`, `postgres` for `graph`/`community`/`storage.communities`, `sqlalchemy` for
-`lexical`/`dense`/`graph`, or `neo4j` for anything but `graph`/`community`/`storage.communities`,
+`lexical`/`dense`/`graph`, or `neo4j`/`kuzu` for anything but `graph`/`community`/`storage.communities`,
 fails validation ("does not declare capability" or "status: planned"). Every adapter on the
 contracts runs the same conformance kit (`su_multi_arm.testing.backend_conformance`,
 `tests/conformance/`; the sqlalchemy suite runs on SQLite on every push; the mongodb, opensearch,
@@ -471,7 +508,16 @@ extraction:
 ```
 
 Communities use overlapping entity groups by default; `communities.strategy: louvain` clusters the
-bipartite document/entity graph with a fixed seed. Minimum document count is configurable. Both
+bipartite document/entity graph with a fixed seed. Minimum document count is configurable.
+`communities.strategy: louvain_hierarchical` (extra `communities`) keeps the seeded Louvain dendrogram
+as levels 0 (coarsest) to 2 with `parent_id` links; `communities.hierarchy: {levels: 1..3, resolution,
+min_split}` tunes it (a parent with fewer than `min_split` documents is not split). `communities.stats:
+{time_basis: <datetime/date field>, granularity: month|year, top_entities: N}` adds deterministic
+per-community statistics from declared fields only: `size`, `entities`, `members_by_kind`, a `trend`
+(bucket counts, least-squares slope, `missing_or_invalid`) over `time_basis`, and `top_entities` by
+lift (support >= 2 in communities with more than one document). Both blocks enter the index recipe only
+when set, so existing generations keep their fingerprint. Hierarchy and statistics are stored with the
+community (under the report's `_community` key) on sqlite, neo4j, kuzu and the in-memory backend. Both
 strategies have passage citations. Set `models.roles.community` to enable precomputed claim
 summaries; `communities.prompt` and the role's `evidence_budget.chars` configure them. Each claim must cite supplied
 passages with valid document IDs, chunk IDs and verbatim quotes. Reports expose omitted chunks and a
@@ -605,7 +651,8 @@ the `su_multi_arm.components` group; nothing else can name code), `backends` (na
 (authoritative backend per non-arm capability: `catalog`, `records`, `ledger`, `sessions`, `cache`,
 `communities`), `metadata_schema` (typed fields: `string|integer|number|boolean|datetime|date|enum|id`,
 with `filterable`, `listable`, `groupable`, `sortable`, `nullable`, `enum_values`, `time_basis`,
-`timezone_policy`, `casefold_match`, `max_catalog_cardinality`), `models.roles` (`planner`,
+`timezone_policy`, `casefold_match`, `max_catalog_cardinality`, `states`; schema-level `canonical_unit`,
+`equivalence_field`, `unknown_fields`, `timezone`), `models.roles` (`planner`,
 `reviewer`, `extractor`, `generator`, `community`, `embedder`, `reranker`;
 each chat role declares `capabilities.structured_output` and `prompt_caching`, and an optional
 `pricing_key`), `pipeline` (`decision`, `arms`, `selection`, `review`, `guards`, `generation`,
@@ -671,6 +718,43 @@ only for listable fields under `max_catalog_cardinality`, and every step is vali
 filterable field, no override of request filters, values resolved through the schema and
 `RecordStore.exists`).
 
+Query-compiler operations (2.0.0a3). A typed scope (`ScopeSpec`) can also: rank groups by their
+measure value (`order: desc|asc`, `top_n`, `nth` for "second most"; dense ranks, ties broken by the
+group key, a tie at the `top_n` boundary listed in `ties`); group a `datetime`/`date` field by
+`granularity: day|month|year` (calendar buckets in `metadata_schema.timezone`); cross-tab two
+`group_by` fields; compare `periods` (half-open windows on its `time_basis`); give each group's
+share (`with_share`) or a share with a `numerator`; count distinct values (`count_distinct`: null
+and missing values are excluded and reported in `missing_or_invalid`, except the `equivalence_field`,
+where a record without one is its own unit); list records (`limit`, `sort`; `total` is always
+reported, "showing N of total"); and match a literal topic (`text: {kind: phrase|all_terms, text,
+role: scope|numerator}`), which the structured arm counts over every matching chunk of the lexical
+index of `pipeline.arms.structured.text_backend` (default: the arm's own backend when it serves
+lexical) under the request's eligibility scope: a whole-corpus literal match labelled with its
+analyzer, never a ranked top-k; more than 50,000 matching chunks is a typed refusal. Every result
+carries `basis` labels (count unit, time basis, window, text match, null coverage). Numeric measures
+exclude records without a numeric value and report them. A negated predicate (or a `negate` state)
+includes records with a null value and reports how many in `unknown`.
+
+`metadata_schema.fields[].states` names value sets (`{name: open, values: [done, closed], negate:
+true}`); an agent-compiled `eq` on a state name becomes that set (a caller's request filter stays
+literal). `metadata_schema.timezone` (IANA) is the zone calendar expressions and buckets are read
+in. Calendar expressions (`decision/windows.py`, English: `today`, `yesterday`, `this|last|previous
+week|month|quarter|year`, `past|last N days|weeks|months|years`, `past month`, `ytd`, `since
+<year|month>`, ISO dates/months/years, `March 5, 2024`, `March 2024`, a month name = its most recent
+occurrence that has begun) resolve against the request anchor `as_of` (search/answer request field;
+default: today in that zone) into half-open windows. Without a declared `timezone`, a calendar
+expression on a `require_offset` datetime field is refused (`timezone_missing`); date fields and
+`assume_utc` fields read it in UTC. The `rules` grammar (`decision/grammar.py`) maps English
+phrasings onto these operations using only schema words (field names, `time_basis` labels, states,
+enum/observed values): `by|per|for each <field>`, `by month`, `which <field> has the most`, `second
+most common <field>`, `top N <fields>`, `average|min|max|total <numeric field>` (`median` is refused),
+`distinct <field>`, `what percentage of X are Y`, `X vs Y` periods, `between X and Y`, `N most recent
+<unit>`, `top N <unit> by <field>`, `not|excluding <value>`, `A or B`, `<numeric field> above N`,
+`mentioning|containing|about <words>` and quoted phrases. Anything left over is still an
+`UnsupportedConstraint`. The `llm` planner's scope draft carries the same operations plus calendar
+`windows`/`periods` as expressions (resolved by `ValueResolver.window`); the plan schema stays
+strict-expressible.
+
 Qualifier coverage (every agent, 2.0.0a2): a structured step an agent compiled from the question must
 account for every qualifier in it. Candidates are found deterministically (English): an observed value
 of a listable filterable field or an enum value that occurs verbatim in the question, a calendar
@@ -712,7 +796,9 @@ also accepted as a deprecated alias; `rrf`, `minmax`, `zscore`, `best_arm_rank`,
 `diversity: {field, min_per_value}` (opt-in; keeps leading slots for every present group value;
 short groups contribute what they have and are listed in the trace), `pins` (`exact_id` records to
 the front) and `packing: {budget_chars, field_priority, fairness: fair_share | greedy,
-min_per_record}`. Packing renders record fields in the configured `field_priority` order and then in
+min_per_record, aggregate_reserve_max}`. Aggregate evidence is reserved before documents, up to
+`aggregate_reserve_max` of the budget (default 0.5; an aggregate beyond it is omitted and listed in
+`omitted_ids`, the cap is traced as `aggregate_reserve_chars`). Packing renders record fields in the configured `field_priority` order and then in
 document order — there is no built-in `details`/`resolution` preference. Ordering never changes
 union membership.
 
@@ -722,7 +808,7 @@ Stop reasons are `sufficient`, `no_actionable_gap`, `repeated_query`, `hop_limit
 decision agent with the same filters, ACL and pinned generation, and a re-plan that is not
 `decided` (including `raw_all_arms`) stops the loop. New hits merge with one vote per record per arm.
 
-`pipeline.generation.contract.on_violation` (`abstain_with_reason` default, `strip`, `fail`) governs
+`pipeline.generation.contract.on_violation` (`strip` default since 2.0.0a3, `abstain_with_reason`, `fail`) governs
 the answer contract: every citation must be supplied evidence; `count`, `exhaustive_list` and
 `absence` claims need an aggregate evidence whose `ScopeResult` is exact (absence also exhaustive and
 empty: a zero count, an empty list); under an aggregate intent with no exact scope the answer may not
@@ -749,13 +835,38 @@ modifies is not the counted population ("there is no error message"); "the only 
 plural unit; "complete list of <noun>" needs `<noun>` to be a unit. Answers in other languages are
 checked on their typed claims only.
 
-Violation handling: `abstain_with_reason` returns `insufficient_evidence: true` with the violated
-rules. One exception keeps narrative answers usable with small models: when the answer text states no
-count, list or absence, a non-narrative claim the rules reject is **stripped** from `claims` (its
-citations too unless still used) and the narrative answer is returned with `contract: stripped` and the
-violation recorded with `action: strip`. `strip` additionally removes the sentences that carry an
-unbacked statement (abstaining when nothing remains). `fail` raises on any violation. Unknown evidence
-ids, missing citations and an empty answer always abstain. With native structured output the generator
+2.0.0a3 additions to the text check: a **total/sum statement** of an amount — "total"/"sum"/"combined
+…" followed within six words by a copula ("is", "was", "comes to", "amounts to", "equals") and an
+amount with an optional currency symbol or code or unit ("The total amount for project Delta is 4,200
+USD", "the sum was $1,250.50") — is a count statement whether or not a numeric field is declared, and
+its amount must match the cited exact aggregate (QQ-03). A number directly after a **declared field
+name** is that field's value, not a count ("priority 3 tickets", QQ-02). When the nearest unit after a
+number reads as a label, a farther unit within the three-word gap is still checked ("111 open CloudTax
+tickets" when the question made "open" a unit). The model's `insufficient_evidence: true` no longer
+exempts the text: a hedged answer that still states a count, list or absence is checked like any
+other (QQ-06). "List all/every", "show (me) all/every" or "enumerate" followed by a common record noun
+that is **not** a declared target ("List every pending ticket" when `ticket` is not the canonical
+unit) is an untargeted list intent: the text is checked as a list answer, the unsupported constraint
+names the undeclared noun (`aggregate_intent_without_scope`), and a planner's structured step for it is
+bounded with that reason instead of "no aggregate operator" (QQ-04).
+
+Violation handling (`on_violation`):
+
+- `strip` (**default since 2.0.0a3**): a non-narrative claim the rules reject is removed from `claims`
+  (its citations too unless still used). When the question asks **no** aggregate (no count, list,
+  total, earliest/latest or absence intent, targeted or not), the sentences of the answer text that
+  carry an unbacked count/list/absence statement are removed as well, and the narrative remainder is
+  returned with `contract: stripped` and every removal recorded (`action: strip`). When the question
+  **does** ask an aggregate, an unbacked statement in the text is the answer itself, so the answer
+  abstains instead. If nothing remains, or no citation remains for a factual answer, it abstains.
+- `abstain_with_reason` (the 2.0.0a2 default): returns `insufficient_evidence: true` with the violated
+  rules. One exception keeps narrative answers usable with small models: when the answer text states
+  no count, list or absence, a rejected non-narrative claim is stripped from `claims` and the
+  narrative answer is returned with `contract: stripped`.
+- `fail` raises on any violation.
+
+Under every policy, unknown evidence ids, missing citations, an empty answer and a stated number that
+differs from the cited exact aggregate (`answer_number_mismatch`) abstain. With native structured output the generator
 schema is narrowed per request: cited ids are an enum of the supplied evidence ids, and non-narrative
 claim kinds are offered only when aggregate evidence was supplied.
 
@@ -882,6 +993,43 @@ Built-ins: `ingest_delta` (`{documents: [...], delete_ids: [...]}` through the s
 and `invalidate_cache` (the active generation's cache entries). `promote_generation` /
 `rollback_generation` arrive with release ops (Phase 2).
 
+### Graph traversal templates (`pipeline.arms.graph.templates`)
+
+A decision agent may select a **declared** traversal template by name on a graph step; it never
+writes a query language. Each template compiles to calls on the frozen `GraphStore.traverse`
+contract and the graph lookups, so it means the same thing on sqlite, neo4j, kuzu and the in-memory
+backend (`tests/conformance/test_traversal_templates.py`).
+
+```yaml
+pipeline:
+  arms:
+    graph:
+      backend: kg
+      templates:
+        fixes:        {kind: neighbors, description: "symptom -> resolved_by -> fix", seed_types: [symptom],
+                       hop: {predicates: [resolved_by], direction: out}, hops: 1}
+        troubleshoot: {kind: chain, seed_match: tokens, seed_types: [symptom],
+                       steps: [{predicates: [has_symptom], direction: in}, {predicates: [has_root_cause, resolved_by], direction: out}]}
+        related:      {kind: connect, hop: {direction: any}, hops: 2}
+        mentioned_in: {kind: mentioned_in}
+      ontology:       # optional; templates naming unknown predicates/types or unreachable chains are refused
+        entity_types: [issue, symptom, cause, fix]
+        predicates: {has_symptom: {subject_types: [issue], object_types: [symptom]}, resolved_by: {object_types: [fix]}}
+```
+
+Kinds: `neighbors` (one hop group, `hops` 1..3), `chain` (1..3 ordered hops, each with its own
+predicates/direction/edge kinds), `connect` (paths of at most `hops` from the first seed ending at the
+second), `mentioned_in` (span-anchored mentions of the seeds). Seeds: a stored entity id resolves to
+itself; otherwise `seed_match: exact` keeps entities whose name tokens equal the seed's and `tokens`
+keeps entities whose name tokens are all in the seed text; `seed_types`/`target_types` filter by
+entity type; `limit` (default 50) caps the paths (reported as `truncated`, never hidden). Edge kinds
+default to `fact`; co-occurrence is reached only by a template that requests it. The `llm` planner
+sees `graph_templates` (name -> description) and may return a graph step with `template` and `seeds`;
+an undeclared template is an `invalid_step` decision failure. The graph arm returns the paths and one
+document hit per evidence document with each edge's quote, predicate, edge kind, support and
+provenance. An attached kuzu store exposes its mapping as an ontology; the arm's `validate`
+reports templates that do not fit it.
+
 ### `exact_id` arm (identifier lookups)
 
 ```yaml
@@ -905,6 +1053,58 @@ exclusions) on the pinned generation. Matches are pinned to the front by `select
 are reported in `trace.exact_id.unknown` and as `unsupported_constraints` (`value_not_observed`),
 never fuzzily matched; only `casefold: true` relaxes case. An `exact_id` arm without any id pattern
 or alias map is a validation error.
+
+### Lexical engine `bm25` (sqlite) and lexical front policies
+
+```yaml
+backends:
+  local:
+    kind: sqlite
+    lexical_engine: bm25          # default fts5
+    bm25: {k1: 1.5, b: 0.75, epsilon: 0.25, tokenizer: unicode_word, lowercase: true, stemming: none, include_title: false}
+pipeline:
+  arms:
+    lexical:
+      backend: local
+      candidates: 2000
+      verbatim_boost: {enabled: false, window_tokens: 6, min_windows: 2, common_df: 5000, max_window_hits: 300, max_candidates: 1200, max_records: 5, quoted: true}
+      pin_identifiers: {enabled: false, fields: [], max_records: 5}
+```
+
+`lexical_engine: bm25` replaces the FTS5 table with an Okapi BM25 inverted index built at ingest
+into the generation (`snapshots/<gen>/bm25/`: memory-mapped postings, term frequencies, idf,
+row lengths and row→document ordinals; the vocabulary is the `bm25_terms` table of the
+generation's catalog). Scores are those of `rank_bm25.BM25Okapi` over the same token lists, bit for
+bit: ATIRE idf `log(N − df + 0.5) − log(df + 0.5)`, idf below zero replaced by
+`epsilon × mean(idf)`, and a repeated query token counted again. A chunk matches when it contains a
+query token; equal scores rank by chunk id. `tokenizer`: `unicode_word` (`\w+`) or `ascii_alnum`
+(`[a-z0-9]+` on lower-cased text; non-ASCII letters split words); `stemming`: `none` or a Snowball
+algorithm (`english`, `porter`, …); `include_title` prepends the document title's tokens to each of
+its chunks (FTS5 indexes the title as a weighted column; `bm25` does not unless asked). Every
+`bm25` setting is index recipe: the keys enter the index fingerprint only when `bm25` is selected
+(FTS5 indexes keep their fingerprint), changing one requires a rebuild, and a segment built with
+other settings is refused (typed `BackendError`). The generation manifest records the analyzer as
+`bm25_okapi:<tokenizer>:<case>:<stemming>`. Scope (ACL, filters, exclusions) is applied as a
+document bitset before the top-k; `phrase` and `boolean` queries check adjacency on the candidate
+chunks' text.
+
+Front policies (off by default) put documents ahead of the scored lexical list, with provenance
+`lexical_front` and scores above the best term score. With `selection.source_slots` these records
+stay first in the lexical arm's list (selection candidate flag `leads`) and the slots mix the rest;
+they are not selection pins:
+
+- `pin_identifiers`: identifiers in the query (matches of `id` field `pattern`s in
+  `metadata_schema`; `fields` narrows which) resolved by exact equality on that document field
+  inside the request scope. Unlike the `exact_id` arm it does not pin in selection; it orders the
+  lexical arm's own list. A named field that is not an `id` field with a pattern is a validation
+  error.
+- `verbatim_boost`: documents whose text holds a quoted string of the query (8–300 characters
+  between quotes) or at least `min_windows` of its `window_tokens`-token windows verbatim (error
+  messages, pasted excerpts). A window counts only if one of its tokens is in at most `common_df`
+  chunks; a window found in more than `max_window_hits` chunks is ignored as boilerplate; a window
+  whose tokens co-occur in more than `max_candidates` chunks is not verified (counted as skipped in
+  the trace event `lexical.verbatim_boost`). It needs a lexical index that exposes its analyzer and
+  term statistics (sqlite `lexical_engine: bm25`); with any other index it is a validation error.
 
 ### `doctor --probe`
 

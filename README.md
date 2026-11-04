@@ -32,7 +32,7 @@ merges their results, an optional review stage asks for what is missing, and an 
 refuses counts, exhaustive lists or absence claims that the evidence cannot back. Everything is
 declared in one YAML file; nothing is imported by name from configuration.
 
-> **Alpha (`2.0.0a2`).** Interfaces may still change. Relevance on real corpora has not been measured
+> **Alpha (`2.0.0a3`).** Interfaces may still change. Relevance on real corpora has not been measured
 > for v2 yet — see [honest status](#validation-and-honest-status).
 
 > [!TIP]
@@ -194,14 +194,15 @@ pages: [backends](docs/backends.md), [providers](docs/providers.md).
 | `opensearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/services/test_opensearch_adapter.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 | `elasticsearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/conformance/test_elasticsearch_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 | `neo4j` | — | — | — | — | yes | — | — | — | real-service conformance suite `tests/conformance/test_neo4j_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| `kuzu` | — | — | — | — | yes | — | — | — | in-process conformance kit, default test run (`tests/conformance/test_kuzu_conformance.py`) |
 | `mongodb` | yes | yes | planned | yes | — | yes | yes | yes | real-service conformance suite `tests/conformance/test_mongodb_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 
 `yes` = implemented on the frozen contracts; `planned` = declared, no code, configuration naming it is rejected; `legacy` = v1 code only; `—` = not declared.
 
 | Chat provider | Model patterns | Evidence |
 |---|---|---|
-| `anthropic` | 8 | contract-mocked (mocked HTTP transport; no paid call made) |
-| `openai` | 10 | contract-mocked (mocked HTTP transport; no paid call made) |
+| `anthropic` | 8 | contract-mocked (mocked HTTP transport); Haiku/Sonnet 5.x also one real-API smoke (2.0.0a3) |
+| `openai` | 10 | contract-mocked (mocked HTTP transport); `gpt-4o-mini` also in the 2.0.0a2 paid QA-08 rerun |
 | `openai_compatible` | 1 | contract-mocked; optional `external` smoke against a local server you run |
 | `none` | — | in-process (answer generation disabled) |
 

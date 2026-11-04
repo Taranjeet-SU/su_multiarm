@@ -39,12 +39,14 @@ DOCS = [
 def config(kind, tmp_path, **overrides):
     data = json.loads(json.dumps(BASE))
     data["backends"]["local"] = {"kind": "memory"} if kind == "memory" else {"kind": "sqlite", "path": str(tmp_path / "state")}
+    if kind == "sqlite_bm25":
+        data["backends"]["local"]["lexical_engine"] = "bm25"
     for key, value in overrides.items():
         data[key] = value
     return validate_config(data)
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+@pytest.fixture(params=["memory", "sqlite", "sqlite_bm25"])
 def engine(request, tmp_path):
     engine = Engine(config(request.param, tmp_path))
     engine.ingest(DOCS)

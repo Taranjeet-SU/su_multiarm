@@ -127,6 +127,10 @@ def test_server_adapters_probe_through_their_typed_ping(module, name):
     import importlib
     import types
 
-    cls = getattr(importlib.import_module(module), name)
+    try:
+        mod = importlib.import_module(module)
+    except ModuleNotFoundError as missing:  # the adapter's optional extra is not installed
+        pytest.skip(str(missing))
+    cls = getattr(mod, name)
     stub = types.SimpleNamespace(ping=lambda: {"version": "x"})
     assert cls.probe(stub) == {"version": "x"}  # probe() is ping(): reachability + version, typed failures

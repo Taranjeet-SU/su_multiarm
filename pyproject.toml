@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "su-multi-arm"
-version = "2.0.0a2"
+version = "2.0.0a3"
 description = "Configurable, provenance-aware multi-arm retrieval and grounded answers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,7 @@ faiss = ["faiss-cpu>=1.8"]
 postgres = ["psycopg[binary]>=3.2,<4"]
 sql = ["sqlalchemy>=2.0,<3"]
 neo4j = ["neo4j>=5.24,<7"]
+kuzu = ["kuzu>=0.11,<0.12"]
 elasticsearch = ["elasticsearch>=8.17,<9"]
 mongodb = ["pymongo>=4.6,<5"]
 opensearch = ["opensearch-py>=2.8,<4"]
@@ -32,7 +33,7 @@ mcp = ["mcp>=1.10,<2"]
 # extras are intentionally empty so `pip install su-multi-arm[openai]` / `[anthropic]` resolve.
 openai = []
 anthropic = []
-all = ["su-multi-arm[faiss,postgres,sql,neo4j,elasticsearch,mongodb,opensearch,semantic,spacy,gliner,communities,api,mcp]"]
+all = ["su-multi-arm[faiss,postgres,sql,neo4j,kuzu,elasticsearch,mongodb,opensearch,semantic,spacy,gliner,communities,api,mcp]"]
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5,<10"]
 dev = ["pytest>=8", "ruff>=0.9", "build>=1.2", "hatchling>=1.25"]
 

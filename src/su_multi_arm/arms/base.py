@@ -16,6 +16,7 @@ from pydantic import Field
 
 from ..backends import capabilities as caps
 from ..core.component import Dependencies, Diagnostic, Environment
+from ..core.config_graph import GraphIntent
 from ..core.errors import BackendError, ConfigError
 from ..core.types import Chunk, Document, Page, Path, Scope, ScopePredicates, ScopeSpec
 from ..models import Hit, StrictModel
@@ -33,6 +34,7 @@ class ArmInput(StrictModel):
     acl: ScopePredicates = Field(default_factory=list)  # ACL alone (RecordStore denominators)
     candidates: int = Field(default=200, ge=1, le=10000)
     aggregate: ScopeSpec | None = None  # structured arm only
+    graph: GraphIntent | None = None  # graph arm only: a declared traversal template and its seeds
     incomplete_stages: list[str] = Field(default_factory=list)  # from the generation manifest
     allow_incomplete: bool = False
 
@@ -132,6 +134,8 @@ class BaseArm:
         if not scored:
             return []
         chunk_ids = list(dict.fromkeys(cid for cid, _, _ in scored))
+        if callable(getattr(self.catalog, "hit_parts", None)):
+            return self._collapse_parts(ctx, scored, chunk_ids)
         chunks: dict[str, Chunk] = {c.id: c for c in self.catalog.get_chunks(ctx.generation, chunk_ids)}
         doc_ids = list(dict.fromkeys(chunks[cid].document_id for cid in chunk_ids if cid in chunks))
         documents: dict[str, Document] = {d.id: d for d in self.catalog.get(ctx.generation, doc_ids)}
@@ -159,6 +163,35 @@ class BaseArm:
                 if len(hit.chunk_ids) < MAX_CHUNKS_PER_DOCUMENT and cid not in hit.chunk_ids:
                     hit.chunk_ids.append(cid)
                     hit.provenance.append(provenance)
+        return sorted(result.values(), key=lambda h: (-h.score, h.document_id))
+
+    def _collapse_parts(self, ctx: RunContext, scored: list[tuple[str, float, dict[str, Any]]], chunk_ids: list[str]) -> list[Hit]:
+        """``collapse`` through ``extras.HitParts`` (no whole-document reads); the same hits."""
+        chunks, heads = self.catalog.hit_parts(ctx.generation, chunk_ids)
+        result: dict[str, Hit] = {}
+        for cid, score, extra in scored:
+            ref = chunks.get(cid)
+            if ref is None or ref[0] not in heads:
+                continue
+            document_id, field, start, end, text = ref
+            provenance = {"chunk_id": cid, "field": field, "start": start, "end": end, **extra}
+            hit = result.get(document_id)
+            if hit is None:
+                title, source, url = heads[document_id]
+                result[document_id] = Hit(
+                    document_id=document_id,
+                    title=title or document_id,
+                    source=source,
+                    url=url,
+                    text=text,
+                    chunk_ids=[cid],
+                    score=float(score),
+                    arms=[self.name],
+                    provenance=[provenance],
+                )
+            elif len(hit.chunk_ids) < MAX_CHUNKS_PER_DOCUMENT and cid not in hit.chunk_ids:
+                hit.chunk_ids.append(cid)
+                hit.provenance.append(provenance)
         return sorted(result.values(), key=lambda h: (-h.score, h.document_id))
 
 

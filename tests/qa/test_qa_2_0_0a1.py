@@ -343,7 +343,7 @@ def test_qa11_config_validate_reports_all_errors_without_traceback(tmp_path):
 
 
 def test_qa12_bearer_scheme_is_case_insensitive(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
     from su_multi_arm.api import create_app
 

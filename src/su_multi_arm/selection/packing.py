@@ -5,7 +5,8 @@ A record's passage is its fields rendered as ``name: value`` lines in the **conf
 ``details``/``resolution`` preference. ``fair_share`` gives every record ``budget // n`` characters,
 returns what short records do not use, and water-fills the truncated ones in order; a record whose
 share would fall under ``min_per_record`` is omitted rather than reduced to a stub. ``greedy`` is
-today's first-come allocation. Aggregates are appended whole when they fit, never truncated.
+today's first-come allocation. Aggregates are appended whole when they fit under the
+``aggregate_reserve_max`` share of the budget, never truncated.
 Everything omitted or truncated is reported, never hidden.
 """
 
@@ -54,6 +55,7 @@ class PackResult(StrictModel):
     passage_characters: int = 0
     fairness: Literal["fair_share", "greedy"]
     field_priority: list[str] = Field(default_factory=list)
+    aggregate_reserve_chars: int = 0  # the cap on aggregate evidence (``aggregate_reserve_max``)
 
 
 def render(record: PackRecord, field_priority: list[str]) -> str:
@@ -92,9 +94,23 @@ def _allocate(lengths: list[int], budget: int, fairness: str, min_per_record: in
 
 def pack(records: list[PackRecord], config: PackingConfig, extras: list[PackExtra] | None = None) -> PackResult:
     result = PackResult(fairness=config.fairness, field_priority=list(config.field_priority))
-    bodies = [render(r, config.field_priority) for r in records]
-    allocations = _allocate([len(b) for b in bodies], config.budget_chars, config.fairness, config.min_per_record)
+    # Exact derived evidence (aggregates) has its size reserved before documents are allocated: given
+    # only what the fair-share allocation left over, it got nothing on a full budget and a count
+    # question reached the generator without its count. Output order stays documents, then extras.
+    # The reservation is capped (``aggregate_reserve_max``, review N1): aggregates beyond it are
+    # omitted and reported, so documents always keep the rest of the budget.
     used = 0
+    reserve = int(config.budget_chars * config.aggregate_reserve_max)
+    result.aggregate_reserve_chars = reserve
+    kept_extras: list[PackedEvidence] = []
+    for extra in extras or []:
+        if used + len(extra.passage) <= reserve:
+            used += len(extra.passage)
+            kept_extras.append(PackedEvidence(id=extra.id, source=extra.source, passage=extra.passage))
+        else:
+            result.omitted_ids.append(extra.id)
+    bodies = [render(r, config.field_priority) for r in records]
+    allocations = _allocate([len(b) for b in bodies], config.budget_chars - used, config.fairness, config.min_per_record)
     for record, body, allocation in zip(records, bodies, allocations, strict=True):
         if allocation <= 0:
             result.omitted_ids.append(record.id)
@@ -114,13 +130,6 @@ def pack(records: list[PackRecord], config: PackingConfig, extras: list[PackExtr
                 truncated=truncated,
             )
         )
-    remaining = config.budget_chars - used
-    for extra in extras or []:
-        if len(extra.passage) <= remaining:
-            remaining -= len(extra.passage)
-            used += len(extra.passage)
-            result.evidence.append(PackedEvidence(id=extra.id, source=extra.source, passage=extra.passage))
-        else:
-            result.omitted_ids.append(extra.id)
+    result.evidence.extend(kept_extras)
     result.passage_characters = used
     return result

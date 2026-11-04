@@ -17,6 +17,9 @@
   ``choices[0].delta.content``/``refusal`` and ``finish_reason``, a usage chunk, then ``[DONE]``;
   folded into the non-streaming reply and parsed by the same rules. A stream without a
   ``finish_reason`` or without ``[DONE]`` is ``ProviderIncomplete``.
+* Thinking text a server returns beside the reply (``message.reasoning`` / ``reasoning_content``,
+  e.g. Ollama, vLLM) is never part of the reply; its length is recorded as ``reasoning_chars`` in
+  the call record because such servers may leave it out of ``completion_tokens`` (QQ-05).
 
 Evidence level: contract-mocked (request/response shapes from the published API documentation).
 """
@@ -113,6 +116,9 @@ class OpenAIProvider(HttpChatProvider):
         finish = choice.get("finish_reason")
         call.extra["stop_reason"] = finish
         message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        thinking = next((message[k] for k in ("reasoning", "reasoning_content") if isinstance(message.get(k), str)), None)
+        if thinking:
+            call.extra["reasoning_chars"] = len(thinking)
         if message.get("refusal"):
             raise ProviderRefusal("model refused", stage=ctx.stage)
         if finish == "length":

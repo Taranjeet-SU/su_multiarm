@@ -86,7 +86,7 @@ def test_matrix_is_consistent_with_contracts_and_config_kinds():
     kind_props = [d["properties"]["kind"] for d in schema["$defs"].values() if "kind" in d.get("properties", {})]
     config_kinds = {k for prop in kind_props for k in prop.get("enum", [prop.get("const")])}
     assert config_kinds == kinds
-    assert {k for k, a in caps.MATRIX.items() if a.status == "contracts"} == {"memory", "sqlite", "opensearch", "elasticsearch", "neo4j"}
+    assert {k for k, a in caps.MATRIX.items() if a.status == "contracts"} == {"memory", "sqlite", "opensearch", "elasticsearch", "neo4j", "kuzu"}
     assert {k for k, a in caps.MATRIX.items() if a.status == "planned"} == set()
     # mongodb: every declared capability is on the contracts except the Atlas-only vector row, which stays planned.
     assert caps.MATRIX["mongodb"].status == "legacy" and caps.status_of("mongodb", "vector") == "planned"
@@ -106,7 +106,7 @@ def test_matrix_is_consistent_with_contracts_and_config_kinds():
     pg_served = {("postgres", c) for c in ("catalog", "lexical", "vector", "records", "cache", "ledger", "session")}
     sql_served = {("sqlalchemy", c) for c in ("catalog", "records", "cache", "ledger", "session")}
     assert served == (
-        {("memory", c) for c in caps.CAPABILITIES} | {("sqlite", c) for c in caps.CAPABILITIES} | {("neo4j", "graph")}
+        {("memory", c) for c in caps.CAPABILITIES} | {("sqlite", c) for c in caps.CAPABILITIES} | {("neo4j", "graph"), ("kuzu", "graph")}
         | mongo_served | opensearch_served | elasticsearch_served | pg_served | sql_served
     )
     assert set(caps.MATRIX["opensearch"].capabilities) == set(caps.MATRIX["elasticsearch"].capabilities) == {"catalog", "lexical", "vector", "records"}  # graph/cache/ledger/session: not served

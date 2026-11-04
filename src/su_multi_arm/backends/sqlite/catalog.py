@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Sequence
 
 from ...core.errors import BackendError
@@ -79,6 +80,42 @@ class SqliteCatalog:
             rows = db.execute(f"SELECT * FROM chunks WHERE id IN ({placeholders(list(chunk_ids))})", list(chunk_ids)).fetchall()
         found = {row["id"]: Chunk.model_validate(dict(row)) for row in rows}
         return [found[i] for i in chunk_ids if i in found]
+
+    def hit_parts(self, gen: GenerationId, chunk_ids: Sequence[str]) -> tuple[dict[str, tuple], dict[str, tuple]]:
+        """``extras.HitParts``: chunk references, the first chunk's text per document and document
+        heads (title, source, url) in two bounded reads, without parsing whole documents."""
+        ids = list(dict.fromkeys(chunk_ids))
+        if not ids:
+            return {}, {}
+        self._b.stats["catalog.hit_parts"] += 1
+        with self._b.catalog_db(gen) as db:
+            cursor = db.cursor()
+            cursor.row_factory = None
+            rows = {r[0]: r[1:] for r in cursor.execute(f"SELECT id, document_id, field, start, end, text FROM chunks WHERE id IN ({placeholders(ids)})", ids)}
+            refs = {cid: row[:4] for cid, row in rows.items()}
+            texts = {cid: row[4] for cid, row in rows.items()}
+            first: dict[str, str] = {}
+            for cid in ids:
+                if cid in refs:
+                    first.setdefault(refs[cid][0], cid)
+            heads_ids = list(first)
+            heads = {
+                row[0]: tuple(json.loads(row[1]))
+                for row in cursor.execute(
+                    f"SELECT id, json_extract(data, '$.title', '$.source', '$.url') FROM documents WHERE id IN ({placeholders(heads_ids)})", heads_ids
+                )
+            } if heads_ids else {}
+        defaults = Document.model_fields
+        heads = {
+            doc_id: (
+                defaults["title"].default if title is None else title,
+                defaults["source"].default if source is None else source,
+                url,
+            )
+            for doc_id, (title, source, url) in heads.items()
+        }
+        chunks = {cid: (*ref, texts.get(cid) if first.get(ref[0]) == cid else None) for cid, ref in refs.items()}
+        return chunks, heads
 
     def iter_scope(self, gen: GenerationId, scope: Scope | None, page: Page) -> PageResult[Document]:
         offset, size = page_window(page, 50)

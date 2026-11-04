@@ -444,16 +444,34 @@ def upgrade(v1: Config, present_keys: set[str] | None = None, *, strict: bool = 
                 ),
             )
         )
+    from ..providers.capabilities import min_max_tokens
+
     roles: dict[str, Any] = {"embedder": v1.embedding.model_dump(mode="json")}
-    for name, role in (
-        ("planner", _role(v1.routing.model)),
-        ("reviewer", _role(v1.routing.reviewer)),
-        ("extractor", _role(v1.extraction.model)),
-        ("generator", _role(v1.generation.model, v1.generation.evidence_char_budget)),
-        ("community", _role(v1.community.model, v1.community.evidence_char_budget)),
+    for name, role, v1_path in (
+        ("planner", _role(v1.routing.model), "routing.model"),
+        ("reviewer", _role(v1.routing.reviewer), "routing.reviewer"),
+        ("extractor", _role(v1.extraction.model), "extraction.model"),
+        ("generator", _role(v1.generation.model, v1.generation.evidence_char_budget), "generation.model"),
+        ("community", _role(v1.community.model, v1.community.evidence_char_budget), "community.model"),
     ):
-        if role is not None:
-            roles[name] = role
+        if role is None:
+            continue
+        floor = min_max_tokens(role["provider"], role["model"])
+        if floor is not None and role["max_tokens"] < floor:
+            # v1 configs predate the thinking-model minimum (2.0.0a3): the upgrade raises the
+            # ceiling and says so; a v2 config with the same value is rejected.
+            if strict:
+                raise ConfigError(f"max_tokens {role['max_tokens']} is below the minimum {floor} for {role['model']} (it thinks by default)", f"{v1_path}.max_tokens")
+            diagnostics.append(
+                Diagnostic(
+                    severity="warning",
+                    code="max_tokens_raised",
+                    path=f"{v1_path}.max_tokens",
+                    message=f"raised from {role['max_tokens']} to {floor}: {role['model']} thinks by default and thinking tokens count against max_tokens",
+                )
+            )
+            role["max_tokens"] = floor
+        roles[name] = role
     if v1.fusion.reranker_model:
         roles["reranker"] = {"provider": "sentence_transformers", "model": v1.fusion.reranker_model}
     decision: dict[str, Any] = {"kind": "rules" if v1.routing.mode == "raw" else "llm", "max_steps": v1.routing.max_steps}
@@ -584,9 +602,16 @@ def downgrade(v2: "ConfigV2") -> Config:
         for key in ("vector", "text_search_config", "timeout_seconds"):
             if getattr(pg, key) != PostgresBackend.model_fields[key].get_default(call_default_factory=True):
                 raise ConfigError(f"v1 has no postgres {key}; only the default can be downgraded", f"backends.pg.{key}")
+    if v2.communities.strategy not in {"entity", "louvain"} or v2.communities.hierarchy is not None or v2.communities.stats is not None:
+        raise ConfigError("v1 has no hierarchical communities or community stats", "communities")
     for name, role in v2.models.roles.chat_roles().items():
         if role.provider == "openai":
             raise ConfigError("v1 has no openai chat provider (use openai_compatible)", f"models.roles.{name}.provider")
+    for name, sel in ((n, p.selection) for n, p in v2.all_pipelines().items()):
+        if sel.source_order or sel.source_slots:
+            raise ConfigError("v1 has no strict source order or source slots", f"pipelines.{name}.selection" if name != v2.default_pipeline else "pipeline.selection")
+    if v2.models.roles.embedder.precomputed is not None:
+        raise ConfigError("v1 has no precomputed (imported) vectors", "models.roles.embedder.precomputed")
     if v2.models.roles.embedder.provider == "openai":
         raise ConfigError("v1 has no openai embedding provider (use openai_compatible)", "models.roles.embedder.provider")
     arms = v2.pipeline.arms
@@ -623,7 +648,7 @@ def downgrade(v2: "ConfigV2") -> Config:
         chunk_size=v2.ingestion.chunking.size,
         chunk_overlap=v2.ingestion.chunking.overlap,
         field_order=list(v2.ingestion.chunking.field_order),
-        embedding=EmbeddingConfig(**roles.embedder.model_dump(exclude={"pricing_key"})),
+        embedding=EmbeddingConfig(**roles.embedder.model_dump(exclude={"pricing_key", "precomputed"})),
         extraction=ExtractionConfig(
             providers=["tags" if e == "gazetteer" else e for e in v2.extraction.extractors],
             grounding=GroundingConfig(**v2.extraction.grounding.model_dump()),

@@ -195,10 +195,11 @@ def role_schemas() -> dict[str, list[type]]:
 
 
 def strict_schema_problems(provider: str, model: str, structured_output: str, role: str) -> list[str]:
-    """Problems of the schemas ``role`` sends when its native mode is OpenAI strict json_schema;
-    empty when the role is not strict-native or every schema converts. Consults the provider
-    capability registry, never the network."""
-    from ..providers.base import StrictSchemaError, strict_schema
+    """Problems of the schemas ``role`` sends when its native mode converts the schema (OpenAI
+    strict json_schema, Anthropic ``output_config.format``); empty when the role is not native in
+    such a mode or every schema converts. Consults the provider capability registry, never the
+    network."""
+    from ..providers.base import StrictSchemaError, output_format_schema, strict_schema
     from ..providers.capabilities import lookup
 
     if structured_output != "native":
@@ -207,12 +208,13 @@ def strict_schema_problems(provider: str, model: str, structured_output: str, ro
         native_kind = lookup(provider, model).native_kind
     except KeyError:
         return []
-    if native_kind != "json_schema_strict":
+    convert = {"json_schema_strict": strict_schema, "output_format": output_format_schema}.get(native_kind or "")
+    if convert is None:
         return []
     problems: list[str] = []
     for schema in role_schemas().get(role, []):
         try:
-            strict_schema(schema.model_json_schema(), schema.__name__)
+            convert(schema.model_json_schema(), schema.__name__)
         except StrictSchemaError as exc:
             problems.append(str(exc))
     return problems
@@ -252,6 +254,11 @@ def config_diagnostics(config: Config) -> list[Diagnostic]:
         problem = config.capability_problem(config.sessions.store, "session")
         if problem:
             out.append(_error("sessions.store", "capability_missing", problem))
+    stats = config.communities.stats
+    if stats is not None and stats.time_basis is not None:
+        spec = config.metadata_schema.field(stats.time_basis)
+        if spec is None or spec.type not in {"datetime", "date"}:
+            out.append(_error("communities.stats.time_basis", "field_not_temporal", f"{stats.time_basis!r} must name a datetime or date field of metadata_schema"))
     roles = config.models.roles
     out.extend(_strict_schema_diagnostics(config))
     if "llm" in config.extraction.extractors and roles.extractor is None:

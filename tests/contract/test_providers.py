@@ -140,7 +140,7 @@ GOOD = {"answer": "ok", "citations": ["a"]}
 
 def test_anthropic_prompt_mode_request_shape_and_usage():
     rec = Recorder(anthropic_text("```json\n" + json.dumps(GOOD) + "\n```"))
-    provider = AnthropicProvider(anthropic_role(), transport=rec.transport)
+    provider = AnthropicProvider(anthropic_role(structured_output="none"), transport=rec.transport)
     budget = CallBudget(2)
     obj, usage = provider.complete_json("SYS", {"q": "x"}, Reply, budget, CallContext("generator"))
     assert obj == Reply(**GOOD) and usage.input_tokens == 10 and usage.output_tokens == 4 and usage.reported

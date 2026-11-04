@@ -134,7 +134,7 @@ def test_streaming_must_be_declared_by_the_role():
 def test_anthropic_text_stream_folds_usage_from_start_and_delta_events():
     text = json.dumps(REPLY)
     mock = Stream(anthropic_sse(text, usage_in={"input_tokens": 12, "cache_read_input_tokens": 5}, output_tokens=7))
-    reply, usage, deltas, budget = run(AnthropicProvider(role("anthropic"), transport=mock.transport))
+    reply, usage, deltas, budget = run(AnthropicProvider(role("anthropic", capabilities={"structured_output": "none"}), transport=mock.transport))
     assert reply == Reply(**REPLY) and "".join(deltas) == text
     assert mock.sent()["stream"] is True and "stream_options" not in mock.sent()
     assert usage.input_tokens == 17 and usage.cached_input_tokens == 5 and usage.output_tokens == 7

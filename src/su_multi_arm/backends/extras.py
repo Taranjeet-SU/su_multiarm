@@ -79,6 +79,18 @@ class GenerationIdentity(Protocol):
     def generation_identity(self, gen: GenerationId) -> dict[str, Any]: ...
 
 
+@runtime_checkable
+class HitParts(Protocol):
+    """``Catalog`` (optional, read path only): what an arm needs to turn chunk hits into document hits,
+    without materialising whole documents. For ``chunk_ids`` in rank order it returns
+    ``(chunks, heads)``: ``chunks[id] = (document_id, field, start, end, text)`` with ``text`` set only
+    for the first chunk of each document (``None`` otherwise), and ``heads[document_id] = (title,
+    source, url)`` for the documents that exist. Unknown ids are absent. Arms use it when present
+    and ``get_chunks``/``get`` otherwise; both give identical hits."""
+
+    def hit_parts(self, gen: GenerationId, chunk_ids: Sequence[str]) -> tuple[dict[str, tuple], dict[str, tuple]]: ...
+
+
 def require(adapter: Any, protocol: type, capability: str, operation: str) -> Any:
     """Return the facet when it structurally satisfies ``protocol``; otherwise a typed ``BackendError``."""
     facet = getattr(adapter, capability, None)
