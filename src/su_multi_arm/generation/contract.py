@@ -108,7 +108,8 @@ class AggregateEvidence(StrictModel):
             return value == 0
         if isinstance(value, (list, dict)):
             return not value
-        return value is None and not self.result.matched_ids and not self.result.groups
+        # ``total`` too: under native aggregation ``matched_ids`` may be a truncated prefix.
+        return value is None and not self.result.matched_ids and not self.result.groups and not self.result.total
 
 
 class AnswerContractViolation(ValueError):

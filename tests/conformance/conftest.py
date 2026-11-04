@@ -29,6 +29,9 @@ ADAPTERS = [
     pytest.param("opensearch_hnsw", marks=pytest.mark.external),
     pytest.param("elasticsearch", marks=pytest.mark.external),
     pytest.param("elasticsearch_hnsw", marks=pytest.mark.external),
+    # records.aggregation: native (every records check through server-side aggregations)
+    pytest.param("opensearch_native", marks=pytest.mark.external),
+    pytest.param("elasticsearch_native", marks=pytest.mark.external),
 ]
 
 
@@ -62,12 +65,13 @@ def adapter_factory(request, tmp_path):
             return SqliteBackend(tmp_path / f"faiss{counter['n']}", vector_engine="faiss", clock=lambda: clock["now"])
         if request.param == "sqlite_bm25":
             return SqliteBackend(tmp_path / f"bm25{counter['n']}", clock=lambda: clock["now"], lexical_engine="bm25")
+        native = {"aggregation": "native"} if request.param.endswith("native") else {}
         if request.param.startswith("opensearch"):
-            backend = opensearch_backend(f"{prefix}_{counter['n']}", "hnsw" if request.param.endswith("hnsw") else "exact", clock=lambda: clock["now"])
+            backend = opensearch_backend(f"{prefix}_{counter['n']}", "hnsw" if request.param.endswith("hnsw") else "exact", clock=lambda: clock["now"], **native)
             created.append(backend)
             return backend
         if request.param.startswith("elasticsearch"):
-            backend = elasticsearch_backend(f"{prefix}_{counter['n']}", "hnsw" if request.param.endswith("hnsw") else "exact", clock=lambda: clock["now"])
+            backend = elasticsearch_backend(f"{prefix}_{counter['n']}", "hnsw" if request.param.endswith("hnsw") else "exact", clock=lambda: clock["now"], **native)
             created.append(backend)
             return backend
         return SqliteBackend(tmp_path / f"sqlite{counter['n']}", clock=lambda: clock["now"])

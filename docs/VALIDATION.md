@@ -1,6 +1,112 @@
-# Validation report
 
-## 2.0.0a3 status — 2026-11-04
+
+## Day partitions, compose, retention and pins — 2026-11-04 (addendum A1 slices L3a + L3b)
+
+Evidence level: **implemented; synthetic and contract-mocked, with the ledger retention operations
+and pins also run against throwaway PostgreSQL and MongoDB containers.** No log cluster was
+contacted (the source is the in-process fake cluster), no paid call was made, and no customer data
+was used.
+
+- **Suite.** `python -m pytest -m 'not external'` gives **1856 passed, 73 skipped** (base `a27ab5a`:
+  1779 passed, 73 skipped). Bare `pytest -q` gives 1859 passed and 198 skipped (external tests skip
+  without their services). `ruff check src tests scripts` is clean; `docs/config.schema.json` was
+  regenerated with `core.schema.write_all`; the golden index fingerprints are unchanged.
+- **11 synthetic days, `keep_days: 10`, `keep_generations: 2`**
+  (`tests/contract/test_retention_11_days.py`, sqlite backend, 6 indices x 16+ lines per day). Every
+  run succeeds and verifies. After day 11: day 1 is a tombstone; the generations of days 9 and 10
+  (both list day 1) are deleted under rule (a), so the active generation is the only one left; no
+  remaining catalog document holds a day-1 line hash; the day-1-tagged ledger reply, every
+  unreferenced `extraction:`/`embedding:`/`pattern_library:` key and the deleted generations' job
+  entries are gone; cache entries of deleted generations are gone; the day-1 session expired; run
+  reports rotate to the 10 window days; audit records, manifests, reports and the tombstone hold
+  no day-1 line or source id. An injected unreferenced ledger entry holding a day-1 source id makes
+  `verify` fail with both the content and the reference finding.
+- **run-daily** (`tests/contract/test_run_daily.py`): refused without a redactor before any request
+  (the fake cluster records none); partitions hold only redacted text; source counts equal the
+  generator's truth; signature window counts equal the parsed matches; a second run pulls and
+  composes nothing; a crash after two of six units resumes with no duplicate record and the same
+  documents as a clean run; another source query on an open partition is refused; the schedule
+  lock refuses a second run while compose takes the write lease itself; a library change reparses
+  the day (`v2`) before compose; the spawn parse pool gives byte-identical matches and aggregates;
+  `settle` re-pulls the one grown unit; salted extraction keys of a library change go with their
+  generation.
+- **Timezone mapping** (`tests/unit/test_log_day_window.py`): index-date and event-time windows,
+  23- and 25-hour DST days in `America/New_York`, an eastern zone, and an end-to-end event-time
+  day whose unit counts equal the fake cluster's lines inside the local day, read from two UTC
+  index days.
+- **Pins** (`tests/unit/test_pins_and_gc.py`): TTL, release and sweep on memory, the sqlite sidecar
+  and SQL; a pin written by a **separate process** blocks `gc` (`pinned_expired_generation`, day
+  kept, verify fails) until it expires, then `gc` deletes and verify passes; bounded retry;
+  `ProcessPins` writes once for 100 requests and drops a non-current generation at refcount 0; a
+  deletion that a backend leaves incomplete keeps the day and its ledger references and fails verify;
+  compose failure skips expiry.
+- **Real-service (throwaway containers `pgvector/pgvector:0.8.0-pg17`, `mongo:7.0.16`, removed
+  afterwards).** PostgreSQL, MongoDB and `sql[postgres]` conformance including the new ledger
+  retention checks, and the PostgreSQL pin test: 69 passed. One failure,
+  `test_records_use_native_types`, fails identically at base `a27ab5a` (pre-existing, unrelated).
+- **Compose scale (N10, `scripts/compose_scale.py`, external workspace, sqlite, hash embedder).**
+  10 days x 100 units x 1000 signatures = **10^6 aggregate rows**, 1,113,100 documents, one
+  compose in **1118.8 s (18.6 min, within the 20 min budget)** with **peak RSS 10.28 GiB (above the
+  8 GB budget: N10 is not met on memory)**. 10^5 rows: 117.4 s, 1.07 GiB; 10^4 rows: 27.2 s, 0.27
+  GiB. The write path holds the whole corpus and its chunks in memory, and the per-document
+  ledger status entries (one sqlite transaction each) dominate the wall time. Streaming or
+  per-partition delta compose (addendum §4.3, deferred "only if the scale acceptance fails") is
+  the follow-up. Measured on one workstation (32 cores, NVMe), external workspace, regex engine.
+- **Not established.** Any real log cluster, real redaction (slice B11; the tests inject a
+  synthetic e-mail/IPv4 redactor), the learning step, communities, serving-path pin wiring, and
+  the pull window.
+
+## Read-only log sources and synthetic log fixtures — 2026-11-04 (addendum A1 slices L0 + L1)
+
+Evidence level: **implemented, synthetic and contract-mocked only.** No real Elasticsearch or
+OpenSearch cluster was contacted. No container ran, no paid call was made, and no customer data was
+used.
+
+- **Suite.** `python -m pytest -m 'not external'` gives **1627 passed** (base `9ba767f`: 1189 passed).
+  `ruff check src tests` is clean, `docs/config.schema.json` was regenerated with
+  `core.schema.write_all`, and the wheel ships `sources/` and `testing/fixtures/logs/` (including
+  the ReDoS corpus YAML).
+- **Allow-list** (`tests/unit/test_source_allowlist.py`, 351 cases).
+  - Every combination of seven methods and 46 paths that is not in the §3.1.1 table is refused, and
+    the fake cluster records **zero** requests (303 of the 351 cases).
+  - Path tricks are refused, among them percent-encoded `_all`, `..` and `?`, double encoding,
+    undiscovered or hidden indices and `//`.
+  - Refused bodies include scripts at any depth, `runtime_mappings`, aggregations, `from` and
+    oversize pages.
+  - Query parameters are allow-listed and keepalives are bounded.
+  - `DELETE` closes only ids that this transport opened and that the cursor lists, and never `_all`.
+  - Redirects are not followed. Credentials and the URL never appear in errors, `repr` or request
+    records.
+- **Self-check and capabilities** (`test_source_self_check.py`). A granted write privilege or
+  `cluster:all` gives a warning, or an error under `require_read_only_role`. A privilege endpoint
+  returning 403, 404 or 500 gives `unknown`. OpenSearch is checked through the account endpoint.
+  A 403 on `GET /` is non-fatal. The version floor and the `_alias` fallback for releases before
+  7.9 are covered.
+- **Pulls** (`tests/contract/test_source_pull.py`), against the in-process fake cluster.
+  - Counts equal the generator's truth for each index: `level_field` where the mapping has `level`,
+    `token_match` elsewhere.
+  - Scroll and `search_after` (with resume) return every document exactly once.
+  - An expired scroll restarts the unit without duplicates. An expiry beyond `max_restarts` is a
+    typed error.
+  - Scrolls are closed on completion, when the generator is abandoned, by the exit hook, and on a
+    real `SIGTERM` in a subprocess.
+  - The open-context limit is refused before I/O, and context fetches are capped per partition.
+  - Mapping plus multiline over a pulled day reproduces the generator's head, continuation and
+    fragment counts.
+- **Sampling** (`test_source_sampling.py`). Largest-remainder quotas sum to the cap. Hourly
+  strata, with an `outside` stratum, sum to the unit count. A seeded pull is reproducible. The
+  partition budget stops the pull and marks it `capped`.
+- **Fixtures** (`test_synthetic_logs.py`). The generator's digest is pinned. The three line styles,
+  noise, multiline fragments and synthetic-only PII shapes (`example.invalid`, 192.0.2.0/24) are
+  covered. The ReDoS corpus is well-formed, and its nested-quantifier case grows super-linearly under
+  Python `re`, a small timing check of a few milliseconds.
+- **CLI.** `sources check|discover|count|probe` ran against the fake cluster served on 127.0.0.1.
+  The probe report contains no log line and no URL.
+- **Not established.** Behaviour against any real Elasticsearch 7.x or OpenSearch 2.x. The isolated
+  container tier named in addendum §4 L1 was not run. Throughput, permission to scroll or PIT, and
+  `random_score` on a real cluster are what `sources probe` is for; an operator runs it outside this
+  repository. Redaction of pulled lines (slice B11) and persistence of day partitions (L3a) are not
+  implemented.
 
 Release candidate: `2.0.0a3` (slice a3/contract-providers). This release makes `on_violation: strip`
 the default and native structured output the Anthropic default. It also fixes the local-model QA
@@ -1723,6 +1829,43 @@ repository). No paid model call was made.
   for the FTS5 build of the same corpus; the segment held 23.4M postings and 229k terms);
   concurrent-request latency.
 
+## Pattern extractor and deterministic pattern learning — 2026-11-04 (addendum A1, slices L2 and L4a)
+
+Evidence level: **implemented, synthetic and contract-tested only.** No real log data, no source
+cluster and no model provider was used, and nothing was measured on a non-synthetic corpus.
+
+- **Suite.** `ruff check src tests` is clean. `pytest -m 'not external'` gives:
+  - **1293 passed, 73 skipped** with the repository venv, which has no `google-re2`, so the RE2-parametrised cases
+    skip;
+  - **1366 passed** with `google-re2` 1.1.20251105 added from an isolated `--target` directory in the
+    external workspace (the shared venv was not changed).
+
+  The base at `9ba767f` gave 1189 passed.
+- **Engine behaviour checked by tests**:
+  - RE2 refuses backreferences and lookaround;
+  - spans are character offsets on non-ASCII text, and `\w` is ASCII under both engines;
+  - `Set.SearchSet` selects candidates, and only those are searched;
+  - `(a+)+$` over 5 000 characters is linear under RE2;
+  - a `regex`-engine timeout is typed and recorded as non-deterministic;
+  - a missing engine is an error, with no fallback.
+- **Lint**: a 13-pattern synthetic ReDoS corpus covering the four rules, the RE2-subset refusals, and
+  every load-time lint class, including the `$attribute` rule.
+- **Contract (sqlite write path)**:
+  - approving a pattern makes the next build re-extract (0 reused) and adds its relation, while the
+    index fingerprint stays unchanged;
+  - deprecating the pattern removes the relation;
+  - a library edit and restart keep `current()` serving;
+  - `pattern_provenance` and the snapshot are recorded;
+  - a lint error fails the build before any write;
+  - the golden fingerprint test is unchanged and green.
+- **Bootstrap (synthetic generator, 700 lines, 7 templates, 4 services)**. Coverage went from 0.143
+  (one approved message pattern) to 1.0 with 24 synthesised proposals: 6 templates × 4 services, keyed
+  per `(service, level)`. There were no rejections and no evictions, and every proposal is lint-clean.
+  This shows the miner and synthesiser work on a fixture designed for them. It says nothing about
+  coverage on real logs, which is an L0/L4 benchmark item.
+- **Not established**: throughput per engine, the miner on public log corpora, and gate precision
+  against real drift. The LLM proposer (L4b) is not built.
+
 ## Production-workload parity, final paired run — 2026-11-04 (2.0.0a3, commit `cec3ffb`)
 
 Evidence level: **measured on private corpora** (aggregate only; corpora, questions, gold, prompts,
@@ -1771,3 +1914,116 @@ answers exist for 45):
 - **Model change:** the newer small generator declines more often (fewer unsupported claims, fewer solved).
 
 Corpus B's dense embedding model differs from the served one (an owner decision).
+
+## LLM pattern-learning loop and index-name grammar — 2026-11-04 (addendum A1, slice L4b and the L1 parser fix)
+
+Evidence level: **implemented, synthetic and mocked only.** Every model reply came from a scripted
+fake provider served through `httpx.MockTransport` (the real `openai` / `openai_compatible` provider
+code, metering and structured-output paths, but no network, no key and no spend). No real model, no
+real log data and no source cluster was used. Nothing here measures proposal quality.
+
+- **Suite.** `ruff check src tests` is clean. `pytest -m 'not external'` gives:
+  - **1849 passed, 91 skipped** with the repository venv (no `google-re2`; the RE2 parameters skip);
+  - **1940 passed, 0 skipped** with `google-re2` 1.1.20251105 from the isolated `--target`
+    directory in the external workspace.
+
+  The base `a27ab5a` gave 1778 passed, 74 skipped (repository venv).
+- **Egress (tests):** plain lines, and lines redacted under another privacy configuration, are refused
+  before any request; a residual IPv4 shape refuses the run (not dropped); a config without redaction
+  is refused; a hosted role without `allow_hosted` is refused at config time and at run time; records
+  from a `LogMapping` without a redactor are refused. In the request bodies no synthetic e-mail, IP,
+  host or tenant value appears, only `[REDACTED_*]` markers and per-run aliases. That test first
+  found the cluster template carrying a host value; the loop now pseudonymises before mining.
+- **Gate (tests, both engines):** each rejection class through the loop, with nothing written:
+  invented example id, matching negative (lint), over-broad (`out_of_cluster`), partial cluster
+  (`cluster_coverage`), stealing an approved pattern's lines (`no_regressions`), ReDoS lint, too few
+  literals, too little support, backreference; novelty against a human-disabled pattern; a fix of a
+  disabled target is invalid; a fix that drops target positives fails `fix_target`.
+- **Promotion and writer (tests):** `manual` keeps passing proposals in `proposed.yaml` (coverage
+  0.16 before and after, 0.88 if approved, on a 25-line fixture); `auto` on RE2 learns both with
+  `approve` records and the reparse reaches 0.88; `auto` on the `regex` engine waits for a human;
+  `propose` never promotes; a fix of a learned pattern is a `supersede`; a fix of a human pattern
+  waits and a human promote supersedes it. `library.yaml` is byte-identical in every case. A human
+  save between read and rename is retried and kept. Two runs with the same fake replies give
+  byte-identical files and reports. Git: only the changed system file is committed, with author
+  `system:pattern_learner`; uncommitted hand edits stop the writer.
+- **Spend (tests):** run and day call caps; a USD run cap refuses before the request; committed spend
+  is the reported usage ($0.52 per call at the test price); the day ledger persists across runs and
+  refuses the next run; two ledger handles on one file reserving concurrently grant exactly the cap.
+- **Index-name grammar (tests):** synthetic deployment-prefixed and numbered infrastructure-prefixed
+  names, and underscored service names, parse; undeclared prefixes, ambiguous readings, missing or
+  invalid dates and vocabulary misses are `unparsed` with typed reasons.
+- **Not established:** proposal quality, cost per day or coverage gain on real logs with a real
+  model; the general spend ledger on other ledger backends (B10); raw-reply tagging by partition.
+
+## Native aggregation pushdown for the Lucene records facets — 2026-11-04 (branch `v2/logs`, base `a27ab5a`)
+
+Evidence level: **real-service on throwaway containers** (OpenSearch 2.19.1, OpenSearch 3.9.0 and
+Elasticsearch 8.17.4 from `tests/services/docker-compose.yml`), **synthetic data only**, plus
+fake-transport unit tests. No paid call; no private or production data; nothing was measured on a
+non-synthetic corpus or on a multi-node or security-enabled cluster.
+
+- **Suite.** `ruff check src tests scripts` is clean. `pytest -m 'not external'` gave **1804 passed,
+  73 skipped**; the base gave 1778 passed, 74 skipped. The default stays `records.aggregation: client`,
+  and the golden index fingerprints are unchanged because `records` is excluded from the backend recipe.
+- **Conformance, both modes** (`tests/conformance/` with `-m external`):
+  - the records kit runs natively on the new `opensearch_native` and `elasticsearch_native` adapters;
+  - `test_lucene_native_aggregation.py` compares client and native on 176 specs × {no ACL, ACL} =
+    352 `ScopeResult`s per server. It covers every measure alone and grouped, cross-tabs with nulls,
+    calendar groups in `Europe/Berlin`, ranking with ties, periods (one with an unparseable bound),
+    numerators (one unsupported), the three distinct-count units, the record list over typed,
+    mixed-type and absent fields, negated-state null counts, and unsupported text;
+  - all 352 results were **identical** (model equality and JSON dump) on each server;
+  - the ACL check: a tenant-hidden record with a marker in every field never appears in any
+    native aggregate, group, tie, id or list;
+  - the caps check: `matched_ids_cap` gives a truncated, flagged list; `max_groups` gives a bounded
+    result; above `distinct_exact_cap` the result is `approximate` with the reason in `basis`.
+  - Runs: OS 2.19.1 + ES 8.17.4, 59 passed; OS 3.9.0 (`SU_TEST_OPENSEARCH_MAJOR=3`), 29 passed. The
+    skips are other services and the env-gated scale test.
+- **Scale** (`scripts/bench_native_aggregation.py`, 200 000 seeded synthetic log records, one
+  records index, ACL on 10 of 20 tenants, so about 99.6k records match; median of 3; shared host; client path
+  with `max_matched` raised so it can answer; ingest 9–12 s per server). Latency in seconds,
+  client → native (default `matched_ids_cap` 10000); the last column is native with
+  `matched_ids_cap: 100`:
+
+  | Question (matched) | OS 2.19.1 | OS 3.9.0 | ES 8.17.4 | native, ids cap 100 (OS2 / OS3 / ES) |
+  |---|---|---|---|---|
+  | count (99.6k) | 2.49 → 0.065 | 2.53 → 0.065 | 2.44 → 0.041 | 0.002 / 0.002 / 0.002 |
+  | count errors (16.8k) | 0.31 → 0.067 | 0.30 → 0.070 | 0.29 → 0.046 | 0.002 / 0.002 / 0.003 |
+  | group by service | 2.58 → 0.067 | 2.61 → 0.071 | 2.27 → 0.047 | 0.004 / 0.003 / 0.006 |
+  | top 5 services by errors | 0.33 → 0.071 | 0.32 → 0.079 | 0.26 → 0.047 | 0.004 / 0.003 / 0.004 |
+  | cross-tab service × level | 2.55 → 0.069 | 2.59 → 0.075 | 2.34 → 0.056 | 0.005 / 0.005 / 0.006 |
+  | errors per day | 0.33 → 0.070 | 0.35 → 0.073 | 0.28 → 0.049 | 0.003 / 0.004 / 0.004 |
+  | avg latency by service | 2.58 → 0.071 | 2.66 → 0.069 | 2.69 → 0.044 | 0.004 / 0.004 / 0.004 |
+  | distinct users (20k values, exact) | 2.55 → 0.086 | 2.62 → 0.093 | 2.29 → 0.066 | 0.023 / 0.022 / 0.024 |
+  | week over week | 2.74 → 0.069 | 2.82 → 0.072 | 2.44 → 0.042 | 0.003 / 0.003 / 0.003 |
+  | error share | 2.51 → 0.067 | 2.61 → 0.067 | 2.17 → 0.042 | 0.002 / 0.002 / 0.002 |
+  | sum latency | 2.52 → 0.066 | 2.61 → 0.067 | 2.28 → 0.041 | 0.002 / 0.002 / 0.002 |
+  | last seen 5xx (19.9k) | 0.68 → 0.072 | 0.68 → 0.072 | 0.32 → 0.046 | 0.003 / 0.003 / 0.003 |
+
+  - Speed-up: 4–61× at the default ids cap, mostly the fetch of 10 000 ids, and up to ~1000× with the
+    cap at 100.
+  - The client cost grows with the matched count, while native stays roughly flat.
+  - Every result **agreed** (equal, with float sums within a relative 1e-9; the native id list is the
+    prefix of the client list and flagged truncated).
+  - Every result was bit-identical except "avg latency by service" on OS 3.9.0 and ES 8.17.4. Those
+    averages of non-integral doubles differ in the last ulps: the engine sums in its own order. This is
+    a documented limitation.
+- **Found and fixed by the scale run.** On OpenSearch 3.9.0 the count-ordered `terms` path returned a
+  wrong top 5 (363 for a true 373, and one group missing). The cause: 3.x searches even a one-shard
+  index in concurrent segment slices (`search.concurrent_segment_search.mode: auto`). The reply
+  reported `doc_count_error_upper_bound` 648 at size 16, and the 352-spec fixture is too small to
+  trigger it. The adapter now trusts a terms reply only when the engine reports error 0, grows the
+  request otherwise, and gives a bounded result past `max_groups`. After the fix the 200k run is
+  identical on 3.9.0. The regression is covered by a unit test and by the env-gated
+  `tests/services/test_native_aggregation_scale.py` (`SU_TEST_AGG_SCALE_DOCS=200000`: 2 passed on
+  OS 3.9.0 and ES 8.17.4).
+- **Not established**:
+  - multi-shard or multi-node indices (the adapter creates one-shard indices; terms ranking relies on
+    the engine's error report, not on the shard count);
+  - security-enabled clusters;
+  - corpora above 200k records;
+  - concurrent-request latency;
+  - `percentiles` (not in the measure contract);
+  - DST-gap zones for calendar buckets (the engine and Python may label a bucket whose local
+    midnight does not exist differently; not tested).

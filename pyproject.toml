@@ -27,13 +27,16 @@ local = ["sentence-transformers>=3.0"]  # local embedder/reranker models (alias 
 spacy = ["spacy>=3.8"]
 gliner = ["gliner>=0.2"]
 communities = ["networkx>=3.3"]
+# pattern extractor engines (chosen explicitly by extraction.pattern_library.engine; no fallback)
+patterns = ["google-re2>=1.1"]
+patterns-lite = ["regex>=2023.0"]
 api = ["fastapi>=0.115", "uvicorn>=0.30"]
 mcp = ["mcp>=1.10,<2"]
 # The OpenAI and Anthropic providers speak the HTTP APIs through httpx (a core dependency); these
 # extras are intentionally empty so `pip install su-multi-arm[openai]` / `[anthropic]` resolve.
 openai = []
 anthropic = []
-all = ["su-multi-arm[faiss,postgres,sql,neo4j,kuzu,elasticsearch,mongodb,opensearch,semantic,spacy,gliner,communities,api,mcp]"]
+all = ["su-multi-arm[faiss,postgres,sql,neo4j,kuzu,elasticsearch,mongodb,opensearch,semantic,spacy,gliner,communities,patterns,api,mcp]"]
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5,<10"]
 dev = ["pytest>=8", "ruff>=0.9", "build>=1.2", "hatchling>=1.25"]
 

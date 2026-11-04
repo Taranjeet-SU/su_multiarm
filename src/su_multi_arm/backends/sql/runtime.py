@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import sqlalchemy as sa
 
@@ -89,17 +89,97 @@ class SqlLedger:
             row = conn.execute(sa.select(jobs.c.status).where(jobs.c.job_id == job_id)).first()
         return None if row is None else row[0]
 
-    def put_raw(self, key: str, raw_reply: str, valid: bool) -> None:
+    def put_raw(self, key: str, raw_reply: str, valid: bool, tags: Sequence[str] = ()) -> None:
         raw = self._b.rt["raw_replies"]
         with self._b.tx("put_raw") as conn:
             conn.execute(raw.delete().where(raw.c.key == key))
             conn.execute(raw.insert().values(key=key, raw_reply=raw_reply, valid=bool(valid)))
+        if tags:
+            self.tag_raw(key, tags)
 
     def get_raw(self, key: str) -> RawReply | None:
         raw = self._b.rt["raw_replies"]
         with self._b.tx("get_raw") as conn:
             row = conn.execute(sa.select(raw.c.raw_reply, raw.c.valid).where(raw.c.key == key)).first()
         return None if row is None else RawReply(key=key, raw_reply=row[0], valid=bool(row[1]))
+
+
+    # retention (``extras.LedgerRetention``) ----------------------------------------------------
+    def tag_raw(self, key: str, tags: Sequence[str]) -> None:
+        raw, t = self._b.rt["raw_replies"], self._b.rt["raw_tags"]
+        with self._b.tx("tag_raw") as conn:
+            if conn.execute(sa.select(raw.c.key).where(raw.c.key == key)).first() is None:
+                raise BackendError(KIND, "tag_raw", f"unknown raw entry {key}")
+            have = {r[0] for r in conn.execute(sa.select(t.c.tag).where(t.c.key == key))}
+            for tag in sorted(set(tags) - have):
+                conn.execute(t.insert().values(key=key, tag=tag))
+
+    def raw_tags(self, key: str) -> list[str]:
+        t = self._b.rt["raw_tags"]
+        with self._b.tx("raw_tags") as conn:
+            return [r[0] for r in conn.execute(sa.select(t.c.tag).where(t.c.key == key).order_by(t.c.tag))]
+
+    def tagged(self, tag: str) -> list[str]:
+        t = self._b.rt["raw_tags"]
+        with self._b.tx("tagged") as conn:
+            return [r[0] for r in conn.execute(sa.select(t.c.key).where(t.c.tag == tag).order_by(t.c.key))]
+
+    def add_refs(self, generation: str, keys: Sequence[str]) -> None:
+        refs = self._b.rt["ledger_refs"]
+        with self._b.tx("add_refs") as conn:
+            have = {r[0] for r in conn.execute(sa.select(refs.c.key).where(refs.c.generation == generation))}
+            fresh = sorted(set(keys) - have)
+            if fresh:
+                conn.execute(refs.insert(), [{"generation": generation, "key": k} for k in fresh])
+
+    def refs(self, generation: str) -> list[str]:
+        refs = self._b.rt["ledger_refs"]
+        with self._b.tx("refs") as conn:
+            return [r[0] for r in conn.execute(sa.select(refs.c.key).where(refs.c.generation == generation).order_by(refs.c.key))]
+
+    def referencing_generations(self) -> list[str]:
+        refs = self._b.rt["ledger_refs"]
+        with self._b.tx("referencing_generations") as conn:
+            return [r[0] for r in conn.execute(sa.select(refs.c.generation).distinct().order_by(refs.c.generation))]
+
+    def purge(self, spec: Any) -> dict[str, int]:
+        raw, t, refs = self._b.rt["raw_replies"], self._b.rt["raw_tags"], self._b.rt["ledger_refs"]
+        with self._b.tx("purge") as conn:
+            dropped = sum(int(conn.execute(refs.delete().where(refs.c.generation == g)).rowcount) for g in spec.drop_refs_of)
+            tagged = 0
+            for tag in spec.tags:
+                keys = [r[0] for r in conn.execute(sa.select(t.c.key).where(t.c.tag == tag))]
+                for key in keys:
+                    tagged += int(conn.execute(raw.delete().where(raw.c.key == key)).rowcount)
+                    conn.execute(t.delete().where(t.c.key == key))
+            unreferenced = 0
+            for prefix in spec.unreferenced_prefixes:
+                unreferenced += int(
+                    conn.execute(raw.delete().where(raw.c.key.startswith(prefix, autoescape=True), raw.c.key.not_in(sa.select(refs.c.key)), raw.c.key.not_in(sa.select(t.c.key)))).rowcount
+                )
+            conn.execute(t.delete().where(t.c.key.not_in(sa.select(raw.c.key))))
+        return {"refs_dropped": dropped, "tagged": tagged, "unreferenced": unreferenced}
+
+    def drop_job(self, job_id: str) -> int:
+        ledger, jobs = self._b.rt["ledger"], self._b.rt["jobs"]
+        with self._b.tx("drop_job") as conn:
+            removed = int(conn.execute(ledger.delete().where(ledger.c.job_id == job_id)).rowcount)
+            conn.execute(jobs.delete().where(jobs.c.job_id == job_id))
+        return removed
+
+    def jobs(self) -> list[str]:
+        ledger = self._b.rt["ledger"]
+        with self._b.tx("jobs") as conn:
+            return [r[0] for r in conn.execute(sa.select(ledger.c.job_id).distinct().order_by(ledger.c.job_id))]
+
+    def raw_entries(self, prefix: str, after: str | None, limit: int) -> list[RawReply]:
+        raw = self._b.rt["raw_replies"]
+        with self._b.tx("raw_entries") as conn:
+            query = sa.select(raw.c.key, raw.c.raw_reply, raw.c.valid).where(raw.c.key.startswith(prefix, autoescape=True))
+            if after is not None:
+                query = query.where(raw.c.key > after)
+            rows = conn.execute(query.order_by(raw.c.key).limit(limit)).all()
+        return [RawReply(key=r[0], raw_reply=r[1], valid=bool(r[2])) for r in rows]
 
 
 class SqlSessions:

@@ -12,9 +12,12 @@ from __future__ import annotations
 
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from pydantic import Field
+
 from ..communities.base import Community
 from ..core.errors import BackendError
-from ..core.types import Entity, GenerationId, Membership, Scope
+from ..core.types import Entity, GenerationId, Membership, RawReply, Scope
+from ..models import StrictModel
 
 
 @runtime_checkable
@@ -89,6 +92,51 @@ class HitParts(Protocol):
     and ``get_chunks``/``get`` otherwise; both give identical hits."""
 
     def hit_parts(self, gen: GenerationId, chunk_ids: Sequence[str]) -> tuple[dict[str, tuple], dict[str, tuple]]: ...
+
+
+class PurgeSpec(StrictModel):
+    """What ``LedgerRetention.purge`` removes (addendum A1 §3.8.3, B6/n2), in this order:
+
+    1. the reference rows of ``drop_refs_of`` (generations deleted by ``gc``);
+    2. every raw entry tagged with any of ``tags`` (e.g. ``partition:<source>:<day>``), with its tags;
+    3. every raw entry whose key starts with one of ``unreferenced_prefixes``, that no remaining
+       ``ledger_refs`` row names and that carries no tag (a tagged entry, e.g. a learning reply,
+       lives until one of its partitions expires).
+    """
+
+    drop_refs_of: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    unreferenced_prefixes: list[str] = Field(default_factory=list)
+
+
+@runtime_checkable
+class LedgerRetention(Protocol):
+    """``LedgerStore`` extension for retention (addendum A1 §3.8.3; memory, sqlite, sqlalchemy,
+    postgres, mongodb). ``put_raw(key, raw, valid, tags=...)`` tags an entry at write time;
+    ``ledger_refs(generation, key)`` is a side table naming every ledger key a generation uses (its
+    manifest keeps only the count and sha). ``drop_job`` removes a deleted generation's job entries
+    (content-free by invariant). ``raw_entries`` pages through raw entries by key for the
+    content-based verifier; it is bounded by ``limit``."""
+
+    def tag_raw(self, key: str, tags: Sequence[str]) -> None: ...
+
+    def raw_tags(self, key: str) -> list[str]: ...
+
+    def tagged(self, tag: str) -> list[str]: ...
+
+    def add_refs(self, generation: str, keys: Sequence[str]) -> None: ...
+
+    def refs(self, generation: str) -> list[str]: ...
+
+    def referencing_generations(self) -> list[str]: ...
+
+    def purge(self, spec: PurgeSpec) -> dict[str, int]: ...
+
+    def drop_job(self, job_id: str) -> int: ...
+
+    def jobs(self) -> list[str]: ...
+
+    def raw_entries(self, prefix: str, after: str | None, limit: int) -> list[RawReply]: ...
 
 
 def require(adapter: Any, protocol: type, capability: str, operation: str) -> Any:

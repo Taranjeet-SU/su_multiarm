@@ -588,6 +588,10 @@ class ScopeResult(StrictModel):
     unknown: dict[str, int] = Field(default_factory=dict)  # field -> matched records with a null value under a negated predicate
     numerator: int | None = Field(default=None, ge=0)  # share: records matching the numerator
     basis: list[str] = Field(default_factory=list)  # human-readable labels: time basis, windows, text match, count unit
+    # Native aggregation (Lucene ``records.aggregation: native``): ``matched_ids`` holds the first
+    # ``matched_ids_cap`` matched ids in id order and this flag says more records matched (``total``
+    # is always the full count). The client path never truncates (it refuses above ``max_matched``).
+    matched_ids_truncated: bool = False
 
 
 class Page(StrictModel):

@@ -155,12 +155,14 @@ MATRIX: dict[str, AdapterCapabilities] = {
                 "catalog": _c("contracts", registry=False),
                 "lexical": _c("contracts", phrase=True, highlight=True, field_boost=True, analyzer_id="lucene_standard"),
                 "vector": _c("contracts", exact=True, ann="hnsw_optional", filter_pushdown=True, max_dimensions=16000, namespaces=True),
-                "records": _c("contracts", exactness="exact", date_buckets=False, top_n=True, max_matched=10000),
+                "records": _c("contracts", exactness="exact", date_buckets=False, top_n=True, max_matched=10000, native_aggregation="optional"),
             },
             notes=(
                 "backends/opensearch/ on the frozen contracts (OpenSearch 2.x and 3.x, opensearch-py; same index layout on both, 3.x BM25 scores are the 2.x scores / 2.2, rankings unchanged). Generation-named indices "
                 "+ dataset aliases; BM25 over the standard analyzer; exact cosine by default, HNSW (lucene engine) opt-in "
-                "with exact rescore; records exact through native filter pushdown and a bounded scan (max_matched). "
+                "with exact rescore; records exact through native filter pushdown and a bounded scan (max_matched), or with "
+                "records.aggregation: native through server-side aggregations (no scan; capped matched ids; cardinality "
+                "only above the exact distinct cap, labelled approximate). "
                 "graph/cache/ledger/session are not served (plan §3.5 table)."
             ),
         ),
@@ -170,13 +172,14 @@ MATRIX: dict[str, AdapterCapabilities] = {
                 "catalog": _c("contracts", registry=True),
                 "lexical": _c("contracts", phrase=True, highlight=True, field_boost=True, analyzer_id="lucene_standard"),
                 "vector": _c("contracts", exact=True, ann="hnsw_optional", filter_pushdown=True, max_dimensions=4096, namespaces=True),
-                "records": _c("contracts", exactness="exact", date_buckets=False, top_n=True, max_matched=10000),
+                "records": _c("contracts", exactness="exact", date_buckets=False, top_n=True, max_matched=10000, native_aggregation="optional"),
             },
             notes=(
                 "backends/elasticsearch/ on the frozen contracts (Elasticsearch 8.x, elasticsearch-py), built on the "
                 "OpenSearch adapter classes over backends/_lucene_common.py: same index layout, aliases, BM25 and typed "
                 "pushdown; dense_vector exact cosine by default, HNSW (float, unquantised) opt-in with exact rescore; "
-                "records exact through a bounded scan (max_matched). graph/cache/ledger/session are not served."
+                "records exact through a bounded scan (max_matched) or server-side aggregations (records.aggregation: native). "
+                "graph/cache/ledger/session are not served."
             ),
         ),
         AdapterCapabilities(

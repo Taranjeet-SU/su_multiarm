@@ -120,9 +120,67 @@ def _main():
     config_sub.add_parser("validate", help="validate the config (v1 is upgraded in memory first)")
     schema = config_sub.add_parser("schema", help="print the JSON schema of the v2 (or v1) config model")
     schema.add_argument("--v1", action="store_true")
+    sources_cmd = commands.add_parser("sources", help="read-only log sources: check, discover, count, probe (never builds an engine)")
+    sources_cmd.add_argument("sources_command", choices=["check", "discover", "count", "probe"])
+    sources_cmd.add_argument("--source", help="name under sources: (default: the only one configured)")
+    sources_cmd.add_argument("--date", help="partition day YYYY-MM-DD in the source timezone (discover, count, probe)")
+    sources_cmd.add_argument("--max-units", type=int, default=3, help="probe: units that get counts and PIT/random_score checks")
+    sources_cmd.add_argument("--max-docs", type=int, default=1000, help="probe: documents pulled from one unit for throughput (0 = none)")
+    sources_cmd.add_argument("--output", type=Path, help="write the JSON report to this file instead of stdout")
+    patterns_cmd = commands.add_parser("patterns", help="pattern library: lint, coverage, mine, propose, learn, promote, deprecate, disable")
+    patterns_sub = patterns_cmd.add_subparsers(dest="patterns_command", required=True)
+    patterns_sub.add_parser("lint", help="load, replay and lint extraction.pattern_library")
+    for name, text in (
+        ("coverage", "line status counts of a log-line file"),
+        ("mine", "mine templates and synthesise proposals (nothing is written)"),
+        ("propose", "LLM proposals for unparsed clusters, gated, written to proposed.yaml only"),
+        ("learn", "one loop: mine, propose, gate, write under the promotion policy, reparse coverage"),
+    ):
+        sub = patterns_sub.add_parser(name, help=text)
+        sub.add_argument("--input", type=Path, required=True, help="one log line per line (UTF-8), or .jsonl with id/text/attributes")
+        sub.add_argument("--attr", action="append", default=[], metavar="KEY=VALUE", help="line attribute (service, level, ...)")
+        if name in {"propose", "learn"}:
+            sub.add_argument("--dry-run", action="store_true", help="stop before any model call: report clusters and estimates; spend and write nothing")
+            sub.add_argument("--max-usd", type=float, help="lower the per-run USD cap for this run (needs budgets.price_table)")
+            sub.add_argument("--output", type=Path, help="write the JSON report to this file instead of stdout")
+    for name, text in (
+        ("promote", "approve a proposed (or deprecated) entry: a human decision record"),
+        ("deprecate", "stop an approved entry from matching: a human decision record"),
+        ("disable", "disable an entry for good (wins over every system record)"),
+    ):
+        sub = patterns_sub.add_parser(name, help=text)
+        sub.add_argument("id")
+        sub.add_argument("--reason", default="")
+        sub.add_argument("--by", default="cli", help="recorded as user:<by> (letters, digits, _ . @ -)")
+    logs_cmd = commands.add_parser("logs", help="daily log partitions and compose (addendum A1 L3a)")
+    logs_cmd.add_argument("logs_command", choices=["run-daily", "compose", "backfill", "settle"])
+    logs_cmd.add_argument("--date", help="partition day YYYY-MM-DD (default for run-daily: yesterday in logs.timezone)")
+    logs_cmd.add_argument("--from", dest="date_from", help="backfill: first day YYYY-MM-DD")
+    retention_cmd = commands.add_parser("retention", help="retention of log partitions and generations (addendum A1 L3b)")
+    retention_cmd.add_argument("retention_command", choices=["report", "verify", "run"])
+    retention_cmd.add_argument("--date", help="as-of day YYYY-MM-DD (default: today in logs.timezone)")
     args = parser.parse_args()
+    if args.command in {"logs", "retention"}:
+        from .ingestion.schedule import logs_cli
+
+        print(json.dumps(logs_cli(args, load_config(args.config)), indent=2, default=str))
+        return
     if args.command == "config":
         print(_config_command(args))
+        return
+    if args.command == "sources":
+        _sources_command(args, parser)
+        return
+    if args.command == "patterns":
+        output = _patterns_command(args)
+        text = json.dumps(output, indent=2, ensure_ascii=False, default=str)
+        if getattr(args, "output", None):
+            args.output.write_text(text + "\n")
+            print(json.dumps({"written": str(args.output), "stopped": output.get("stopped")}))
+        else:
+            print(text)
+        if output.get("stopped"):
+            raise SystemExit(EXIT_FAILED)
         return
     import warnings
 
@@ -234,6 +292,143 @@ def _main():
         uvicorn.run(mcp_http_app(server, args.token_env), host=args.host, port=args.port)
         return
     print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def _sources_command(args, parser) -> None:
+    """``sources check|discover|count|probe``. Loads the config, constructs the named source and
+    talks to it only through its allow-list transport. Output is aggregate JSON; credentials come
+    from the ``*_env`` variables and are never printed."""
+    from .sources import build_source
+    from .sources.cursor import install_signal_handlers
+    from .sources.probe import day_window, run_probe
+
+    config = load_config(args.config)
+    if not config.sources:
+        raise ConfigError("no sources are configured", "sources")
+    name = args.source or (next(iter(config.sources)) if len(config.sources) == 1 else None)
+    if name is None:
+        parser.error(f"several sources are configured; pass --source ({sorted(config.sources)})")
+    if name not in config.sources:
+        raise ConfigError(f"unknown source {name!r}; configured: {sorted(config.sources)}", "sources")
+    if args.sources_command != "check" and not args.date:
+        parser.error(f"sources {args.sources_command} needs --date YYYY-MM-DD")
+    install_signal_handlers()
+    source = build_source(name, config.sources[name])
+    failed = False
+    try:
+        if args.sources_command == "check":
+            caps = source.capabilities(probe=True)
+            diagnostics = source.self_check()
+            failed = any(d.severity == "error" for d in diagnostics)
+            output = {"source": name, "capabilities": caps.model_dump(), "self_check": [d.model_dump() for d in diagnostics]}
+        elif args.sources_command == "probe":
+            output = run_probe(source, args.date, max_units=args.max_units, max_docs=args.max_docs)
+            failed = any(d["severity"] == "error" for d in output["self_check"])
+        else:
+            units = source.discover(day_window(args.date, source.config.timezone))
+            if args.sources_command == "discover":
+                output = {"source": name, "units": [u.model_dump(mode="json") for u in units]}
+            else:
+                output = {"source": name, "counts": [{"index": u.index, **source.count(u).model_dump(mode="json")} for u in units]}
+            output["diagnostics"] = [d.model_dump() for d in source.diagnostics]
+    finally:
+        source.shutdown()
+    text = json.dumps(output, indent=2, ensure_ascii=False, default=str)
+    if args.output:
+        args.output.write_text(text + "\n")
+        print(json.dumps({"written": str(args.output)}))
+    else:
+        print(text)
+    if failed:
+        raise SystemExit(EXIT_FAILED)
+
+
+def _input_lines(args) -> list:
+    """``--input``: plain lines (ids ``l<n>``, ``--attr`` attributes) or JSONL objects with ``text``
+    and optional ``id`` and ``attributes``."""
+    from .learning.patterns import LogLine
+
+    attributes = {}
+    for item in args.attr:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--attr expects KEY=VALUE, got {item!r}")
+        attributes[key] = value
+    raw = args.input.read_text(encoding="utf-8").splitlines()
+    if args.input.suffix == ".jsonl":
+        lines = []
+        for number, row in enumerate(raw):
+            if not row.strip():
+                continue
+            data = json.loads(row)
+            if not isinstance(data, dict) or not isinstance(data.get("text"), str):
+                raise ValueError(f"{args.input}:{number + 1}: each JSONL row needs a string 'text'")
+            attrs = {**attributes, **{str(k): str(v) for k, v in (data.get("attributes") or {}).items()}}
+            lines.append(LogLine(str(data.get("id") or f"l{number}"), data["text"], attrs))
+        return lines
+    return [LogLine(f"l{i}", line, attributes) for i, line in enumerate(row for row in raw if row.strip())]
+
+
+def _patterns_decision(args, config, ref) -> dict:
+    """``patterns promote|deprecate|disable``: one human record in decisions.yaml (CLI only)."""
+    from .extraction.patterns.engine import select_engine
+    from .extraction.patterns.library import load_library
+    from .extraction.patterns.writer import commit_system_files, git_work_tree, require_clean_system_files
+    from .learning.patterns import human_decision
+
+    library = load_library(ref.path, select_engine(ref.engine, timeout_ms=ref.regex_timeout_ms), min_literal_chars=ref.min_literal_chars, strict=False)
+    settings = config.learning.patterns
+    commit = settings is not None and settings.git_commit and git_work_tree(ref.path)
+    if commit:
+        require_clean_system_files(ref.path)
+    decision = human_decision(ref.path, args.patterns_command, args.id, by=f"user:{args.by}", library=library, reason=args.reason)
+    sha = commit_system_files(ref.path, "system:cli", f"patterns {args.patterns_command} {args.id}") if commit else None
+    return {"decision": decision.model_dump(mode="json", exclude_none=True), "git_commit": sha}
+
+
+def _patterns_command(args) -> dict:
+    """``patterns lint|coverage|mine`` read the library and an input file and write nothing.
+    ``propose|learn`` run the learning loop (``learning/patterns/loop.py``); ``promote|deprecate|
+    disable`` append one human decision record. None of them constructs an engine or touches an
+    index; none is an ``Action`` (no HTTP/MCP surface)."""
+    from .extraction.patterns.coverage import coverage
+    from .extraction.patterns.extractor import PatternExtractor
+
+    config = load_config(args.config)
+    ref = config.extraction.pattern_library
+    if ref is None:
+        raise ConfigError("extraction.pattern_library is not configured", "extraction.pattern_library")
+    if args.patterns_command in {"promote", "deprecate", "disable"}:
+        return _patterns_decision(args, config, ref)
+    if args.patterns_command in {"propose", "learn"}:
+        from .learning.patterns import session_from_config
+
+        session = session_from_config(config, dry_run=args.dry_run, max_usd=args.max_usd)
+        return session.run(_input_lines(args), mode=args.patterns_command, dry_run=args.dry_run).to_dict()
+    from .extraction.predicate_support import PredicateSupport
+
+    compiled = PatternExtractor(ref, PredicateSupport(config.extraction.stemmer_language)).load()
+    library = compiled.library
+    if args.patterns_command == "lint":
+        return {
+            "library": library.name,
+            "provenance": compiled.provenance(),
+            "approved": [e.entry.id for e in library.approved()],
+            "statuses": {pid: e.status for pid, e in sorted(library.entries.items())},
+            "issues": [i.render() for i in library.issues],
+        }
+    lines = _input_lines(args)
+    if args.patterns_command == "coverage":
+        return coverage(compiled.match_line(line.text, attributes=line.attributes) for line in lines).to_dict()
+    from .learning.patterns import bootstrap
+
+    report = bootstrap(
+        lines,
+        compiled,
+        min_support=ref.gate.min_support,
+        min_literal_chars=ref.min_literal_chars,
+    )
+    return {**report.to_dict(), "proposals": [p.model_dump(mode="json", exclude_none=True) for p in report.proposals]}
 
 
 def _config_command(args) -> str:

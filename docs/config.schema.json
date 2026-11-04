@@ -685,6 +685,47 @@
       "title": "CommunityStats",
       "type": "object"
     },
+    "ComposeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "signature_hour": {
+          "default": false,
+          "title": "Signature Hour",
+          "type": "boolean"
+        },
+        "max_exemplars_per_signature": {
+          "default": 3,
+          "maximum": 50,
+          "minimum": 0,
+          "title": "Max Exemplars Per Signature",
+          "type": "integer"
+        }
+      },
+      "title": "ComposeConfig",
+      "type": "object"
+    },
+    "CountQueryConfig": {
+      "additionalProperties": false,
+      "description": "A named count query. Built **per index from its mapping**: a ``level_field`` terms query on\n``mapping.level`` where that field exists in the index, and otherwise a ``token_match`` query on\nthe message field. Without ``tokens`` an index lacking the level field is a typed schema-drift\nerror, never a zero.",
+      "properties": {
+        "levels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Levels",
+          "type": "array"
+        },
+        "tokens": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tokens",
+          "type": "array"
+        }
+      },
+      "title": "CountQueryConfig",
+      "type": "object"
+    },
     "DecisionConfig": {
       "additionalProperties": false,
       "properties": {
@@ -990,6 +1031,7 @@
         "extractors": {
           "items": {
             "enum": [
+              "pattern",
               "gazetteer",
               "regex",
               "spacy",
@@ -1000,6 +1042,17 @@
           },
           "title": "Extractors",
           "type": "array"
+        },
+        "pattern_library": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatternLibraryRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "grounding": {
           "$ref": "#/$defs/GroundingConfig"
@@ -1437,6 +1490,63 @@
       "title": "IdentifierPin",
       "type": "object"
     },
+    "IndexNameConfig": {
+      "additionalProperties": false,
+      "description": "Index-name grammar: ``[<prefix>-][<deployment prefix>-]<prefix fields>-<service>-<date>``.\n\n- ``date_format`` matches the trailing date (``%Y``, ``%m``, ``%d`` and literal separators).\n- ``prefix`` (optional) is a literal every name must start with, followed by ``separator``.\n- ``deployment_prefixes`` (optional) are left-side deployment or infrastructure prefixes, tried\n  longest first; ``{n}`` stands for a run of digits (``os-data-{n}`` matches ``os-data-1``). A\n  matched prefix is recorded as the ``deployment`` attribute (``none`` when the name has none).\n- ``prefix_fields`` (default ``tenant``, ``env``) and ``service`` are the segments. A segment\n  with a vocabulary takes the **longest** vocabulary entry that fits (``query-gateway`` wins\n  over ``gateway``); a segment without one is exactly one separator-free token, so service\n  names such as ``slack_bot`` parse with the ``-`` separator.\n\nA name that does not fit the grammar, or that fits it in more than one way (with and without\na deployment prefix), is ``unparsed`` with a typed reason and ``unknown`` attributes: never a\nguess.",
+      "properties": {
+        "separator": {
+          "default": "-",
+          "maxLength": 3,
+          "minLength": 1,
+          "title": "Separator",
+          "type": "string"
+        },
+        "date_format": {
+          "default": "%Y.%m.%d",
+          "title": "Date Format",
+          "type": "string"
+        },
+        "prefix": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prefix"
+        },
+        "deployment_prefixes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Deployment Prefixes",
+          "type": "array"
+        },
+        "prefix_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Prefix Fields",
+          "type": "array"
+        },
+        "vocabularies": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Vocabularies",
+          "type": "object"
+        }
+      },
+      "title": "IndexNameConfig",
+      "type": "object"
+    },
     "IngestBudget": {
       "additionalProperties": false,
       "description": "Limits of one ingestion build (the write path), separate from the per-request limits.\n\n``max_llm_calls`` caps extraction and community-report calls of the whole build;\n``max_embedding_calls`` caps embedding provider requests (one per batch of\n``models.roles.embedder.batch_size`` chunks; reused vectors cost none); ``max_usd`` caps the\nbuild's spend across both, reserved before every call from ``budgets.price_table`` and\ncommitted with the reported usage. Exhaustion stops the stage (``budget`` category) under the\nextraction policy; nothing is downgraded or retried.",
@@ -1494,6 +1604,28 @@
           "anyOf": [
             {
               "$ref": "#/$defs/InputMapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "line_recipe": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LineRecipeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "projections": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectionsConfig"
             },
             {
               "type": "null"
@@ -1663,6 +1795,24 @@
       "title": "KuzuBackend",
       "type": "object"
     },
+    "LearningConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "patterns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatternLearningConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "LearningConfig",
+      "type": "object"
+    },
     "LexicalArm": {
       "additionalProperties": false,
       "properties": {
@@ -1692,6 +1842,186 @@
         "backend"
       ],
       "title": "LexicalArm",
+      "type": "object"
+    },
+    "LineRecipeConfig": {
+      "additionalProperties": false,
+      "description": "``ingestion.line_recipe``: the ``line`` chunk recipe (addendum \u00a73.4.2 n1). Each listed field is\ncut into one chunk per log record (records are separated by one blank line), whatever\n``chunking.size`` is, so a line-scoped fact never spans two chunks. A record longer than\n``max_chunk_chars`` is a build error, never split.",
+      "properties": {
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Fields",
+          "type": "array"
+        },
+        "max_chunk_chars": {
+          "default": 24576,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Chunk Chars",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fields"
+      ],
+      "title": "LineRecipeConfig",
+      "type": "object"
+    },
+    "LogFieldMap": {
+      "additionalProperties": false,
+      "description": "Which source fields become ``LogRecord`` fields. Only these (plus ``extra``) are requested\nthrough ``_source`` includes; ``drop_fields`` are never requested.",
+      "properties": {
+        "timestamp": {
+          "default": "@timestamp",
+          "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "message": {
+          "default": "message",
+          "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+          "title": "Message",
+          "type": "string"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Level"
+        },
+        "stack": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stack"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
+        },
+        "container": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container"
+        },
+        "file": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "File"
+        },
+        "offset": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Offset"
+        },
+        "extra": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Extra",
+          "type": "array"
+        },
+        "drop_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Drop Fields",
+          "type": "array"
+        }
+      },
+      "title": "LogFieldMap",
+      "type": "object"
+    },
+    "LogsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "partitions": {
+          "$ref": "#/$defs/PartitionsConfig"
+        },
+        "parse": {
+          "$ref": "#/$defs/ParseConfig"
+        },
+        "compose": {
+          "$ref": "#/$defs/ComposeConfig"
+        },
+        "retention": {
+          "$ref": "#/$defs/RetentionConfig"
+        },
+        "pins": {
+          "$ref": "#/$defs/PinsConfig"
+        },
+        "schedule": {
+          "$ref": "#/$defs/ScheduleConfig"
+        },
+        "settle": {
+          "$ref": "#/$defs/SettleConfig"
+        }
+      },
+      "required": [
+        "source",
+        "partitions"
+      ],
+      "title": "LogsConfig",
       "type": "object"
     },
     "LuceneBackend": {
@@ -1724,6 +2054,9 @@
           "maximum": 600,
           "title": "Timeout Seconds",
           "type": "number"
+        },
+        "records": {
+          "$ref": "#/$defs/LuceneRecordsConfig"
         }
       },
       "required": [
@@ -1731,6 +2064,44 @@
         "hosts_env"
       ],
       "title": "LuceneBackend",
+      "type": "object"
+    },
+    "LuceneRecordsConfig": {
+      "additionalProperties": false,
+      "description": "How the ``records`` facet evaluates a typed scope. ``client`` (default): the matched records are\nscanned and the operations computed in Python, bounded by ``max_matched`` (typed refusal above\nit). ``native``: the operations are compiled to aggregations on the server (no record scan);\n``matched_ids`` then holds at most ``matched_ids_cap`` ids (``matched_ids_truncated`` above it), more\nthan ``max_groups`` groups is a ``bounded`` result, and ``count_distinct`` is exact up to\n``distinct_exact_cap`` distinct values, ``approximate`` (engine ``cardinality``) above it. A query-time\nsetting: not part of the index recipe.",
+      "properties": {
+        "aggregation": {
+          "default": "client",
+          "enum": [
+            "client",
+            "native"
+          ],
+          "title": "Aggregation",
+          "type": "string"
+        },
+        "matched_ids_cap": {
+          "default": 10000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Matched Ids Cap",
+          "type": "integer"
+        },
+        "max_groups": {
+          "default": 10000,
+          "maximum": 50000,
+          "minimum": 1,
+          "title": "Max Groups",
+          "type": "integer"
+        },
+        "distinct_exact_cap": {
+          "default": 100000,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Distinct Exact Cap",
+          "type": "integer"
+        }
+      },
+      "title": "LuceneRecordsConfig",
       "type": "object"
     },
     "McpConfig": {
@@ -1901,6 +2272,17 @@
           ],
           "default": null
         },
+        "pattern_learner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "embedder": {
           "$ref": "#/$defs/EmbedderRole"
         },
@@ -1965,6 +2347,62 @@
         "database"
       ],
       "title": "MongoBackend",
+      "type": "object"
+    },
+    "MultilineConfig": {
+      "additionalProperties": false,
+      "description": "Join continuation documents (stack frames, ``Caused by:`` \u2026) onto the preceding head of the\nsame ``(container, file)`` within ``max_gap_ms``. Continuation rules are a closed built-in set\nin this slice; the pattern library's ``continuation`` kind (L2) replaces them.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "continuation": {
+          "items": {
+            "enum": [
+              "indented",
+              "java_frame",
+              "python_frame",
+              "caused_by",
+              "traceback_header",
+              "ellipsis_more"
+            ],
+            "type": "string"
+          },
+          "title": "Continuation",
+          "type": "array"
+        },
+        "max_gap_ms": {
+          "default": 2000,
+          "maximum": 600000,
+          "minimum": 0,
+          "title": "Max Gap Ms",
+          "type": "integer"
+        },
+        "max_lines": {
+          "default": 200,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Lines",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "default": 16384,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "fragment_sample_rate": {
+          "default": 0.01,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Fragment Sample Rate",
+          "type": "number"
+        }
+      },
+      "title": "MultilineConfig",
       "type": "object"
     },
     "NamedState": {
@@ -2091,6 +2529,278 @@
       "title": "PackingConfig",
       "type": "object"
     },
+    "ParseConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "workers": {
+          "default": 1,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Workers",
+          "type": "integer"
+        },
+        "batch_size": {
+          "default": 2000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_exemplars_per_signature": {
+          "default": 3,
+          "maximum": 50,
+          "minimum": 0,
+          "title": "Max Exemplars Per Signature",
+          "type": "integer"
+        },
+        "max_unparsed": {
+          "default": 2000,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Unparsed",
+          "type": "integer"
+        }
+      },
+      "title": "ParseConfig",
+      "type": "object"
+    },
+    "PartitionsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "clock": {
+          "default": "index_date",
+          "enum": [
+            "index_date",
+            "event_time"
+          ],
+          "title": "Clock",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "PartitionsConfig",
+      "type": "object"
+    },
+    "PatternEgressConfig": {
+      "additionalProperties": false,
+      "description": "What may leave the process for the ``pattern_learner`` model.\n\nOnly lines processed by the configured ``privacy`` redaction are ever sent (anything else is\nrefused, not repaired). ``allow_hosted: false`` (the default) permits only an\n``openai_compatible`` role on a loopback host. ``pseudonymise`` lists line attributes whose\nvalues are replaced by stable per-run aliases (in the attributes and in the line text) before\nthe prompt is built.",
+      "properties": {
+        "allow_hosted": {
+          "default": false,
+          "title": "Allow Hosted",
+          "type": "boolean"
+        },
+        "pseudonymise": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pseudonymise",
+          "type": "array"
+        }
+      },
+      "title": "PatternEgressConfig",
+      "type": "object"
+    },
+    "PatternGateConfig": {
+      "additionalProperties": false,
+      "description": "The deterministic validation gate a learned pattern must pass (``learning/patterns/gate.py``).",
+      "properties": {
+        "min_support": {
+          "default": 3,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Min Support",
+          "type": "integer"
+        },
+        "require_re2": {
+          "default": true,
+          "title": "Require Re2",
+          "type": "boolean"
+        },
+        "min_cluster_coverage": {
+          "default": 0.9,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Min Cluster Coverage",
+          "type": "number"
+        },
+        "max_out_of_cluster": {
+          "default": 0,
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Out Of Cluster",
+          "type": "integer"
+        }
+      },
+      "title": "PatternGateConfig",
+      "type": "object"
+    },
+    "PatternLearningConfig": {
+      "additionalProperties": false,
+      "description": "``learning.patterns``: one ``patterns learn`` run mines the unparsed lines, asks\n``pattern_learner`` about at most ``max_clusters_per_run`` clusters (each with at most\n``max_lines_per_cluster`` example lines and ``nearest_patterns`` approved patterns), gates every\nreply, writes the passing ones under the promotion policy and reports coverage before and after.\n\n**Spend.** Every call is reserved before it is sent, against the run caps\n(``max_calls_per_run``, ``max_usd_per_run``) and the persistent per-day caps\n(``max_calls_per_day``, ``max_usd_per_day``; the day is the calendar day in ``timezone``). USD\ncaps need ``budgets.price_table``; a hosted role needs both USD caps. A refused reservation stops\nthe run; nothing is retried or downgraded. The ledger is ``spend_ledger`` (default\n``<library>/.spend_ledger.sqlite``).",
+      "properties": {
+        "max_clusters_per_run": {
+          "default": 10,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Max Clusters Per Run",
+          "type": "integer"
+        },
+        "max_lines_per_cluster": {
+          "default": 8,
+          "maximum": 50,
+          "minimum": 3,
+          "title": "Max Lines Per Cluster",
+          "type": "integer"
+        },
+        "nearest_patterns": {
+          "default": 3,
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Nearest Patterns",
+          "type": "integer"
+        },
+        "max_calls_per_run": {
+          "default": 10,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Calls Per Run",
+          "type": "integer"
+        },
+        "max_calls_per_day": {
+          "default": 50,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Calls Per Day",
+          "type": "integer"
+        },
+        "max_usd_per_run": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Run"
+        },
+        "max_usd_per_day": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Day"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "spend_ledger": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Spend Ledger"
+        },
+        "git_commit": {
+          "default": false,
+          "title": "Git Commit",
+          "type": "boolean"
+        },
+        "egress": {
+          "$ref": "#/$defs/PatternEgressConfig"
+        }
+      },
+      "title": "PatternLearningConfig",
+      "type": "object"
+    },
+    "PatternLibraryRef": {
+      "additionalProperties": false,
+      "description": "``extraction.pattern_library``: the library directory of the ``pattern`` extractor.\n\nOnly ``engine``, ``max_line_bytes`` and ``mode`` enter the index recipe. The library contents,\nthe engine version and the promotion policy are build provenance (generation manifest), so a\nlibrary edit never changes the live fingerprint; it changes the extraction reuse salt instead.",
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "engine": {
+          "default": "re2",
+          "enum": [
+            "re2",
+            "regex"
+          ],
+          "title": "Engine",
+          "type": "string"
+        },
+        "max_line_bytes": {
+          "default": 8192,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Line Bytes",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "line",
+          "default": "line",
+          "title": "Mode",
+          "type": "string"
+        },
+        "promotion": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "manual"
+          ],
+          "title": "Promotion",
+          "type": "string"
+        },
+        "min_literal_chars": {
+          "default": 4,
+          "maximum": 64,
+          "minimum": 0,
+          "title": "Min Literal Chars",
+          "type": "integer"
+        },
+        "regex_timeout_ms": {
+          "default": 100,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Regex Timeout Ms",
+          "type": "integer"
+        },
+        "gate": {
+          "$ref": "#/$defs/PatternGateConfig"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "PatternLibraryRef",
+      "type": "object"
+    },
     "PgVectorConfig": {
       "additionalProperties": false,
       "description": "pgvector search. ``exact`` (default) scans with the scope in the WHERE clause; ``hnsw`` builds\nper-namespace HNSW indexes at refresh and fails the refresh when the measured filter recall\nagainst exact search is below ``min_filter_recall``.",
@@ -2153,6 +2863,27 @@
         }
       },
       "title": "PhraseBoost",
+      "type": "object"
+    },
+    "PinsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "ttl_seconds": {
+          "default": 120,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Ttl Seconds",
+          "type": "number"
+        },
+        "heartbeat_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Heartbeat Seconds",
+          "type": "number"
+        }
+      },
+      "title": "PinsConfig",
       "type": "object"
     },
     "PipelineConfig": {
@@ -2382,6 +3113,150 @@
       "title": "PrivacyConfig",
       "type": "object"
     },
+    "ProjectionsConfig": {
+      "additionalProperties": false,
+      "description": "``ingestion.projections``: which document kinds stay out of a projection, and which fields of a\nkind are embedded. Catalog and records always hold every document.",
+      "properties": {
+        "exclude_kinds": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "propertyNames": {
+            "enum": [
+              "lexical",
+              "vector",
+              "graph"
+            ]
+          },
+          "title": "Exclude Kinds",
+          "type": "object"
+        },
+        "embed_fields": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Embed Fields",
+          "type": "object"
+        }
+      },
+      "title": "ProjectionsConfig",
+      "type": "object"
+    },
+    "PullConfig": {
+      "additionalProperties": false,
+      "description": "Records-tier pull: cursor, page size, keepalive bound and stratified caps (\u00a73.1.3).",
+      "properties": {
+        "cursor": {
+          "default": "scroll",
+          "enum": [
+            "scroll",
+            "search_after"
+          ],
+          "title": "Cursor",
+          "type": "string"
+        },
+        "tiebreaker": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tiebreaker"
+        },
+        "page_size": {
+          "default": 500,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Page Size",
+          "type": "integer"
+        },
+        "keepalive": {
+          "default": "1m",
+          "title": "Keepalive",
+          "type": "string"
+        },
+        "keepalive_max": {
+          "default": "2m",
+          "title": "Keepalive Max",
+          "type": "string"
+        },
+        "records_query": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Records Query"
+        },
+        "max_docs_per_unit": {
+          "default": 20000,
+          "minimum": 1,
+          "title": "Max Docs Per Unit",
+          "type": "integer"
+        },
+        "max_docs_per_partition": {
+          "default": 500000,
+          "minimum": 1,
+          "title": "Max Docs Per Partition",
+          "type": "integer"
+        },
+        "sample_method": {
+          "default": "hourly_quota",
+          "enum": [
+            "hourly_quota",
+            "random_score"
+          ],
+          "title": "Sample Method",
+          "type": "string"
+        },
+        "seed": {
+          "default": 0,
+          "maximum": 2147483647,
+          "minimum": 0,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "max_concurrency": {
+          "default": 1,
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        },
+        "slices": {
+          "default": 1,
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Slices",
+          "type": "integer"
+        },
+        "max_restarts": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 0,
+          "title": "Max Restarts",
+          "type": "integer"
+        }
+      },
+      "title": "PullConfig",
+      "type": "object"
+    },
     "RequestConfig": {
       "additionalProperties": false,
       "properties": {
@@ -2464,6 +3339,48 @@
       "title": "RerankerRole",
       "type": "object"
     },
+    "RetentionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "keep_days": {
+          "default": 10,
+          "maximum": 3660,
+          "minimum": 1,
+          "title": "Keep Days",
+          "type": "integer"
+        },
+        "keep_generations": {
+          "default": 2,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Keep Generations",
+          "type": "integer"
+        },
+        "max_pin_wait_seconds": {
+          "default": 900,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Max Pin Wait Seconds",
+          "type": "number"
+        },
+        "pin_retry_seconds": {
+          "default": 15,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Pin Retry Seconds",
+          "type": "number"
+        },
+        "verify_sample": {
+          "default": 1000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Verify Sample",
+          "type": "integer"
+        }
+      },
+      "title": "RetentionConfig",
+      "type": "object"
+    },
     "ReviewConfig": {
       "additionalProperties": false,
       "properties": {
@@ -2493,6 +3410,20 @@
         }
       },
       "title": "ReviewConfig",
+      "type": "object"
+    },
+    "ScheduleConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "lock_ttl_seconds": {
+          "default": 3600,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Lock Ttl Seconds",
+          "type": "number"
+        }
+      },
+      "title": "ScheduleConfig",
       "type": "object"
     },
     "SelectionConfig": {
@@ -2716,6 +3647,192 @@
         }
       },
       "title": "SessionsConfig",
+      "type": "object"
+    },
+    "SettleConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_growth": {
+          "default": 0.05,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Max Growth",
+          "type": "number"
+        }
+      },
+      "title": "SettleConfig",
+      "type": "object"
+    },
+    "SourceConfig": {
+      "additionalProperties": false,
+      "description": "One read-only log source. ``kind: elasticsearch_rest`` covers Elasticsearch \u2265 7.9 and\nOpenSearch \u2265 1.0 over plain REST (older 7.x discover through ``/{expr}/_alias``).",
+      "properties": {
+        "kind": {
+          "const": "elasticsearch_rest",
+          "title": "Kind",
+          "type": "string"
+        },
+        "url_env": {
+          "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+          "title": "Url Env",
+          "type": "string"
+        },
+        "auth": {
+          "default": "none",
+          "enum": [
+            "none",
+            "basic",
+            "api_key"
+          ],
+          "title": "Auth",
+          "type": "string"
+        },
+        "username_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Username Env"
+        },
+        "password_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Password Env"
+        },
+        "api_key_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key Env"
+        },
+        "verify_tls": {
+          "default": true,
+          "title": "Verify Tls",
+          "type": "boolean"
+        },
+        "ca_bundle": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ca Bundle"
+        },
+        "indices": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Indices",
+          "type": "array"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "require_read_only_role": {
+          "default": false,
+          "title": "Require Read Only Role",
+          "type": "boolean"
+        },
+        "mapping": {
+          "$ref": "#/$defs/LogFieldMap"
+        },
+        "index_name": {
+          "$ref": "#/$defs/IndexNameConfig"
+        },
+        "multiline": {
+          "$ref": "#/$defs/MultilineConfig"
+        },
+        "counts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CountQueryConfig"
+          },
+          "title": "Counts",
+          "type": "object"
+        },
+        "pull": {
+          "$ref": "#/$defs/PullConfig"
+        },
+        "limits": {
+          "$ref": "#/$defs/SourceLimits"
+        },
+        "max_line_bytes": {
+          "default": 8192,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Line Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "url_env",
+        "indices"
+      ],
+      "title": "SourceConfig",
+      "type": "object"
+    },
+    "SourceLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "requests_per_second": {
+          "default": 2.0,
+          "exclusiveMinimum": 0,
+          "maximum": 50,
+          "title": "Requests Per Second",
+          "type": "number"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 300,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "max_response_bytes": {
+          "default": 67108864,
+          "maximum": 536870912,
+          "minimum": 1024,
+          "title": "Max Response Bytes",
+          "type": "integer"
+        },
+        "max_context_per_partition": {
+          "default": 200,
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Context Per Partition",
+          "type": "integer"
+        }
+      },
+      "title": "SourceLimits",
       "type": "object"
     },
     "SqlAlchemyBackend": {
@@ -3230,6 +4347,27 @@
     },
     "actions": {
       "$ref": "#/$defs/ActionsConfig"
+    },
+    "sources": {
+      "additionalProperties": {
+        "$ref": "#/$defs/SourceConfig"
+      },
+      "title": "Sources",
+      "type": "object"
+    },
+    "learning": {
+      "$ref": "#/$defs/LearningConfig"
+    },
+    "logs": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LogsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

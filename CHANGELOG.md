@@ -7,6 +7,131 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Log features
+
+- **LLM pattern learning** (addendum A1, slice L4b). `su-multi-arm patterns learn` runs one loop:
+  mine the unparsed lines, ask `models.roles.pattern_learner` (Anthropic, OpenAI or
+  `openai_compatible`, structured output) for one proposal per cluster, gate it deterministically,
+  write it under `extraction.pattern_library.promotion`, and report coverage before and after.
+  `patterns propose` writes proposals to `proposed.yaml` only. `--dry-run` sends, spends and writes
+  nothing; `--max-usd` lowers the run cap.
+  - Egress policy (`learning.patterns.egress`): only lines processed by the configured `privacy`
+    redaction leave the process, a residual e-mail/IP/token shape refuses the run before any call,
+    `pseudonymise` attributes become per-run aliases, and a hosted role needs `allow_hosted: true`.
+  - Spend caps per run and per calendar day (`max_calls_*`, `max_usd_*`), reserved before every call;
+    the day caps are kept in a SQLite spend ledger. No retries.
+  - The gate gains `cluster_coverage`, `out_of_cluster` (absolute over-breadth bound, default 0)
+    and `fix_target`. A passing fix of a learned pattern is written as `supersede`.
+  - Human decisions `patterns promote|deprecate|disable <id>` (CLI only, recorded in
+    `decisions.yaml`). A human disable or edit always wins; the system never writes `library.yaml`.
+  - Optional git commit of the system files (`learning.patterns.git_commit`), refused while a system
+    file has uncommitted hand edits.
+  - Evidence: synthetic lines with a scripted fake provider only (docs/VALIDATION.md).
+- **Index-name grammar** (`sources.<name>.index_name`). Optional `prefix`, optional
+  `deployment_prefixes` (`{n}` = digits; recorded as the `deployment` attribute) and vocabularies for
+  any segment. A name that does not fit exactly once is `unparsed` with a typed `reason`.
+- **Configuration.** New keys `learning.patterns`, `models.roles.pattern_learner`,
+  `extraction.pattern_library.gate.min_cluster_coverage` / `max_out_of_cluster`, and the
+  `index_name` grammar keys; the config schema is regenerated.
+
+### Changed
+
+- **Index-name parsing no longer guesses.** A segment without a vocabulary is exactly one token, so a
+  multi-token tenant (previously "the first prefix field keeps extra separators") now needs a tenant
+  vocabulary, and a name with an undeclared left-side prefix is `unparsed` instead of being read
+  into the tenant.
+
+### Added
+
+- **Read-only log sources (`sources:`; addendum A1 slices L0 and L1).**
+  - Component kind `source` and the `elasticsearch_rest` adapter (Elasticsearch ≥ 7.9, OpenSearch
+    ≥ 1.0) behind an exact allow-list transport, which refuses every non-listed request before any
+    I/O.
+  - A `_has_privileges` read-only self-check (`require_read_only_role`).
+  - Discovery with the `_alias` fallback, and per-index count queries built from the mapping
+    (basis `level_field` or `token_match`).
+  - Scroll and `search_after` pulls with close hygiene and stratified caps (`hourly_quota`,
+    `random_score`).
+  - Index-name parsing by service vocabulary, longest suffix first.
+  - `LogRecord` mapping and multiline assembly.
+  - `su-multi-arm sources check|discover|count|probe`.
+  - Synthetic fixtures: a deterministic log generator, a fake cluster and a ReDoS corpus.
+  - Evidence: synthetic and contract-mocked only (docs/VALIDATION.md).
+
+- **`pattern` extractor** (addendum A1, slice L2). Set `extraction.extractors: [pattern, …]` with
+  `extraction.pattern_library`. It has:
+  - an explicit `re2` engine (extra `patterns`) or the `regex` development engine (extra
+    `patterns-lite`), with no fallback between them;
+  - an RE2-subset validator and ReDoS lint;
+  - a four-file library: human `library.yaml`, plus system-owned and append-only `learned.yaml`,
+    `proposed.yaml` and `decisions.yaml`;
+  - a loader with owner precedence and decisions replay (a human `disable` is final);
+  - an RE2 `Set` prefilter;
+  - line-scoped facts, header-scoped `native_link` attribute links, and residue composition when listed
+    first;
+  - a CAS-safe writer for the system files;
+  - the read-only CLI `patterns lint|coverage|mine`.
+- **Pattern provenance.** Generation manifests record `pattern_provenance` and a content-addressed
+  library snapshot. Extraction reuse keys of the `pattern` extractor carry a salt derived from the
+  library, so library changes re-extract while index fingerprints stay unchanged. Other extractors keep
+  their keys.
+- **Pattern learning, deterministic part** (slice L4a). It adds:
+  - a Drain-style template miner with bounded memory;
+  - a regex synthesiser;
+  - bootstrap coverage without an LLM;
+  - the validation gate;
+  - `pattern_library.promotion: auto | manual` (default `auto`).
+- **Configuration.** New keys `extraction.pattern_library` and `extraction.extractors: pattern`; the
+  config schema is regenerated. Configs that do not select `pattern` keep their index fingerprint.
+- **Daily log partitions and compose (`logs:`; addendum A1 slice L3a).**
+  - A partition store per source and day (`ingestion/partitions.py`): resumable atomic units, sealed
+    immutable versions, `reparse`/`repull` as `v+1`, tombstones.
+  - Partition-stage parsing with an optional spawn process pool, signature and unit aggregates with
+    row exactness, hourly co-firing cells, exemplars and the unparsed queue.
+  - Compose of the window into a generation with a library identity check (stale partitions are
+    reparsed first) and a compose identity (unchanged windows are not rebuilt); per-day and window
+    documents with a rendered `header` field.
+  - `logs run-daily|backfill|settle|compose` under a schedule lock separate from the write lease.
+    Pulling refuses a mapping without a redactor; the CLI has none until slice B11, so the three
+    pulling commands refuse today.
+  - Partition clocks `index_date` and `event_time` (a reporting day in `logs.timezone`, DST-aware,
+    read from every UTC index day it overlaps).
+  - Write path: the `line` chunk recipe (`ingestion.line_recipe`), projection exclusions
+    (`ingestion.projections`), `manifest_extra`. Both keys enter the index recipe only when set.
+- **Retention (`logs.retention`, `logs.pins`; slice L3b).** Rule (a) `gc` of every generation that
+  lists an expired day, cross-process pins with TTL on the file (sqlite sidecar), memory, SQL and
+  PostgreSQL registries, per-process heartbeat pins, ledger tags / `ledger_refs` / `purge` on the
+  memory, sqlite, sqlalchemy, postgres and mongodb ledgers, cache invalidation, session expiry,
+  audit records, `retention report|verify|run` with a content-based verifier. `logs` is refused on
+  MongoDB and Elasticsearch catalogs (no pins).
+- `scripts/compose_scale.py`: the compose scale benchmark (synthetic aggregate rows on SQLite).
+
+- **Native aggregation pushdown for the `opensearch` and `elasticsearch` records facets.**
+  - New `backends.<name>.records` block: `aggregation: client | native` (default `client`, unchanged
+    behaviour and fingerprints), `matched_ids_cap`, `max_groups`, `distinct_exact_cap`. It is a
+    query-time setting and is excluded from the index recipe.
+  - Under `native`, scope operations compile to server-side aggregations (`backends/_lucene_aggs.py`):
+    - `track_total_hits` for counts;
+    - `composite` paging for groups and cross-tabs (nulls via `missing_bucket`);
+    - `date_histogram` with the schema `time_zone` for calendar groups and buckets;
+    - a count-ordered `terms` request for `top_n`/`nth`, trusted only when the engine reports
+      `doc_count_error_upper_bound: 0` (OpenSearch 3.x concurrent segment slices report an error);
+    - `filters` for periods;
+    - `filter` sub-aggregations for share numerators and null counts;
+    - `stats` for sum/avg/min/max and `top_hits` for first/last seen;
+    - exact `count_distinct` by pair paging, with `cardinality` above the cap labelled `approximate`.
+    The ACL is the query of every aggregation request, and nothing is scanned or `max_matched`-bound.
+  - `ScopeResult.matched_ids_truncated` (additive, default `false`): under `native`, `matched_ids` is
+    the first `matched_ids_cap` ids and the flag says more matched. The structured arm passes it on
+    as `document_ids_truncated` (kept out of the prompt). `AggregateEvidence.empty()` also requires
+    `total == 0`.
+  - More than `max_groups` groups is a `bounded` result. A group key that the index keeps apart but
+    Python equates is a typed `BackendError`.
+  - Conformance: new kit `testing/aggregation_parity.py` (client/native parity, ACL isolation,
+    native caps). The records kit also runs natively (`opensearch_native`, `elasticsearch_native`).
+    Results are identical on OpenSearch 2.19.1, 3.9.0 and Elasticsearch 8.17.4.
+  - `scripts/bench_native_aggregation.py` measures client and native latency (docs/VALIDATION.md).
+
 ## [2.0.0a3] - 2026-11-04
 
 Owner decisions on the answer contract and Anthropic defaults, fixes for the local-model QA findings

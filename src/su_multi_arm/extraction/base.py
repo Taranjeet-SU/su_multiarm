@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -62,6 +63,10 @@ class ExtractionResult:
     output: ExtractionOutput
     raw_replies: list[RawReply] = field(default_factory=list)
     calls: int = 0
+    routing: dict[str, Any] = field(default_factory=dict)  # per-unit routing (pattern residue composition)
+
+
+LOG = logging.getLogger(__name__)
 
 
 # Recipe keys earlier releases hashed that the config no longer carries, with the value they always
@@ -82,6 +87,12 @@ class BuiltinExtractor:
         self._support = PredicateSupport(config.stemmer_language, config.predicate_triggers)
         self._spacy = None
         self._gliner = None
+        self._pattern = None
+        if config.pattern_library is not None:
+            from .patterns.extractor import PatternExtractor
+
+            # Lazy: the library files are read on first extraction (never by serving).
+            self._pattern = PatternExtractor(config.pattern_library, self._support, self.recipe_fingerprint)
 
     # --- component contract ------------------------------------------------------------------
 
@@ -93,10 +104,43 @@ class BuiltinExtractor:
             diagnostics.append(Diagnostic(severity="error", code="empty_gazetteer_entry", message="gazetteer entries cannot be empty", component=self.name))
         if any(e in self.cfg.extractors for e in ("gliner", "llm")) and not self.cfg.labels:
             diagnostics.append(Diagnostic(severity="error", code="labels_missing", message="gliner/llm extraction needs extraction.labels", component=self.name))
+        if self._pattern is not None:
+            diagnostics.extend(self._validate_pattern(probe))
         return diagnostics
+
+    def _validate_pattern(self, probe: bool) -> list[Diagnostic]:
+        """The engine must be installed (no fallback) and the directory must exist. The library files
+        are read and linted only under ``probe`` (``doctor --probe``) and at the start of every build."""
+        from .patterns.engine import PatternEngineUnavailable
+        from .patterns.library import PatternLibraryError
+
+        ref = self.cfg.pattern_library
+        found = []
+        try:
+            self._pattern.engine()
+        except PatternEngineUnavailable as exc:
+            found.append(Diagnostic(severity="error", code="pattern_engine_unavailable", message=str(exc), component=self.name, path="extraction.pattern_library.engine"))
+        if ref.engine == "regex":
+            found.append(Diagnostic(severity="warning", code="pattern_engine_nondeterministic", message="the regex engine is a development fallback; timeouts make results non-deterministic", component=self.name, path="extraction.pattern_library.engine"))
+        if not ref.path.is_dir():
+            found.append(Diagnostic(severity="error", code="pattern_library_missing", message=f"pattern library directory {ref.path} does not exist", component=self.name, path="extraction.pattern_library.path"))
+        if probe and not any(d.severity == "error" for d in found):
+            try:
+                library = self._pattern.load().library
+                for issue in library.issues:
+                    if issue.severity != "info":
+                        found.append(Diagnostic(severity="warning", code=f"pattern_{issue.code}", message=issue.render(), component=self.name, path="extraction.pattern_library"))
+            except PatternLibraryError as exc:
+                found.append(Diagnostic(severity="error", code="pattern_library_lint", message=str(exc), component=self.name, path="extraction.pattern_library"))
+        return found
 
     def recipe_fingerprint(self) -> str | None:
         data = self.cfg.model_dump(mode="json")
+        # Omitted while unset (2.0.0a1/a2 golden fingerprints); when set only its static options
+        # enter (engine kind, max_line_bytes, mode): library contents are provenance, not recipe.
+        library = data.pop("pattern_library", None)
+        if library is not None:
+            data["pattern_library"] = self.cfg.pattern_library.recipe()
         # 2.0.0a1 hashed ``ontology`` (always ``None`` when unused). 2.0.0a2 refuses the key, so it
         # is pinned here: a removed key must not change the index fingerprint (a2 review B2).
         for key, value in A1_RECIPE_KEYS.items():
@@ -107,6 +151,21 @@ class BuiltinExtractor:
 
     def prompt_sha(self) -> str:
         return hashlib.sha256(self.prompt.encode()).hexdigest()
+
+    def reuse_salt(self) -> str:
+        """Extraction reuse salt (addendum §3.4.3): ``""`` unless the ``pattern`` extractor is
+        selected, then the sha of the library provenance and applied decisions. Never part of the
+        recipe or index fingerprint."""
+        return self._pattern.reuse_salt() if self._pattern is not None else ""
+
+    def prepare_build(self) -> dict[str, Any] | None:
+        """Called once at the start of a build: (re)load the library files so the build uses the
+        library as it is now. Returns the pattern provenance and snapshot, or ``None`` without the
+        ``pattern`` extractor. A lint error raises ``PatternLibraryError`` before anything is written."""
+        if self._pattern is None:
+            return None
+        compiled = self._pattern.load()
+        return {"provenance": compiled.provenance(), "snapshot": compiled.snapshot(), "salt": compiled.reuse_salt()}
 
     def run(self, ctx: Any, inputs: ExtractionInput) -> ExtractionResult:
         return self.extract(inputs)
@@ -139,8 +198,28 @@ class BuiltinExtractor:
             canonical = entity_key(kind, name)
             return Entity(id=mention_id(canonical, span), name=name, type=kind, span=span, canonical_id=canonical)
 
-        for extractor in cfg.extractors:
-            if extractor == "gazetteer":
+        source_text = text
+        routing: dict[str, Any] = {}
+        residue = False
+        for position, extractor in enumerate(cfg.extractors):
+            if extractor == "pattern":
+                found_patterns = self._pattern.extract(chunk, inputs.document)
+                for entity in found_patterns.entities:
+                    add(entity)
+                relations.extend(found_patterns.relations)
+                routing.update(found_patterns.routing)
+                if position == 0 and len(cfg.extractors) > 1:
+                    # Residue composition (N8): later extractors see only the lines the library did
+                    # not parse (parsed lines blanked, offsets kept); nothing left -> they are skipped.
+                    residue = True
+                    routing["residue_only"] = True
+                    routing["residue_to"] = [] if found_patterns.residue_empty else list(cfg.extractors[1:])
+                    if found_patterns.residue_empty:
+                        break
+                    text = found_patterns.residue_text
+                    chunk = chunk.model_copy(update={"text": text})
+                    inputs = ExtractionInput(chunk=chunk, document=inputs.document, chunks=inputs.chunks, budget=inputs.budget)
+            elif extractor == "gazetteer":
                 seen: set[str] = set()
                 for kind, names in cfg.gazetteer.items():
                     for name in names:
@@ -202,11 +281,18 @@ class BuiltinExtractor:
                     raise
             else:
                 raise ExtractionFailure("schema", chunk.id, f"unknown extractor {extractor!r}")
+        if residue:
+            # A later extractor's match must not reach into a blanked line: every span on this chunk
+            # must still be the verbatim source text (fail closed, never repaired).
+            for span in [e.span for e in mentions.values()] + [r.span for r in relations]:
+                if span.chunk_id == chunk.id and span.field == chunk.field and source_text[span.start - chunk.start : span.end - chunk.start] != span.text:
+                    raise ExtractionFailure("grounding", chunk.id, "a residue extractor matched across a parsed line", raw_replies)
+            LOG.debug("extraction routing %s: %s", chunk.id, routing)
         try:
             output = ExtractionOutput(entities=list(mentions.values()), relations=relations)
         except ValidationError as exc:
             raise ExtractionFailure("endpoint_not_in_span", chunk.id, str(exc), raw_replies) from None
-        return ExtractionResult(output=output, raw_replies=raw_replies, calls=calls)
+        return ExtractionResult(output=output, raw_replies=raw_replies, calls=calls, routing=routing)
 
     def _call_model(self, inputs: ExtractionInput) -> tuple[Extraction, RawReply]:
         chunk = inputs.chunk

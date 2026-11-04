@@ -338,6 +338,22 @@ def rank_groups(scope: ScopeSpec, groups: list[GroupRow]) -> tuple[list[GroupRow
     return kept, ties
 
 
+def order_groups(scope: ScopeSpec, groups: list[GroupRow]) -> tuple[list[GroupRow], list[GroupRow], dict[str, Any]]:
+    """``(groups, ties, value)`` of a grouped scope: groups by count (key ascending on ties), then
+    the scope's group-field sort or measure ranking (``rank_groups``); ``value`` maps the joined key
+    to the group value. Shared by the client path and the native aggregation path."""
+    groups = sorted(groups, key=lambda g: (-g.count, _key_repr(g)))
+    ties: list[GroupRow] = []
+    if scope.sort and scope.sort.field in scope.group_by:
+        field = scope.sort.field
+        groups.sort(key=lambda g: repr(g.key.get(field)), reverse=scope.sort.descending)
+        if scope.top_n:
+            groups = groups[: scope.top_n]
+    elif scope.order is not None or scope.top_n is not None or scope.nth is not None:
+        groups, ties = rank_groups(scope, groups)
+    return groups, ties, {"|".join(str(k) for k in g.key.values()): g.value for g in groups}
+
+
 def _numerator_rows(scope: ScopeSpec, matched: list[StructuredRecord], schema: MetadataSchema, unsupported: list) -> list[StructuredRecord] | None:
     rows = matched
     for predicate in scope.numerator:
@@ -461,14 +477,7 @@ def scope_result(
             missing += group_missing
             share = (len(rows) / len(matched)) if scope.with_share and matched else None
             groups.append(GroupRow(key=dict(zip(scope.group_by, key)), value=group_value, count=len(rows), share=share))
-        groups.sort(key=lambda g: (-g.count, _key_repr(g)))
-        if scope.sort and scope.sort.field in scope.group_by:
-            groups.sort(key=lambda g: repr(g.key.get(scope.sort.field)), reverse=scope.sort.descending)
-            if scope.top_n:
-                groups = groups[: scope.top_n]
-        elif scope.order is not None or scope.top_n is not None or scope.nth is not None:
-            groups, ties = rank_groups(scope, groups)
-        value = {"|".join(str(k) for k in g.key.values()): g.value for g in groups}
+        groups, ties, value = order_groups(scope, groups)
     elif _numerator_share(scope):
         rows = _numerator_rows(scope, matched, schema, unsupported) if scope.numerator else None
         numerator = None if rows is None else len(rows)

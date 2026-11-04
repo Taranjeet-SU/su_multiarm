@@ -99,6 +99,8 @@ class _State:
         self.ledger: dict[str, list[LedgerEntry]] = {}
         self.status: dict[str, str] = {}
         self.raw: dict[str, RawReply] = {}
+        self.raw_tags: dict[str, set[str]] = {}
+        self.refs: dict[str, set[str]] = {}
         self.sessions: dict[str, SessionRecord] = {}
         self.session_lock = threading.Lock()
         self.max_matched = MAX_MATCHED_DEFAULT  # same typed cap as every records adapter
@@ -481,11 +483,57 @@ class MemoryLedger(_Facet):
     def status(self, job_id: str) -> str | None:
         return self._s.status.get(job_id)
 
-    def put_raw(self, key: str, raw_reply: str, valid: bool) -> None:
+    def put_raw(self, key: str, raw_reply: str, valid: bool, tags: Sequence[str] = ()) -> None:
         self._s.raw[key] = RawReply(key=key, raw_reply=raw_reply, valid=valid)
+        if tags:
+            self.tag_raw(key, tags)
 
     def get_raw(self, key: str) -> RawReply | None:
         return self._s.raw.get(key)
+
+    # retention (``extras.LedgerRetention``) ----------------------------------------------------
+    def tag_raw(self, key: str, tags: Sequence[str]) -> None:
+        if key not in self._s.raw:
+            raise BackendError(KIND, "tag_raw", f"unknown raw entry {key}")
+        self._s.raw_tags.setdefault(key, set()).update(tags)
+
+    def raw_tags(self, key: str) -> list[str]:
+        return sorted(self._s.raw_tags.get(key, ()))
+
+    def tagged(self, tag: str) -> list[str]:
+        return sorted(k for k, tags in self._s.raw_tags.items() if tag in tags)
+
+    def add_refs(self, generation: str, keys: Sequence[str]) -> None:
+        self._s.refs.setdefault(generation, set()).update(keys)
+
+    def refs(self, generation: str) -> list[str]:
+        return sorted(self._s.refs.get(generation, ()))
+
+    def referencing_generations(self) -> list[str]:
+        return sorted(g for g, keys in self._s.refs.items() if keys)
+
+    def purge(self, spec: Any) -> dict[str, int]:
+        dropped = sum(len(self._s.refs.pop(g, ())) for g in spec.drop_refs_of)
+        doomed = {k for tag in spec.tags for k in self.tagged(tag)}
+        tagged = len(doomed)
+        referenced = set().union(*self._s.refs.values()) if self._s.refs else set()
+        unreferenced = {k for k in self._s.raw if k not in doomed and k not in referenced and not self._s.raw_tags.get(k) and any(k.startswith(p) for p in spec.unreferenced_prefixes)}
+        for key in doomed | unreferenced:
+            self._s.raw.pop(key, None)
+            self._s.raw_tags.pop(key, None)
+        return {"refs_dropped": dropped, "tagged": tagged, "unreferenced": len(unreferenced)}
+
+    def drop_job(self, job_id: str) -> int:
+        entries = self._s.ledger.pop(job_id, [])
+        self._s.status.pop(job_id, None)
+        return len(entries)
+
+    def jobs(self) -> list[str]:
+        return sorted(self._s.ledger)
+
+    def raw_entries(self, prefix: str, after: str | None, limit: int) -> list[RawReply]:
+        keys = sorted(k for k in self._s.raw if k.startswith(prefix) and (after is None or k > after))
+        return [self._s.raw[k] for k in keys[:limit]]
 
 
 class MemorySessions(_Facet):

@@ -18,6 +18,8 @@ Use `Config.model_json_schema()` to regenerate the schema after changing public 
 | `spacy` | spaCy; separately install a licensed language pipeline |
 | `gliner` | GLiNER; downloads the configured model on first use |
 | `communities` | NetworkX Louvain |
+| `patterns` | `google-re2` for the `pattern` extractor's `re2` engine (linear-time matching, `Set` prefilter) |
+| `patterns-lite` | the `regex` package for the `pattern` extractor's development `regex` engine |
 | `api` | FastAPI/Uvicorn |
 | `mcp` | official MCP Python SDK, stdio and streamable-HTTP transports |
 | `mongodb` | PyMongo for the `mongodb` backend |
@@ -248,8 +250,8 @@ names its own backend. In this release the engine wires these kinds on the froze
 | `postgres` (extra `postgres`, psycopg 3; pgvector for vectors) | `catalog`, `lexical`, `vector`, `records`, `cache`, `ledger`, `session` | `dsn_env` (environment variable holding the DSN; never the DSN itself), `table_prefix`, `text_search_config` (default `english`), `vector` (`index: exact\|hnsw`, `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `min_filter_recall`, default 0.95), `timeout_seconds` (connect timeout and `statement_timeout`). **One schema per generation**, `<prefix>_<dataset>_<generation>` when that fits PostgreSQL's 63-byte identifier limit and the dataset is a lowercase identifier, otherwise `<prefix>_g<sha256(dataset/generation)[:20]>`; it holds documents, chunks, typed field rows (native `double precision` and `timestamptz` columns), records, the FTS table and the pgvector tables, and `delete_generation` is one `DROP SCHEMA ... CASCADE`. Schema `<prefix>` holds `generations` (dataset, generation, schema name, text-search configuration, metadata schema), `meta` (the `CURRENT` pointer row, replaced by a single-row upsert only by `activate`; failed builds write `failure:<gen>` and never touch it; manifests), `cache`, `ledger`, `jobs`, `raw_replies`, `sessions`. The write lock is a session-level `pg_try_advisory_lock` (held = typed error, never a wait). Typed scope, ACL predicates and id allow/deny lists compile to bound-parameter `EXISTS` subqueries; temporal values compare as UTC instants (naive = UTC, dates by calendar day); `values` is `SELECT DISTINCT` under `max_values_cardinality` (10000; more is a typed error). Lexical: title and body `tsvector`s built with the generation's recorded configuration (`analyzer_id` `pg_ts_<config>`); terms = any term, `phrase` = `phraseto_tsquery` per column, `boolean` = terms plus `must` phrases minus `must_not` phrases; every user token is a bound parameter, never tsquery syntax; scores are `2*ts_rank_cd(title)+ts_rank_cd(body)`, **not BM25**; stop words never match and stemming conflates inflections (FTS5 differs). Vector: L2-normalised, inner product = cosine; **exact** by default (scope in the `WHERE` clause, order `(distance, chunk_id)`); `vector.index: hnsw` builds a partial HNSW index per namespace at `refresh` and then measures recall@10 of the forced index path against exact search (unfiltered and with an allow-list filter); below `min_filter_recall` the refresh fails with a typed error so that build never activates; HNSW searches use `hnsw.iterative_scan = strict_order` (pgvector >= 0.8). Up to 2000 dimensions with HNSW, 16000 exact. `graph` is `planned`. |
 | `sqlalchemy` (extra `sql`, SQLAlchemy 2 + driver) | `catalog`, `records`, `cache`, `ledger`, `session` | `url_env` (environment variable holding the SQLAlchemy URL, e.g. `sqlite:///state/rel.db` or `postgresql+psycopg://...`), `table_prefix`, `timeout_seconds`. SQLAlchemy Core only (portable types, delete+insert instead of dialect upserts). Per generation: tables `<prefix>_<token>_{docs,chunks,dfields,records,rfields}` with `token = sha256(dataset/generation)[:12]` (the readable name does not fit the 63/64-byte identifier limits; `<prefix>_generations` maps it); runtime tables `<prefix>_{generations,meta,cache,ledger,jobs,raw_replies,sessions}`; `CURRENT` pointer row replaced in one transaction only by `activate`; write lock = lease row (held = typed error; a lease older than 600 s is taken over). Temporal values are stored as UTC epoch seconds (no portable timezone-aware type). Ids are limited to 512 characters (typed error beyond). **Tested dialects: SQLite and PostgreSQL** (the conformance kit runs on both); any other dialect builds and `ping()` reports `dialect_tested: false` — MySQL/MariaDB in particular compare text with the column collation (usually case-insensitive), which would change `eq`. `lexical` and `vector` are dialect-specific and `planned`; configuration naming them is rejected. |
 | `mongodb` (extra `mongodb`, pymongo) | `catalog`, `lexical`, `records`, `cache`, `ledger`, `session` | `uri_env` (environment variable holding the connection URI; never the URI itself), `database`, `collection_prefix`, `timeout_seconds` (server selection, connect and socket timeouts). Per generation: `<prefix>_<dataset>_<generation>_{documents,chunks,lexical,records}` collections; `<prefix>_generations` lists known generations with their metadata schema; `<prefix>_{cache,ledger,jobs,raw_replies,sessions}` are prefix-wide; `<prefix>_meta` holds the generation pointer (`_id: CURRENT`, replaced atomically only by `activate`; failed builds write `failure:<gen>` and never touch it), manifests and the write lease. Typed scope, ACL predicates and id allow/deny lists are pushed down as query predicates over typed field rows (temporal values stored as UTC instants under the shared rule: aware stamps converted, naive `assume_utc` stamps and dates read as UTC, `date` fields compared by UTC calendar day); `exists` is one `find_one`; `values` groups distinct values server-side under `max_values_cardinality` (default 10000, exceeding it is a typed error, never a truncated list). Lexical search uses the server's `english` text index (`analyzer_id: mongo_text_english`): phrase and `must`/`must_not` are supported, scores are MongoDB `textScore` values and **not BM25**, so no score parity with other engines is claimed. The cache has a server-side TTL index on top of the clock-based expiry; sessions get a TTL index only when the backend is built with `session_ttl_seconds` (Python API). No `graph`; `vector` stays `planned` because MongoDB vector search exists only on Atlas and is not verified here, so a config naming `(mongodb, vector)` is rejected. |
-| `opensearch` | `catalog`, `lexical`, `vector`, `records` | `hosts_env` (environment variable holding one or more comma-separated `http(s)://host:port` URLs), `index_prefix`, `knn: {method: exact|hnsw, exact_rescore: true}`, `timeout_seconds`. Needs `pip install 'su-multi-arm[opensearch]'` (`opensearch-py`); OpenSearch 2.x or 3.x (`probe` refuses other majors and other distributions; tested on 2.19.1 and 3.9.0). Per generation three indices `<index_prefix>_<dataset>_<generation>_{docs,chunks,records}` (one shard, strict mappings tagged with the adapter's mapping version); dataset aliases `<index_prefix>_<dataset>_{docs,chunks,records}` are switched atomically by `OpenSearchBackend.activate(gen)`, and `delete_generation` refuses the generation an alias serves. Datasets must match `[a-z0-9][a-z0-9_-]*` (index names are never mangled). See "OpenSearch semantics" below. |
-| `elasticsearch` | `catalog`, `lexical`, `vector`, `records` | Same options as `opensearch` (`hosts_env`, `index_prefix`, `knn`, `timeout_seconds`); needs `pip install 'su-multi-arm[elasticsearch]'` (official `elasticsearch` 8.x client) and an Elasticsearch 8.x server (other majors and OpenSearch are refused by `probe`). The adapter is the OpenSearch adapter's classes over `backends/_lucene_common.py` with the engine-specific parts replaced: transport, probe, `dense_vector` fields (exact: `index: false` + `script_score` cosine; `knn.method: hnsw`: float HNSW without quantisation, candidates from the top-level `knn` search with the scope as pre-filter, then the same exact rescore), and no `index.knn` setting. Same three indices per generation, same dataset aliases switched atomically by `activate(gen)`, same typed-field pushdown, lexical and records semantics as the section below. `generation_registry()` (what the write path needs to own `storage.catalog`) keeps manifests, failure records and the ingestion lock in `<index_prefix>__registry` and resolves `CURRENT` through the `docs` alias. |
+| `opensearch` | `catalog`, `lexical`, `vector`, `records` | `hosts_env` (environment variable holding one or more comma-separated `http(s)://host:port` URLs), `index_prefix`, `knn: {method: exact|hnsw, exact_rescore: true}`, `timeout_seconds`, `records: {aggregation: client|native, matched_ids_cap: 10000, max_groups: 10000, distinct_exact_cap: 100000}` (query-time; not part of the index recipe; see "Records aggregation" below). Needs `pip install 'su-multi-arm[opensearch]'` (`opensearch-py`); OpenSearch 2.x or 3.x (`probe` refuses other majors and other distributions; tested on 2.19.1 and 3.9.0). Per generation three indices `<index_prefix>_<dataset>_<generation>_{docs,chunks,records}` (one shard, strict mappings tagged with the adapter's mapping version); dataset aliases `<index_prefix>_<dataset>_{docs,chunks,records}` are switched atomically by `OpenSearchBackend.activate(gen)`, and `delete_generation` refuses the generation an alias serves. Datasets must match `[a-z0-9][a-z0-9_-]*` (index names are never mangled). See "OpenSearch semantics" below. |
+| `elasticsearch` | `catalog`, `lexical`, `vector`, `records` | Same options as `opensearch` (`hosts_env`, `index_prefix`, `knn`, `timeout_seconds`, `records`); needs `pip install 'su-multi-arm[elasticsearch]'` (official `elasticsearch` 8.x client) and an Elasticsearch 8.x server (other majors and OpenSearch are refused by `probe`). The adapter is the OpenSearch adapter's classes over `backends/_lucene_common.py` with the engine-specific parts replaced: transport, probe, `dense_vector` fields (exact: `index: false` + `script_score` cosine; `knn.method: hnsw`: float HNSW without quantisation, candidates from the top-level `knn` search with the scope as pre-filter, then the same exact rescore), and no `index.knn` setting. Same three indices per generation, same dataset aliases switched atomically by `activate(gen)`, same typed-field pushdown, lexical and records semantics as the section below. `generation_registry()` (what the write path needs to own `storage.catalog`) keeps manifests, failure records and the ingestion lock in `<index_prefix>__registry` and resolves `CURRENT` through the `docs` alias. |
 | `neo4j` (extra `neo4j`, official driver) | `graph` (with `memberships`) | `uri`, `user`, `password_env` (environment variable holding the password; never the password itself), `database`, `namespace` (default `su_multi_arm`; letters, digits, `_`, `.`, `-`), `timeout_seconds` (connection, pool acquisition and per-transaction timeout). Fixed labels; every node and edge carries the generation key `g = <namespace>\|<dataset>\|<generation>`, so namespaces and generations never touch each other. Mentions are `SuGraphMention` nodes (span offsets, quote, match level, canonical id, aliases), entities `SuGraphEntity` nodes, relations one relationship type per edge kind (`SU_FACT`, `SU_CO_OCCURRENCE`, ...) carrying predicate, `edge_kind`, `support`, status, span, provenance and every occurrence; communities are `SuGraphCommunity` nodes with their report, memberships `SuGraphMembership` nodes. Loads are `MERGE`-idempotent and one explicit transaction per call (a dangling relation endpoint or any server error rolls the whole call back; never retried). Traversal runs only fixed parameterised Cypher templates, one statement per hop, `fact` edges unless other kinds are requested, the hop bound a validated integer 0..3. Eligibility is pushed down as a document-id allow/deny list only (`predicate_scope: false`): the graph and community arms first resolve request filters and ACL predicates to document ids through the catalog (at most 10000 eligible documents; more is a typed error, never a truncated list). `<namespace>\|<dataset>` has one `SuGraphPointer` node naming the active generation; the write path moves it just before the authoritative `CURRENT` switch, moves it back if that switch fails, and a failed load never reaches it; `delete_generation` refuses the generation it names. Needs Neo4j 5.23 or later (scoped `CALL` subqueries); tested on 5.26 community. No catalog: `storage.catalog` must name another backend. |
 | `kuzu` (extra `kuzu`, embedded) | `graph` (with `memberships`) | `path` (database file, relative to the config; default `state/graph.kuzu`), `mode: native\|attach`, `namespace`, `timeout_seconds` (per-query timeout), `buffer_pool_mb`. **`native`**: the package's own embedded store with the same contract and semantics as `neo4j` (fixed tables `SuGraphEntity`/`SuGraphMention`/`SuGraphMembership`/`SuGraphCommunity`/`SuGraphGeneration`/`SuGraphPointer`, one relationship table per edge kind, every row keyed by `g = <namespace>\|<dataset>\|<generation>`; `MERGE`-idempotent loads in one explicit transaction; fixed parameterised Cypher only; `fact` edges unless other kinds are requested; document-id allow/deny eligibility, `predicate_scope: false`; a per-dataset pointer row moved by the write path with compare-and-set). The conformance kit runs in-process (no service). **`attach`** (`attach: {mapping: <file>}`): an **existing** Kuzu database opened read-only and mapped onto the contract by a declared mapping file (`backends/kuzu/attach.py::AttachMapping`): `dataset`, `generations` (or `any_generation: true`), `nodes` (`table`, `type`, `key`, `name`, `lookup`, `document: {column, pattern, template}`, `mention_text`), `edges` (`table`, `predicate`, `edge_kind`, `support`, `quote`, `source`, `document_pattern`/`document_template`, `verified`, `status`, `provenance` columns), optional `communities` (`table`, `label`, `level`, `summary`, `quote`, `quote_source`, `member_edge`) and `require_verified` (default true). Every table and column is checked against the store's catalog when the backend opens; only statements built from the validated mapping run; an edge without a quote, without a document id, or (with `require_verified`) without a verified quote is never surfaced; the edge span anchors the stored quote (`field: <REL>.<quote column>`), not package catalog offsets. Writes (`upsert`, `put_communities`, `delete_generation`) are refused. Keep private mappings outside the repository. |
 
@@ -302,13 +304,42 @@ backend; no request loads the corpus.
   fields);
   nothing is post-filtered. `casefold_match` therefore uses Lucene `lowercase`, not Python
   `str.casefold` (they differ for a few characters such as `ß`).
-- **Records**: the ACL and every supported predicate are pushed down as the same filter; the
-  denominator is a `_count`; the matched records are scanned in id order (`search_after`) and the
-  measure is computed by the shared `backends/_scope.py` code, so every `ScopeResult` is `exact` and
-  identical to the other adapters. A scope matching more than `max_matched` records (default 10000,
-  constructor argument) is a typed `BackendError`, never a truncated result; approximate
-  `cardinality` aggregations are not used. `values()` is a key-ordered `terms` aggregation capped at
-  10000 (`limit` above the cap is an error); `exists()` is a `_count`.
+- **Records** (`records.aggregation: client`, the default): the ACL and every supported predicate
+  are pushed down as the same filter; the denominator is a `_count`; the matched records are scanned
+  in id order (`search_after`) and the measure is computed by the shared `backends/_scope.py` code,
+  so every `ScopeResult` is `exact` and identical to the other adapters. A scope matching more than
+  `max_matched` records (default 10000, constructor argument) is a typed `BackendError`, never a
+  truncated result. `values()` is a key-ordered `terms` aggregation capped at 10000 (`limit` above
+  the cap is an error); `exists()` is a `_count`.
+- **Records aggregation** (`records.aggregation: native`): the scope operations are compiled to
+  aggregations on the server (`backends/_lucene_aggs.py`), so a scope over millions of records is
+  answered without fetching them and `max_matched` does not apply. The same filter (ACL included)
+  is the query of every aggregation request. The compilation:
+
+  | Operation | Native form | Exactness |
+  |---|---|---|
+  | count, `total`, `zero_match` | `track_total_hits: true` (a lower-bound total is a typed error) | exact |
+  | `group_by` (one field or a cross-tab of two), nulls | `composite` paging over `v.<field>` with `missing_bucket`, keys decoded to their JSON type | exact |
+  | calendar groups (`granularity`), `bucket` measure | `date_histogram` (`calendar_interval`, `time_zone` = `metadata_schema.timezone`) | exact |
+  | `top_n` / `nth` of a count over one field | `terms` ordered by count, grown until the boundary rank is decided and the engine reports `doc_count_error_upper_bound: 0` (OpenSearch 3.x searches even the one-shard index in concurrent segment slices) | exact; more than `max_groups` needed is `bounded` |
+  | other ranking, `order`, group-field sort, `with_share` | composite enumeration, then the shared ranking code | exact |
+  | `periods` | `filters` aggregation | exact |
+  | `share` numerator, null counts of negated predicates | `filter` sub-aggregations | exact |
+  | sum / avg / min / max | `stats` on `n.<field>` | engine double sums (integral values reported as integers) |
+  | first_seen / last_seen | `value_count` + `top_hits` sorted by `t.<field>`, then id | exact at millisecond resolution |
+  | `count_distinct` | `composite` paging of (group, unit) pairs up to `distinct_exact_cap` | exact; above the cap `cardinality` (HyperLogLog++), `exactness: approximate`, the reason in `basis` |
+  | record list (`limit`) | sorted search of at most `limit` hits, missing values last, ties by id | exact |
+
+  Nothing is cut silently. `matched_ids` holds the first `matched_ids_cap` matched ids (id order) and
+  `matched_ids_truncated: true` says more matched; `total` is always the full count. The default cap
+  (10000) equals the client path's `max_matched`, so wherever the client path answers, native gives
+  the same ids. More than `max_groups` groups gives a `bounded` result with no groups and an
+  `UnsupportedConstraint` naming the cap. A group key that the index stores apart but Python treats
+  as equal (`3` and `3.0`, or `1` and `true`, in one undeclared field) is a typed `BackendError`.
+  The answer contract is unchanged: an `approximate` or `bounded` result never backs a count, list or
+  absence claim, and an absence claim also needs `total == 0`. `percentiles` is not compiled: the
+  measure contract has no percentile kind. The conformance kit gives identical results for both modes
+  on OpenSearch 2.19.1, 3.9.0 and Elasticsearch 8.17.4 (`tests/conformance/test_lucene_native_aggregation.py`).
 - **Result window**: lexical pages stay within `index.max_result_window` (10000, `from + size`). A
   page that ends at the window edge decides whether more hits exist from an exact `_count`; a page
   beyond the window is a typed `BackendError`, never a shortened ranking. A structured text
@@ -498,8 +529,8 @@ names. Review redacted samples and the manifest's counts. Patterns themselves ar
 
 ## Extraction and communities
 
-`extraction.extractors` combines `gazetteer`, `regex`, `spacy`, `gliner`, `llm` (v1 names
-`providers`/`tags` upgrade automatically):
+`extraction.extractors` combines `pattern`, `gazetteer`, `regex`, `spacy`, `gliner`, `llm` (v1 names
+`providers`/`tags` upgrade automatically; `pattern` has its own section below):
 
 ```yaml
 extraction:
@@ -536,6 +567,274 @@ extraction:
     hosted: [held in, venue]                      # extra evidence phrases per predicate
   stemmer_language: english                       # any Snowball language
 ```
+
+### Pattern extractor (`pattern`, `extraction.pattern_library`)
+
+The `pattern` extractor matches lines (log lines or any line-oriented text) against a **pattern
+library**: a directory of files with typed named groups that produce span-anchored entities and
+line-scoped relations. It is selected together with `extraction.pattern_library`; one without the other
+is a configuration error.
+
+```yaml
+extraction:
+  extractors: [pattern, gazetteer]       # pattern first: later extractors see only the residue
+  pattern_library:
+    path: patterns/                      # library directory (relative to the config file)
+    engine: re2                          # re2 (extra `patterns`) | regex (extra `patterns-lite`, development only)
+    max_line_bytes: 8192                 # each line is cut here (UTF-8, on a character boundary) before matching
+    mode: line                           # every line of a chunk is matched on its own
+    promotion: auto                      # auto | manual; default auto (owner decision 2026-11-04)
+    min_literal_chars: 4                 # lint warning / gate refusal below this many literal characters
+    regex_timeout_ms: 100                # per-search timeout of the regex engine
+    gate: {min_support: 3, require_re2: true, min_cluster_coverage: 0.9, max_out_of_cluster: 0}
+```
+
+**Engines.** `re2` uses `google-re2`: matching is linear in the line length and each stage uses an
+RE2 `Set` to select the candidate patterns before full matching. `regex` is a development fallback:
+patterns are compiled ASCII-only and every search has a timeout. A timed-out line gets status `timeout`,
+and the provenance records `engine_deterministic: false`. The engine is never chosen implicitly: when
+the configured engine's package is missing, `validate`/`doctor` report `pattern_engine_unavailable`
+and the build fails. There is no fallback to the other engine.
+
+**Library files** (one directory):
+
+| File | Owner | Written by |
+|---|---|---|
+| `library.yaml` | human | humans only. The system never writes it. |
+| `learned.yaml` | system (humans may edit) | the CAS-safe writer, append-only |
+| `proposed.yaml` | system | the writer, append-only |
+| `decisions.yaml` | system | the writer (promotion policy or CLI), append-only |
+
+`library.yaml` is a mapping (`library`, `format_version: 1`, `engine`, `vocabularies`, `masks`,
+`patterns`). The system files are YAML sequences. A synthetic example:
+
+```yaml
+library: example-core
+format_version: 1
+vocabularies: {service: [ingest-worker, query-gateway]}
+masks: {num: '-?[0-9]+(?:\.[0-9]+)?'}
+patterns:
+  - id: fmt.kv_v1
+    kind: format                         # index_name | format | continuation | message | annotate | noise
+    status: approved
+    priority: 100
+    regex: '^ts=(?P<ts>[0-9T:.\-]+Z) lvl=(?P<level>[a-z]+) comp=(?P<component>[a-z0-9_.]+) msg="(?P<body>[^"]*)"$'
+    entities: [{group: component, type: component}]
+    then: {field_from_group: body}       # the message stage matches this group
+  - id: msg.dependency.connect_failed
+    kind: message
+    status: approved
+    priority: 50
+    applies_to: {level: [error, warn]}   # selectors: a format group of that name, else document metadata
+    regex: '(?P<client>[a-z]+-client) (?P<trigger>failed to connect|refused by) (?P<dep>kafka|redis)(?: after (?P<ms>{{mask:num}}) ?ms)?'
+    signature: {id: dependency.connect_failed, category: connectivity}
+    fields: {ms: {type: number}}
+    entities: [{group: client, type: component}, {group: dep, type: dependency}]
+    relations: [{subject: client, predicate: fails_to_connect, object: dep, trigger_group: trigger}]
+    attribute_links: [{subject: $service, predicate: emits, object: $signature}]
+    examples: {positive: ["db-client failed to connect redis after 30 ms"], negative: ["db-client connected to redis"]}
+```
+
+**Stages per line.** `format` (first match by priority, then id) hands its `then` group to `message`
+(first match sets the signature). Every matching `annotate` pattern adds entities. Without a message
+match, a `noise` pattern marks the line benign. The resulting status is one of `parsed`, `noise`,
+`format_only`, `unparsed` or `timeout`; multiline assembly assigns `fragment` upstream. Coverage is
+`(parsed + noise) / (lines - fragments)`.
+
+**Relations.** Relations are line-scoped: both endpoints are entity groups of the message match or of
+its format match, and the trigger group is on the same line. The relation span is the smallest span
+covering them. With a matched trigger group the relation is a `fact`, unless a negation word lies in the
+span. Without a trigger group the predicate-support check decides. Anything unsupported is stored as a
+`co_occurrence`. **Attribute links** (`$service`, `$tenant`, `$env`, `$signature`) are emitted only from a
+document's `header` field. They are `native_link` edges with `support: unchecked`, created when the
+document's `signature_id` belongs to the pattern and both endpoint values occur in the same header
+chunk. Typed `fields` are not written to the graph; they are available to partition-stage consumers.
+Chunks cut by the default chunker can split a line; the planned `line` chunk recipe keeps one record
+per chunk.
+
+**Residue.** When `pattern` is listed first, each following extractor runs only on the lines the
+library did not parse. Parsed and noise lines are blanked and offsets are kept. When nothing is left,
+the following extractors are skipped for that chunk. A later extractor whose match reaches into a blanked
+line fails the chunk (`grounding`); nothing is repaired. When `pattern` is not first, every extractor
+sees the whole chunk.
+
+**Loader and decisions.** Entries are read in the order user, then learned, then proposed. An id
+defined by more than one owner resolves to the first (`info` diagnostic): a human entry wins over a
+learned one, and a learned entry over a pending proposal. `decisions.yaml` records are then replayed in
+order:
+
+- `approve` promotes an entry.
+- `deprecate` retires it.
+- `supersede {id, target}` shadows the target without editing it.
+- `expire` drops an unpromoted proposal.
+- `disable` is a human-only record (`by: user:<name>`). It is final and wins over every other record and
+  file.
+
+A system record (`by: system:<name>`) never changes a human-owned entry, and a system `disable` is not
+applied. Both are reported as warnings.
+
+**Lint** (load-time errors) covers:
+
+- the RE2 subset: no backreferences, lookaround, atomic groups, possessive quantifiers, `\Z`, `{,n}`,
+  `\p`, unnamed capture groups, or flags other than `i`/`m`/`s`;
+- the ReDoS rules:
+  1. star height ≤ 1;
+  2. no quantified alternation with branches sharing a first character, or with an empty branch;
+  3. no adjacent unbounded repeats over intersecting classes;
+  4. every unbounded repeat is followed by an anchor or by a character it cannot consume, so `error
+     (?P<code>[0-9]+)` must end in `$` or a literal;
+- duplicate ids within one owner, and unknown kinds, statuses and field types;
+- undeclared groups and relation endpoints that are not entity groups;
+- a relation with a `$attribute` endpoint (with or without `trigger_group`): attribute links belong
+  under `attribute_links`;
+- examples that fail their own pattern, and unresolved `{{vocab:}}`/`{{mask:}}` templates;
+- ambiguity: same kind, priority and overlapping selectors, with each pattern matching the other's
+  positives;
+- unredacted email, IPv4, JWT, bearer-token or access-key shapes in examples.
+
+Warnings cover too few literal characters, a pattern unanchored at both ends, and a system file
+edited outside the writer. Lint errors in a proposal that is not approved become warnings and the entry
+stays inert. Approving it makes them errors again. The lint walks the standard library's regular
+expression parse tree; that parser folds some alternations (`x|x` becomes a class), so the `regex`
+engine's timeout remains the runtime guard there, and RE2 is linear regardless.
+
+**Identity, fingerprint and reuse.** Only `engine`, `max_line_bytes` and `mode` enter the index
+recipe; while `pattern_library` is unset the recipe is unchanged. The library contents and the engine
+version are build provenance. Each build records `pattern_provenance` in the generation manifest
+(`library_identity`, which is the sha256 of the effective approved entries, plus `engine`,
+`engine_version`, `validator_version` and `engine_deterministic`). It stores the effective library
+snapshot content-addressed in the ledger (`pattern_library_snapshot`). Extraction reuse keys carry a
+salt derived from that provenance and the applied decisions
+(`extraction:{recipe}:{salt}:{chunk}`), so approving or deprecating a pattern re-extracts on the next
+build without changing the index fingerprint. Other extractors keep the unsalted key. The library is
+read when a build starts and by `doctor --probe`; serving never reads the library files.
+
+**Promotion (`promotion: auto | manual`, default `auto`).** A learned proposal must pass the
+deterministic gate (`learning/patterns/gate.py`), which checks:
+
+- `re2_compile`: validator plus RE2 compile (the `regex` engine cannot pass while `require_re2` is
+  set);
+- `lint`: entry lint, the ReDoS rules and at least `min_literal_chars` literal characters;
+- `cited_examples`: the cited example lines are supplied evidence lines (not invented), positives match,
+  negatives do not, and the entry's examples are exactly those lines;
+- `no_regressions`: no match on held-out lines that other approved patterns match today;
+- `min_support`: at least `gate.min_support` matched lines and that many cited positives;
+- `novelty`: not a duplicate regex (including disabled and deprecated entries);
+- learning loop only (`patterns learn|propose`): `cluster_coverage` (matches at least
+  `gate.min_cluster_coverage` of the whole cluster), `out_of_cluster` (matches at most
+  `gate.max_out_of_cluster` unparsed lines outside the cluster; default 0) and, for a fix,
+  `fix_target` (the target is approved and every one of its positive examples still matches).
+
+Under `auto`, a passing `message` proposal is appended to `learned.yaml` (approved, priority below every
+approved entry of its kind, gate summary as `evidence`) with an `approve` record in `decisions.yaml`
+(`by: system:auto` for the miner, `system:pattern_learner` for the LLM loop). A passing fix of a
+system-owned pattern is recorded as `supersede {id: fix, target: old}`. The record copies the example
+lines. Auto-promotion also needs a gate run on RE2. Under `manual`, and always for other kinds, for a
+gate run on the `regex` engine and for fixes of human-owned patterns, the proposal is appended to
+`proposed.yaml` and waits for a human decision (`patterns promote`). A failing proposal is not written.
+The deterministic miner and synthesiser and the LLM learning loop (below) are the two sources of
+proposals. A human review step on top of `auto` is planned as an option.
+
+**Writer.** The writer appends only to the three system files and never opens `library.yaml`. It uses
+a sha256 compare-and-swap: it reads, writes a temporary file and fsyncs it, re-checks the sha, runs
+`os.replace`, and verifies the result. A concurrent save restarts the append. A file that is no longer
+a YAML sequence is refused (`SystemFileCorrupt`), and persistent contention raises
+`SystemFileConflict`. With `learning.patterns.git_commit: true` and a library directory inside a git
+work tree, the writer refuses to start while a system file has uncommitted changes
+(`SystemFileDirty`: commit or revert the hand edits) and commits exactly the changed system files
+afterwards, with the author `system:pattern_learner` (or `system:cli` for human decisions).
+`library.yaml` is never added or committed by the system.
+
+**CLI.** `su-multi-arm --config c.yaml patterns lint` prints statuses, provenance and issues.
+`patterns coverage --input lines.txt [--attr service=x --attr level=error]` prints line status counts.
+`patterns mine --input lines.txt` runs the deterministic template miner and synthesiser and prints the
+proposals (status `proposed`) with coverage before and after. These three write nothing. `--input` may
+also be a `.jsonl` file of `{"id", "text", "attributes"}` objects. The learning commands
+(`patterns propose|learn`) and the human decisions (`patterns promote|deprecate|disable <id>`) are
+described under "Pattern learning" below; they are CLI-only, not `Action`s, with no HTTP/MCP surface.
+
+**`regex` and `pattern`.** `extraction.patterns` (the `regex` extractor) still runs on Python `re` in
+this release, so its results and existing fingerprints are unchanged.
+`su_multi_arm.extraction.patterns.sugar.regex_entries` gives the equivalent `annotate` entries for the
+planned switch, and fails for an expression outside the RE2 subset or the ReDoS rules.
+
+### Pattern learning (`learning.patterns`, `models.roles.pattern_learner`)
+
+The learning loop asks a chat model to propose patterns for the lines the library does not parse.
+The deterministic gate decides; the promotion policy decides where a passing proposal is written.
+
+```yaml
+models:
+  roles:
+    pattern_learner:                     # anthropic | openai | openai_compatible, structured output
+      provider: openai_compatible
+      model: local-model
+      base_url: http://127.0.0.1:8000/v1 # loopback: allowed without hosted egress
+privacy:
+  redact_emails: true                    # at least one redaction is required: only redacted lines leave
+  patterns: {IPV4: '\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'}
+learning:
+  patterns:
+    max_clusters_per_run: 10             # clusters asked about per run (largest x level weight first)
+    max_lines_per_cluster: 8             # example lines sent per cluster
+    nearest_patterns: 3                  # approved patterns shown to the model
+    max_calls_per_run: 10
+    max_calls_per_day: 50                # persisted per calendar day in `timezone`
+    max_usd_per_run: 0.25                # USD caps need budgets.price_table
+    max_usd_per_day: 1.0
+    timezone: UTC
+    spend_ledger: state/learning_spend.sqlite   # default <library>/.spend_ledger.sqlite
+    git_commit: false                    # commit learned/proposed/decisions in a git work tree
+    egress:
+      allow_hosted: false                # true is required for a hosted (non-loopback) role
+      pseudonymise: [tenant, host]       # attribute values replaced by per-run aliases
+```
+
+**One run** (`patterns learn --input lines.jsonl`):
+
+1. **Egress.** Every input line is redacted with the configured `privacy` redaction and stamped. Only
+   stamped lines may reach the model. A line that still shows an e-mail, IPv4, JWT, bearer-token or
+   access-key shape after redaction refuses the whole run (`EgressRefused`) before any call; lines are
+   never silently dropped or repaired. A config without any redaction is refused. A hosted role
+   (anything but `openai_compatible` on a loopback host) needs `egress.allow_hosted: true` and both
+   USD caps. Values of the `pseudonymise` attributes are replaced by stable per-run aliases in the
+   attributes and in the line text before mining, so neither the prompt lines nor the cluster template
+   carry them.
+2. **Match** every line with the current library: coverage *before*. The `unparsed` and `format_only`
+   bodies form the queue.
+3. **Mine** the queue (the Drain-style miner), rank clusters by size times a level weight (error 3,
+   warn 2, other 1) and keep the top `max_clusters_per_run` with at least `gate.min_support` lines.
+4. **Propose.** One structured call per cluster (reply schema `PatternProposalReply`: `action`
+   `new | fix | noise | none`, `regex`, typed groups, entities, relations, cited positive and negative
+   line ids, `issue_name`, `issue_category`, `rationale`). Each call is reserved first against the run
+   caps and the persistent day caps; a refused reservation stops the run before the request. A provider
+   error stops the run; a reply that violates the schema is recorded for its cluster. Nothing is
+   retried. `issue_name` and `rationale` are inert metadata in the entry's provenance; the regex is the
+   only part of a reply that is used, and only after the gate.
+5. **Gate** every entry (the checks above, including `cluster_coverage`, `out_of_cluster` and
+   `fix_target`).
+6. **Write** passing entries under `promotion` (`patterns propose` always writes to `proposed.yaml`).
+   A fix of a pattern that is disabled or deprecated is invalid: a human decision always wins.
+7. **Reparse**: coverage *after* (with the reloaded library) and *after if approved* (pending
+   proposals evaluated as approved).
+
+The report (JSON on stdout, or `--output report.json`) lists each cluster's outcome (`learned`,
+`proposed`, `rejected` with the failed gate checks, `invalid`, `invalid_reply`, `declined`,
+`not_sent`, `provider_error`), what was written, the spend of the run and of the day, and the git
+commit. The command exits 1 when the run stopped early (budget or provider error).
+
+`--dry-run` stops before any model call: it reports the clusters, the line ids that would be sent, the
+prompt size and the estimated USD, spends nothing and writes nothing (no ledger file either).
+`--max-usd X` lowers the per-run USD cap for one run; it can never raise it.
+
+**Human decisions.** `patterns promote <id>` approves a proposed (or deprecated) entry; a fix is
+promoted as `supersede`, so its target is shadowed without editing `library.yaml`. `patterns deprecate
+<id>` retires an approved entry. `patterns disable <id>` is final. Each appends one record
+`by: user:<name>` (`--by name`, default `cli`; `--reason text`) to `decisions.yaml`; a decision that
+does not fit the entry's state is refused and nothing is written.
+
+**Evidence.** Synthetic lines and a scripted fake provider only (docs/VALIDATION.md); no real model
+has been run through the loop yet.
 
 Communities use overlapping entity groups by default; `communities.strategy: louvain` clusters the
 bipartite document/entity graph with a fixed seed. Minimum document count is configurable.
@@ -1165,6 +1464,273 @@ mongodb, postgres, sqlalchemy, neo4j: server ping and version; opensearch, elast
 declared capabilities next to its registry entry and, per role, `strict_schemas`: `ok` or the
 strict-form problems of the schemas a native OpenAI role sends (a problem fails the probe). It makes
 **no model calls** (`model_calls: 0`) and exits non-zero when a backend probe fails.
+
+### Read-only log sources (`sources`)
+
+`sources.<name>` declares a read-only log source. In this release the source is used only by the
+`su-multi-arm sources` command. The engine never opens a source on the request path, and nothing
+pulled is persisted yet (day partitions arrive in a later slice). The one kind is
+`elasticsearch_rest`: Elasticsearch 7.9 or later, or OpenSearch 1.0 or later, over plain REST with
+no client library. Older 7.x releases discover indices through `/{expr}/_alias`.
+
+```yaml
+sources:
+  logs:
+    kind: elasticsearch_rest
+    url_env: LOG_SOURCE_URL            # base URL; never put credentials in the URL
+    auth: basic                        # none | basic | api_key
+    username_env: LOG_SOURCE_USER
+    password_env: LOG_SOURCE_PASSWORD  # or api_key_env with auth: api_key
+    verify_tls: true                   # ca_bundle: ./ca.pem (relative to this file)
+    indices: ["*-{date}"]              # {date} is filled with index_name.date_format
+    timezone: UTC                      # what the partition day means
+    require_read_only_role: true       # a granted write privilege fails `sources check`
+    mapping:
+      timestamp: "@timestamp"
+      message: message
+      level: level                     # optional; per index, only where the field exists
+      host: host.name
+      container: kubernetes.container.name
+      file: log.file.path
+      offset: log.offset
+      extra: [trace_id]                # declared passthrough only
+      drop_fields: []                  # never requested
+    index_name:                        # [<prefix>-][<deployment>-]<tenant>-<env>-<service>-<YYYY.MM.DD>
+      separator: "-"
+      date_format: "%Y.%m.%d"
+      prefix: null                     # optional literal every name starts with (e.g. logs)
+      deployment_prefixes: [search-admin, os-data-{n}]   # optional, longest first; {n} = digits
+      prefix_fields: [tenant, env]     # one token each unless the field has a vocabulary
+      vocabularies:                    # service and any prefix field; literal names, '_' allowed
+        service: [ingest-worker, query-gateway, gateway, scheduler, slack_bot]
+    counts:
+      errors: {levels: [ERROR, FATAL], tokens: [error, fatal]}
+    multiline:
+      continuation: [java_frame, python_frame, traceback_header, caused_by, ellipsis_more]
+      max_gap_ms: 2000
+      max_lines: 200
+      max_bytes: 16384
+      fragment_sample_rate: 0.01
+    pull:
+      cursor: scroll                   # or search_after with a unique `tiebreaker` field
+      page_size: 500
+      keepalive: 1m                    # at most keepalive_max (default 2m, never above 10m)
+      records_query: errors            # the records tier pulls documents matching this count query
+      max_docs_per_unit: 20000         # above this the unit is stratified
+      max_docs_per_partition: 500000   # the pull stops and is marked capped
+      sample_method: hourly_quota      # or random_score
+      seed: 0
+      max_concurrency: 1               # open contexts per process <= max_concurrency x slices
+      slices: 1
+      max_restarts: 1                  # an expired cursor restarts its stratum at most this often
+    limits: {requests_per_second: 2, timeout_seconds: 30, max_response_bytes: 67108864, max_context_per_partition: 200}
+    max_line_bytes: 8192
+```
+
+**What the source may send.** Every request is checked against an exact allow-list before any
+I/O. The allowed requests are:
+
+- resolve, alias, mapping, count, search and scroll;
+- opening and closing a PIT;
+- `GET /` and the privilege endpoint.
+
+A path, method, query parameter or body key outside that list raises `SourceRequestRefused`, and
+nothing is sent. Further rules:
+
+- `{idx}` must be a name that discovery returned. Wildcards are allowed only in discovery and in
+  `_count`.
+- Bodies may not contain scripts, runtime fields, aggregations or write operations.
+- `DELETE` may only close a scroll or PIT that this source opened and that the cursor lists, and
+  never `_all`.
+- Redirects are not followed, and there are no retries.
+
+**Self-check.** `sources check` asks `_security/user/_has_privileges` whether the account holds
+`write`, `delete`, `index` or `manage` on the configured patterns, or `cluster:all`. A granted
+privilege is a warning, or an error (exit 1) under `require_read_only_role`. If the endpoint is not
+available, the result is reported as `unknown` and the allow-list remains the guarantee. OpenSearch
+reports `unknown` because its account endpoint lists roles, not privileges. A 403 on `GET /` is
+recorded and is not fatal.
+
+**Index names.** Each discovered index name is parsed with the `index_name` grammar, left to
+right:
+
+1. the trailing date (`date_format`; `%Y`, `%m`, `%d` and literal separators);
+2. the optional literal `prefix`, which every name must then start with;
+3. the optional deployment prefix: the longest entry of `deployment_prefixes` that matches, where
+   `{n}` stands for digits (`os-data-{n}` matches `os-data-1-…`). It is recorded as the
+   `deployment` attribute, or `none` when the name has no deployment prefix;
+4. the `service` segment at the end, and the `prefix_fields` segments in order. A segment with a
+   vocabulary takes the longest entry that fits (`query-gateway` before `gateway`). A segment
+   without one is exactly one token without the separator, so `slack_bot` is one token under `-`.
+
+A name that does not fit, or that fits both with and without its deployment prefix, is `unparsed`
+with a typed `reason` (`no_date`, `invalid_date`, `prefix`, `segments`, `service`, `vocabulary`,
+`ambiguous`), `unknown` attributes and a `source_index_name_unparsed` diagnostic. The parser never
+guesses: a multi-token tenant needs a tenant vocabulary, and an undeclared left-side prefix is not
+folded into the tenant.
+
+**Counts.** Count queries are built for each index from its mapping:
+
+- a terms query on `mapping.level` (or its `.keyword` sub-field) where that field exists, recorded
+  with basis `level_field`;
+- otherwise a word query on the message field, with basis `token_match`;
+- an index that has neither is a `SourceSchemaDrift` error, never a zero.
+
+**Units and sampling.**
+
+- A dated expression (`{date}`) gives one unit per index: the index date selects the day. An
+  undated expression gives units sliced to the day window by event time.
+- When a unit's records-tier count exceeds `max_docs_per_unit`, the pull is stratified.
+  `hourly_quota` gives each hour of the window, plus one `outside` stratum, a quota proportional to
+  its count. Within an hour, documents are ordered by `random_score` on `_seq_no`. `random_score`
+  instead caps the whole unit.
+- The sample plan records the method, seed, and each stratum's counts, quotas and fetched documents.
+  Estimates from it are approximate and labelled as such.
+
+**Secrets.** The URL and credentials are read from the named environment variables when the first
+request is made. They never appear in a config value, an error, a request record or a report. The
+HTTP client ignores proxy environment variables.
+
+**Not in this release.** Redaction of pulled lines (`LogMapping` accepts an injected redactor and
+reports `redaction: none` without one). PIT-based pulls (PIT is probed only). Sliced scroll.
+Data-stream backing indices (skipped with a diagnostic). User-defined continuation patterns.
+
+**CLI.**
+
+```bash
+su-multi-arm --config c.yaml sources check                       # capabilities + self-check
+su-multi-arm --config c.yaml sources discover --date 2026-01-05  # units and parsed attributes
+su-multi-arm --config c.yaml sources count --date 2026-01-05     # per-unit counts and bases
+su-multi-arm --config c.yaml sources probe --date 2026-01-05 --max-units 3 --max-docs 1000 --output probe.json
+```
+
+`probe` puts a bounded load on the cluster and writes an aggregate-only JSON report:
+
+- capabilities and the self-check;
+- per-unit counts and bases, field presence and index-name parse results;
+- PIT and `random_score` support;
+- scroll throughput on one unit of at most `--max-docs` documents;
+- request timings for each allow-list row.
+
+The report contains no log line or field value. Keep reports outside any repository. `sources`
+never builds an engine. Open cursors are closed on exit, on `SIGTERM` and on `SIGINT`. A context
+that a hard kill leaks expires after the bounded keepalive.
+
+### Daily log partitions, compose and retention (`logs`)
+
+`logs` turns one source into day partitions and composes the retained window into the serving
+generation (addendum A1 slices L3a and L3b). It needs the `pattern` extractor, the `line` chunk
+recipe for the `exemplars` field, and a catalog backend whose generation registry has pins
+(`sqlite`, `memory`, `postgres`, `sqlalchemy`; `logs` is refused on `mongodb` and
+`elasticsearch` catalogs, where pins are planned).
+
+```yaml
+ingestion:
+  line_recipe:                         # one chunk per log record (records separated by a blank line)
+    fields: [exemplars]
+    max_chunk_chars: 24576             # >= sources.<s>.max_line_bytes + multiline.max_bytes
+  projections:                         # catalog and records always hold every document
+    exclude_kinds:
+      lexical: [unit_day, signature_day, service_day, signature_service_day, signature_tenant_window, signature_hour]
+      vector: [unit_day, signature_day, service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour]
+      graph: [unit_day, signature_day, service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour]
+    embed_fields: {signature: [template]}   # exemplars (log-line text) are never embedded
+logs:
+  source: logs                         # a name under sources:
+  timezone: Europe/Berlin              # what "today" means; the event_time clock cuts days here
+  partitions:
+    path: ./partitions                 # relative to this file; keep it outside any served directory
+    clock: index_date                  # or event_time
+  parse: {workers: 1, batch_size: 2000, max_exemplars_per_signature: 3, max_unparsed: 2000}
+  compose: {signature_hour: false, max_exemplars_per_signature: 3}
+  retention:
+    keep_days: 10
+    keep_generations: 2                # the active one included; rule (a) overrides it
+    max_pin_wait_seconds: 900
+    pin_retry_seconds: 15
+    verify_sample: 1000
+  pins: {ttl_seconds: 120, heartbeat_seconds: 30}
+  schedule: {lock_ttl_seconds: 3600}
+  settle: {max_growth: 0.05}
+```
+
+**Partition clock and timezone.**
+
+- `index_date` (default): a partition is one index date of the source, read in
+  `sources.<s>.timezone`. Documents carry `date` = the index date, `date_basis: index_date` and
+  `date_timezone` = the source timezone. A reporting day in another timezone is not re-cut.
+- `event_time`: a partition is one calendar day in `logs.timezone`, from local midnight to the next
+  local midnight (23 or 25 hours across a DST change). The source is asked for every index date
+  that window overlaps, and each unit is sliced to the window by event time. Documents carry
+  `date_basis: event_time` and `date_timezone` = `logs.timezone`. With `timezone: UTC` this is the
+  addendum's `event_time_utc`.
+- Every header and every dated document states its basis and timezone, so an exactness claim can
+  name them.
+
+**What a day becomes.** Each record's head line is matched once by the pattern library. A sealed
+partition holds the redacted records per unit, the per-record matches (no text), the day's unit
+and signature aggregates, the hourly co-firing cells (signature x deployment x hour), up to
+`max_exemplars_per_signature` exemplars per signature and the unparsed queue. Compose turns the
+window into documents:
+
+| Kind | One per | Notes |
+|---|---|---|
+| `unit_day` | day x unit | exact source counts per count query and basis |
+| `signature_day` | day x unit x signature | exact only under the coverage condition, else `approximate (method)` |
+| `service_day` | day x service | sums, tenants affected |
+| `signature_service_day` | day x service x signature | trend rollup |
+| `signature_hour` | hour x service x signature | opt-in (`compose.signature_hour`) |
+| `signature_window` | signature | first/last seen, lines in the window |
+| `signature_tenant_window` | signature x tenant | tenants affected by a signature |
+| `signature` | signature | `template` (from the library entry) and `exemplars` (redacted lines, `line` recipe) |
+
+Every document has a rendered `header` field (`kind: … | date: … (basis, tz) | service: … | …`).
+
+**Commands.**
+
+```bash
+su-multi-arm --config c.yaml logs run-daily [--date YYYY-MM-DD]   # pull, parse, seal, compose, retention, verify
+su-multi-arm --config c.yaml logs backfill --from 2026-01-01 --date 2026-01-10
+su-multi-arm --config c.yaml logs settle --date 2026-01-05        # re-pull units that grew
+su-multi-arm --config c.yaml logs compose --date 2026-01-05       # sealed partitions only
+su-multi-arm --config c.yaml retention report|verify|run [--date YYYY-MM-DD]
+```
+
+`run-daily` holds only the schedule lock (`<partitions>/.schedule.lock`); compose and `gc` take the
+registry write lease themselves. A second run while one holds the lock is refused
+(`WriteConflict(held)`). Each unit is stored atomically, so a crashed pull resumes at the next unit
+without duplicates. A day that is already sealed with the same source query and library is neither
+pulled nor composed again. Compose reparses any partition whose library identity is stale, from its
+retained records, before building.
+
+**Redaction is required.** Nothing is pulled without a redactor: `run-daily`, `backfill` and
+`settle` refuse with `RedactionRequired` before any request. The safe redaction contract (slice
+B11) is not in this release, so the CLI refuses these three commands today; the Python API
+(`LogsPipeline(..., redactor=...)`) accepts an injected redactor.
+
+**Retention.** When a day leaves the window:
+
+- every non-active generation whose manifest lists the day is deleted (rule (a)), whatever
+  `keep_generations` says; `keep_generations` bounds only in-window rollback generations;
+- a generation pinned by a live serving process (cross-process pins, TTL) is not deleted; retention
+  retries up to `max_pin_wait_seconds`, then reports `pinned_expired_generation` and keeps the
+  day's artifacts, and `verify` fails;
+- the cache is invalidated per deleted generation; the ledger drops the generation's job entries,
+  every reply tagged with the day (`partition:<source>:<day>`), and every `extraction:`,
+  `embedding:`, `raw:` or `pattern_library:` entry no remaining generation references
+  (`ledger_refs`);
+- the partition becomes a content-free tombstone holding hashes of its lines and source ids;
+- sessions expire with a TTL no longer than the window; run reports rotate at the window length;
+  a content-free audit record of each deleted generation goes to `<partitions>/audit/`.
+
+If compose fails, retention is skipped for that run: nothing is deleted before its replacement
+serves. `retention verify` checks the remaining manifests, the ledger references and tags, and
+hashes every text-bearing row of the remaining generations, the ledger and the live partitions
+against the tombstones. `retention report` lists what is kept, what the next run deletes, and the
+approved pattern examples kept beyond the window (owner decision O7).
+
+**Not in this release.** The pull window (`limits.window`), learning-loop proposals and their
+`expire` records (L4b), co-firing communities and `issue_report` documents (L5).
 
 ## Serving
 

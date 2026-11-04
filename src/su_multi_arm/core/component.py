@@ -36,6 +36,7 @@ ComponentKind = Literal[
     "community",
     "provider",
     "backend",
+    "source",
 ]
 COMPONENT_KINDS: tuple[str, ...] = (
     "arm",
@@ -50,6 +51,7 @@ COMPONENT_KINDS: tuple[str, ...] = (
     "community",
     "provider",
     "backend",
+    "source",
 )
 Severity = Literal["error", "warning", "info"]
 COMPONENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

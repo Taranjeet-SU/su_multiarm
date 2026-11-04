@@ -309,3 +309,27 @@ def test_write_lease_fencing_and_compare_and_set(pg_factory):
     assert registry.lease_renew(lease.token, 120.0) is False  # released: no session holds it for this token
     manifests = [{"dataset": "conformance", "generation": g.generation, "index_format": 3, "fingerprint": g.fingerprint} for g in (kit.GEN, kit.GEN2, kit.GEN.model_copy(update={"generation": "c" * 32}))]
     check_compare_and_set(pg_factory().generation_registry(), manifests)
+
+
+def test_pins_live_in_the_registry_meta_table(pg_factory, postgres_dsn):
+    """Addendum A1 §3.8.4 (n4): cross-process pins on the PostgreSQL registry (``pin:`` meta rows),
+    seen through a second backend handle on the same prefix."""
+    from su_multi_arm.backends.postgres import PostgresBackend
+    from su_multi_arm.ingestion.pins import PostgresMetaPins, pin_registry
+
+    clock = {"t": 1000.0}
+    backend = pg_factory()
+    pins = pin_registry(backend.generation_registry(), clock=lambda: clock["t"])
+    assert isinstance(pins, PostgresMetaPins)
+    token = pins.pin("a" * 32, "proc-a", 60)
+    pins.pin("a" * 32, "proc-b", 5)
+    second = PostgresBackend(postgres_dsn, backend.prefix, timeout_seconds=10)
+    try:
+        other = pin_registry(second.generation_registry(), clock=lambda: clock["t"])
+        assert [t.holder for t in other.pinned("a" * 32)] == ["proc-a", "proc-b"]
+        clock["t"] += 10
+        assert [t.holder for t in other.pinned("a" * 32)] == ["proc-a"]
+        pins.release(token)
+        assert other.pinned("a" * 32) == [] and other.sweep() == 1
+    finally:
+        second.close()

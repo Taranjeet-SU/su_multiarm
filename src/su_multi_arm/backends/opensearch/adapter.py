@@ -40,6 +40,7 @@ from .._lucene_common import (
     index_name,
     meta,
 )
+from .._lucene_aggs import DISTINCT_EXACT_CAP_DEFAULT, MATCHED_IDS_CAP_DEFAULT, MAX_GROUPS_DEFAULT
 from .catalog import OpenSearchCatalog, OpenSearchRecords
 from .search import HNSW_ENGINE, OpenSearchLexical, OpenSearchVector
 
@@ -49,6 +50,19 @@ ANALYZER_ID = "lucene_standard"
 # notes: nmslib deprecated in 2.19, index creation with nmslib blocked from 3.0.0).
 KNN_ENGINES: dict[int, frozenset[str]] = {2: frozenset({"lucene", "faiss", "nmslib"}), 3: frozenset({"lucene", "faiss"})}
 DOCS_PATTERN = re.compile(r"^(?P<prefix>[a-z][a-z0-9_]*)_(?P<dataset>[a-z0-9][a-z0-9_-]*)_(?P<generation>[0-9a-f]{32})_docs$")
+
+
+def records_options(config: Any) -> dict[str, Any]:
+    """Constructor arguments of a ``LuceneBackend.records`` block (absent: the defaults)."""
+    records = getattr(config, "records", None)
+    if records is None:
+        return {}
+    return {
+        "aggregation": records.aggregation,
+        "matched_ids_cap": records.matched_ids_cap,
+        "max_groups": records.max_groups,
+        "distinct_exact_cap": records.distinct_exact_cap,
+    }
 
 
 def server_major(number: str) -> int | None:
@@ -97,7 +111,15 @@ class OpenSearchBackend:
         max_matched: int = MAX_MATCHED_DEFAULT,
         transport: Transport | None = None,
         clock: Callable[[], float] = time.time,
+        aggregation: str = "client",
+        matched_ids_cap: int = MATCHED_IDS_CAP_DEFAULT,
+        max_groups: int = MAX_GROUPS_DEFAULT,
+        distinct_exact_cap: int = DISTINCT_EXACT_CAP_DEFAULT,
     ):
+        if aggregation not in {"client", "native"}:
+            raise BackendError(self.kind, "init", f"unknown records aggregation {aggregation!r} (client | native)")
+        if min(matched_ids_cap, max_groups, distinct_exact_cap) < 1:
+            raise BackendError(self.kind, "init", "matched_ids_cap, max_groups and distinct_exact_cap must be positive")
         if knn_method not in {"exact", "hnsw"}:
             raise BackendError(self.kind, "init", f"unknown knn method {knn_method!r} (exact | hnsw)")
         if knn_method == "hnsw" and not exact_rescore:
@@ -113,6 +135,13 @@ class OpenSearchBackend:
         self.exact_rescore = exact_rescore
         self.timeout = timeout_seconds
         self.max_matched = max_matched
+        # Records aggregation (``records.aggregation``): ``client`` scans matched records (bounded by
+        # ``max_matched``); ``native`` pushes the operations down as aggregations (``_lucene_aggs``).
+        self.aggregation = aggregation
+        self.matched_ids_cap = matched_ids_cap
+        self.max_groups = max_groups
+        self.distinct_exact_cap = distinct_exact_cap
+        self.shard_counts: dict[str, bool] = {}  # records index -> has exactly one shard (terms ranking is exact)
         self.transport = transport
         self.clock = clock
         self.stats: Counter[str] = Counter()
@@ -139,7 +168,7 @@ class OpenSearchBackend:
         if not raw:
             raise BackendError(cls.kind, "init", f"environment variable {config.hosts_env} (hosts) is not set")
         hosts = [h.strip() for h in raw.split(",") if h.strip()]
-        return cls(hosts, config.index_prefix, config.knn.method, config.knn.exact_rescore, config.timeout_seconds, clock=clock)
+        return cls(hosts, config.index_prefix, config.knn.method, config.knn.exact_rescore, config.timeout_seconds, clock=clock, **records_options(config))
 
     # --- transport ---------------------------------------------------------------------------
 

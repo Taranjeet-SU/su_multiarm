@@ -1,466 +1,271 @@
-# V2 execution log
+### 2026-11-04 — A1/L4b: LLM pattern-learning loop and writer, plus the L1 index-name grammar fix — DONE (synthetic/mocked evidence)
+Branch `worktree-agent-a3278fda379576f1e` (base `a27ab5a`, `v2/logs`), commit `a586d0b`. Scope: addendum
+`v2_addendum_logs_and_patterns.md` rev 3, §3.6.1–3.6.3, and the index-name parser fix (L1).
 
-Branch: `v2/phase-0` (then `v2/phase-N`). Plan: `v2_implementation_plan.md` (rev 2, approved).
-Each slice appends a dated entry: scope, what landed, deviations, test counts, follow-ups.
-Owner decisions (plan §9) not yet taken are applied as the plan's recommended defaults and listed
-under "Assumed defaults"; they can be reversed later.
+**Done.**
 
-## Assumed defaults pending owner decision (plan §9)
+- `learning/patterns/propose.py`: the `PatternProposalReply` schema (no free-form mappings; strict
+  for OpenAI, within the Anthropic `output_config.format` limits), a neutral system prompt, nearest
+  approved patterns, one `JsonModel` call per cluster, and `proposal_entry` (a reply becomes a
+  `proposed` entry or a typed `invalid`/`declined` reason; never repaired).
+- `egress.py`: `LineRedactor` (the configured `privacy` redaction plus a stamp; a config without
+  redaction is refused), `EgressPolicy.admit` (only `RedactedLine`s with the current stamp; a residual
+  e-mail/IPv4/JWT/bearer/AWS shape refuses the run), `check_role` (`allow_hosted`), `Pseudonymiser`,
+  and `lines_from_records` (refuses a `LogMapping` with `redaction: none`; closes L1 open item b for
+  L4b).
+- `spend.py`: `DaySpendLedger` (SQLite; conditional `UPDATE` under `BEGIN IMMEDIATE`; integer
+  micro-dollars; a crash leaves the reservation counted) and `LearnerMeter` (the `CallMeter`: run
+  `Budget` then day ledger before the request; commits reported usage, or the estimate).
+- `loop.py`: `learn` (egress → match → mine → rank → propose → gate → write → reparse, `dry_run`),
+  `LearningSession` and `session_from_config` (`--max-usd` only lowers the run cap).
+- Gate: `cluster_coverage`, `out_of_cluster` (absolute bound) and `fix_target`, only when the loop
+  supplies the evidence. Promotion: a passing fix of a system entry is written as `supersede`;
+  `human_decision` appends `approve` (or `supersede` for a fix), `deprecate` and `disable` records.
+- `writer.py`: `git_work_tree`, `dirty_system_files`, `require_clean_system_files`
+  (`SystemFileDirty`), `commit_system_files` (only the changed system files; author
+  `system:<actor>`).
+- CLI: `patterns propose|learn --input [--attr] [--dry-run] [--max-usd] [--output]` (exit 1 when the
+  run stopped early) and `patterns promote|deprecate|disable <id> [--by] [--reason]`. `--input`
+  also takes `.jsonl` (`id`, `text`, `attributes`).
+- Config: `core/config_learning.py` (`learning.patterns`, cross-checks in `config_diagnostics`),
+  `models.roles.pattern_learner` (in `chat_roles()` and `role_schemas()`),
+  `pattern_library.gate.min_cluster_coverage`/`max_out_of_cluster`, `spend_ledger` path resolution.
+  Schema regenerated with `core.schema.write_all`.
+- Index-name grammar (`IndexNameConfig`, `IndexNameParser`): optional `prefix`, optional
+  `deployment_prefixes` (`{n}` = digits; `deployment` attribute), vocabularies for any segment
+  (longest entry first), one token per segment without a vocabulary, and both readings tried: a name
+  that fits zero or two times is `unparsed` with a typed `reason`.
+- Docs: CONFIGURATION (pattern learning section, gate, writer/git, CLI, index-name grammar),
+  ARCHITECTURE, CHANGELOG (`[Unreleased]` "Log features" and "Changed"), VALIDATION, main-plan
+  changelog row.
 
-| # | Decision | Assumed |
-|---|---|---|
-| 1 | Package name | keep `su_multi_arm` import/CLI until renamed; no `SU_*` alias work |
-| 2 | Later backends | Phase 5 only |
-| 3 | Paid judges / paid benchmark calls | none; local models only |
-| 4 | Classifier agent | interface + ONNX artifact contract, no weights, default off |
-| 5 | ANN defaults | exact everywhere |
-| 6 | OAuth2 | outside core; `PrincipalResolver` hook only |
-| 7 | Hierarchical communities | NetworkX-based refinement (permissive licence); no GPL extra |
-| 8 | MongoDB vector | Atlas-only flagged capability |
-| 9 | Async core | threaded sync core |
-| 10 | Local-model recipes | one tested OpenAI-compatible local recipe, documented as example |
-| 11 | Compatibility window | two minor releases |
-| 12 | Streaming | in Phase 1 as planned |
-| 13 | Apache-2.0 for profiles/ontologies | yes |
-| 14 | Real-provider smoke | not run (no paid calls) |
-| 15 | `2.0.0a1` scope | cache arm in Phase 2 as planned |
-| 16 | Grounding re-run on frozen cohorts | not run; awaiting owner |
+**Deviations.**
 
-## Slices
+- (a) **Spend ledger scope.** B10 has not landed. The per-day cap is a minimal SQLite
+  `DaySpendLedger` in `learning/patterns/spend.py` for the `learning.patterns` scope only (path
+  `learning.patterns.spend_ledger`, default `<library>/.spend_ledger.sqlite`), not the general
+  `SpendLedger` on every ledger backend under `ingestion/spend.py`. No `reconcile`; a stale
+  reservation stays counted for that day. Placed outside `ingestion/` to stay clear of the parallel
+  L3a/L3b slice.
+- (b) **Egress redaction engine.** B11 has not landed, so lines are redacted with today's privacy
+  engine (`privacy.redact_emails` + `privacy.patterns`, Python `re`). The "re-run built-in redactors"
+  defence is the library's PII-shape check, which refuses rather than redacts.
+- (c) **Pseudonymisation happens before mining**, not only on prompt lines: a test found the cluster
+  template carried a host value. The gate still evaluates the redacted, non-pseudonymised bodies.
+- (d) **Dry run stops before the model call** (no spend, no writes, no ledger file). It reports
+  clusters, line ids, prompt size and estimated USD, not gate results. This is the safer reading of
+  "a dry-run mode".
+- (e) **`patterns propose`** is the loop with the policy forced to `manual` (always `proposed.yaml`);
+  `patterns learn` uses the configured policy.
+- (f) The CLI also covers the human decisions `promote|deprecate|disable` (as the task asked);
+  `supersede` and `expire` remain record types written by the system or by `promote` of a fix.
+- (g) **Index-name behaviour change.** The old rule "the first prefix field keeps extra separators"
+  and "service = the rest without a vocabulary" were guesses. They are gone: two L1 tests were
+  replaced (`big-tenant-…` now uses a tenant vocabulary; the `_`-separator case now asserts `unparsed`
+  for a multi-token service). The old vocabulary validator already accepted `_`; the grammar tests
+  pin `slack_bot` explicitly.
+- (h) Not done from §3.6.1: raw replies are not stored, so they are not tagged with contributing
+  partitions (needs L3a partitions); the novelty check is regex-sha only (no 0.98 overlap measure);
+  the "parsed sample (≥ 20 000 lines)" for stealing is the input's parsed lines plus approved
+  positives.
+- (i) The L2/L4a test `test_a_fix_may_match_its_target_lines` now also asserts the new `fix_target`
+  failure (the fix there drops two target positives); the original edge case (target lines exempt
+  from `no_regressions`) is still asserted.
 
-### 2026-11-03 — P0/S1 grounding + predicate support — DONE
-Landed: `grounding.py`, `predicate_support.py`, span-anchored `GroundedExtraction`, catalog columns
-(offsets, match_level, edge_kind, support), `index_format` 3, graph arm traverses `fact` only,
-Neo4j adapter exports facts only, config `extraction.grounding` / `predicate_triggers` /
-`stemmer_language`, `snowballstemmer` core dependency. Tests 40 → 64 passed. Docs: ARCHITECTURE,
-CONFIGURATION, VALIDATION, schema. Not yet: `relocated` level, fact dedupe across inherited title
-chunks, quarantine/partial policies (→ P0/S3).
+**Tests.** `not external`: base `a27ab5a` 1778 passed, 74 skipped → **1849 passed, 91 skipped**
+(repository venv, no google-re2) and **1940 passed, 0 skipped** with google-re2 1.1.20251105 from the
+isolated `--target` directory. Bare `pytest -q`: 1852 passed, 215 skipped. ruff clean. New files:
+`tests/unit/test_pattern_learning_loop.py`, `tests/contract/test_patterns_learn_cli.py`,
+`tests/unit/test_index_name_grammar.py`, `tests/pattern_learning_support.py` (scripted
+`httpx.MockTransport` provider).
 
-### 2026-11-03 — P1/prep real-service test infrastructure — DONE
-Landed: `tests/services/docker-compose.yml` (OpenSearch 2.19.1, Elasticsearch 8.17.4,
-pgvector 0.8.0-pg17, Neo4j 5.26.0-community, Mongo 7.0.16; project `su-multi-arm-tests`; loopback-only
-non-default ports from `SU_TEST_*_PORT`; security off on the two Lucene engines; 512 MiB heaps;
-tmpfs data dirs, no volumes; healthchecks), `tests/services/wait_ready.py` (stdlib protocol probes +
-readiness table), `tests/services/README.md`, `.github/workflows/services.yml` (nightly /
-dispatch / PR label `services`; `pytest -m external`; digests to job summary; `down -v` always).
-Verified locally: cold pull 17 min, healthy within 11 s of creation, all probes ready, 3 existing
-`external` tests passed against the stack, clean teardown, `docker ps` unchanged. Details and
-digests in `docs/VALIDATION.md` ("Real-service test infrastructure — 2026-11-03").
-Deviations: tags pinned to exact versions rather than the plan's major floats; MySQL omitted (not a
-first-release backend); the CI job runs `-m external` today because `tests/services/` and
-`tests/conformance/` suites do not exist yet — switch its pytest target when they land. No src/ changes.
-Follow-ups: adapters + conformance kit (R2a–R2f) consume `SU_TEST_OPENSEARCH_URL`,
-`SU_TEST_ELASTICSEARCH_URL`, `SU_TEST_MONGO_URI`; add `opensearch`/`elasticsearch`/`mongodb`
-extras to the workflow's install step once they exist; re-measure Neo4j under the 1.5 GiB cap.
+**Follow-ups.**
 
-### 2026-11-03 — P0/S2 kernel (types, metadata schema, component/registry, config v2, backend contracts, runtime) — DONE
-Landed: `core/` (types incl. `MetadataSchema`, component + artifact rules, registries + entry-point
-plugins, config v2 + `validate_config`/`load_config`, schema helper, errors), `compat/config_v1.py`
-(v1 model moved; `config.py` re-exports; `upgrade`/`downgrade`/`upgrade_text` with mapping table),
-`backends/` (eight frozen protocols, capability matrix with `contracts|legacy|planned` status,
-in-memory fake satisfying every protocol), `runtime/` (RunContext, Budget + PriceTable, Trace with
-masked export, SessionManager, Memory, ToolRegistry, ActionRunner + audit, Principal/AccessPolicy),
-CLI `config upgrade|validate|schema`, `docs/config.schema.json` regenerated as v2 and
-`docs/config_v1.schema.json` added. Tests 62 → 154 passed (same interpreter, `mcp` absent → 2 skips).
-Deviations / interpretations: (1) `Catalog.get_chunks` and `LedgerStore.get_raw` added to the
-listed contract methods; `LexicalIndex.search` returns `PageResult[ScoredChunk]` (items + cursor)
-so paging is explicit. (2) Adapters expose per-capability facets (`adapter.catalog`, ...) because
-the plan's protocols share method names. (3) `Scope` (eligibility pushdown) is distinct from
-`ScopeSpec` (typed structured query). (4) `MetadataSchema.unknown_fields` (`allow` default) added so
-undeclared metadata stays untyped rather than failing ingestion. (5) `structured_output: native`
-is always rejected until a provider declares a `(provider, model)` pair; `profile` accepts only
-`neutral`; `extraction.policy` accepts only `strict`; planned backend kinds are rejected; all with
-explicit messages. (6) Engine still consumes v1 `su_multi_arm.config.Config`; v2 `Config` lives at
-`su_multi_arm.core.config.Config` until the arms/write-path slices switch the engine. (7) v2
-`fingerprint()` hashes the effective config; the recipe-composed index fingerprint waits for
-components (`legacy_fingerprint()` covers N6 meanwhile). (8) Fingerprint round-trip is exact for all
-examples; it would differ only for a v1 file that set `community`/`extraction` model fields or
-`community.evidence_char_budget` without a provider (settings that had no effect).
-Follow-ups: sqlite adapter on contracts (S3); arms/tools on `RunContext`; `Engine(config,
-components=[...])`; CI schema-drift job; `config upgrade` for prompt files inlines content (v1
-loader semantics) — the written v2 file keeps `prompt_file` only when the v1 file used it unresolved.
-
-### 2026-11-03 — P0/S2-fix kernel review fixes (branch `v2/p0-s2-fix`) — DONE
-Review: `docs/plans/reviews/p0_s2_kernel_review.md` (REVISE). Fixed B1 (scanner accepts `name:tag`
-model ids and bare `.onnx` names; dotted factories/pickles still rejected), B2 (per-(adapter,
-capability) status in `backends/capabilities.py`; `Config._require_capability` rejects `planned`
-pairs and graph backends without `memberships` for community slots), B3 (plan rev 3: §3.1a
-`unknown_fields`, §3.5 frozen method list/`PageResult`/namespaces/`Scope` vs `ScopeSpec`/facets/
-per-capability status, §5 narrowed N6; `upgrade()` emits `lossy_upgrade` diagnostics, `--strict`
-refuses). Non-blocking fixed: N1 (`ChatRole.price_key()`), N2 (extra masked keys), N3 (page cap =
-candidates cap, `BackendError`), N4 (fake honours `unknown_fields: reject`, `field_not_filterable`),
-N5 (unknown vector id → `BackendError`), N6 (datetime `range` bounds), N7 (`SessionNotFound`), N8
-(`get_chunks` asserted; tautological memory test replaced), N10 (fingerprint docstring), N14
-(interpreter recorded). Tests 156 → 169 passed (`.venv`, `mcp` present).
-Follow-ups (not done): N9 support-domain defaults in `ExtractionConfig.labels`/`field_order` move to
-the `support_example` profile with the profiles slice; N11 decide sqlite vector namespaces before S3;
-N12 budget overrun trace event; N13 aggregate all pydantic errors in `validate_config`; §2.1.7
-hits-bounded catalog-read conformance check needs an arm (S3/arms).
+- A real-model smoke of `patterns learn` (loopback model first; hosted only within the owner's paid
+  QA budget) and a public-corpus benchmark of proposal quality and cost per day.
+- B10: the general spend ledger on every ledger backend, with `reconcile`, and `learning.patterns`
+  moved onto it.
+- B11: the safe redaction engine; the egress stamp then names it.
+- L3a: run the loop on partition unparsed queues and tag stored raw replies with their partitions.
+- The "after if approved" coverage does not shadow the targets of pending fixes.
 
 
-### 2026-11-03 — P0/S3 decision agent, typed scope, answer contract, review stage, selection split — DONE
-Branch `worktree-agent-a1a8201a5f0aed248` (commit `893e668`), to be merged by the coordinator.
-Landed: `decision/` (`intent.py` pre-pass, `base.py` request/plan/decision types + fail-policy
-machinery, `values.py` ValueResolver, `scope.py` ScopeCompiler, `rules.py`, `classifier.py`,
-`llm.py`, `cascade.py`), `selection/` (`types`, `collapse`, `limits`, `union`, `ordering`,
-`diversity`, `pins`, `packing`, `select()` chain), `generation/contract.py` (Claim/Answer/
-AnswerResult/AggregateEvidence/AnswerContract), `pipeline/review.py` (ReviewStage, Review,
-JsonModelReviewer, REVIEW_PROMPT moved), `core/config_decision.py` (`StagePolicies`),
-`core/config_selection.py` (`OrderingKind`, `PackingConfig`); `core/config.py` touched for two
-imports and three fields (`decision.stage_policies`, `selection.ordering` kinds/default,
-`selection.packing`); `compat/config_v1.py` ordering map; `backends/memory.py` date-field
-`date_interval` bounds; `tests/conftest.py` v2 fixtures; schema regenerated; CONFIGURATION,
-ARCHITECTURE, VALIDATION updated. Tests 156 → 300 passed (144 new: `tests/unit/test_{intent,
-scope_values,fail_policies,classifier_artifacts,llm_agent,answer_contract,selection,count_probes}.py`,
-`tests/contract/test_review_stage.py`, `tests/parity/test_ordering_parity.py`, one config test).
-Deviations / interpretations: (1) `selection.ordering` default is `reciprocal_rank` (plan §3.9) and
-the v1 map is `per_arm → reciprocal_rank`, `rrf → rrf`; S2 had `per_arm → per_arm`, `rrf →
-reciprocal_rank`, which would have changed the formula of an upgraded `rrf` config. `per_arm` stays
-accepted as a deprecated alias; `best_arm_rank`/`stable_interleave` have no v1 form and `downgrade`
-rejects them with a key path. Two S2 config assertions were updated accordingly. (2) The nine
-HybridQA probe shapes are not enumerated in the repo (VALIDATION.md records only "0/9"); they are
-reproduced from the two documented failure modes (invented identifiers → confident zero, numeric
-total answered with a record count) plus seven deterministic variants, listed in
-`tests/unit/test_count_probes.py`. (3) `rules` binds predicates only from observed values of
-listable fields / enum values occurring verbatim (unit words excluded) and from request filters; any
-other qualifier fails the plan. The plan's "quoted strings → phrase boost" is exposed as
-`Intents.quoted_phrases` for the lexical arm; `RetrievalStep` has no phrase field. (4) The classifier
-ships as interface + artifact contract; there is no ONNX inference dependency, so a configured
-classifier fails `validate()` unless a `ClassifierModel` is injected via `Dependencies.components`.
-(5) `AnswerContractConfig.on_violation` keeps S2's `fail` literal (plan says `error`). (6) The review
-stage treats a `raw_all_arms` re-plan as `replan_abstained`. (7) `date_interval` on a `datetime`
-field under `require_offset` rejects calendar-shaped bounds (`2024-03`) with `timezone_missing`;
-`assume_utc` or `date` fields accept them. (8) The two v1 agentic tests moved with S4 to `tests/contract/test_engine_support_example.py` (S3 wrote "stay in `tests/test_core.py`"; that file was replaced)
-against the v1 engine; their intents are reproduced in `tests/contract/test_review_stage.py` and the
-originals can be retired when the engine is ported. (9) `selection/phrase.py` not created (lexical
-arm concern). (10) `DecisionRequest` is a slice-local request type until the engine defines the v2
-request; `Capabilities` carries enabled arms, metadata schema, step cap and id patterns.
-Follow-ups: engine wiring (`decide` → `select` → `ReviewStage.run` → `AnswerContract.enforce`);
-`exact_set` guard (Phase 2) screening prose numerals; `profiles` prompts for the planner; a bare
-relative artifact filename such as `model.onnx` is rejected by the kernel's dotted-path rule
-(`core/component.py::DOTTED_IMPORT`) — the kernel-fix branch's scanner change should cover it.
 
-### 2026-11-03 — P0/S4 storage + arms on the contracts, write path with policies, neutral profiles — DONE
-Commits `v2(phase-0/s4a)` and `v2(phase-0/s4b)`. Landed: `backends/sqlite/` (all eight capabilities
-over `snapshots/<gen>/catalog.sqlite` + vector files + `runtime.sqlite`; schema a superset of the v1
-tables, `index_format` stays 3), `backends/_scope.py` (shared predicate/measure semantics),
-`backends/extras.py` (non-frozen extension protocols: counts, `find_entities`/`mentions`, community
-objects), `testing/backend_conformance.py` + `tests/conformance/` (kit v0 over memory, sqlite,
-sqlite+faiss), `ingestion/{write,policy,release}.py` (single write path, per-projection validation,
-failure manifest, old generation stays active, strict/quarantine/partial with coverage, ledger reuse +
-raw replies), `extraction/` package (v2 `BuiltinExtractor` on core types, `relocated` level,
-`dedupe.py`; S1 modules moved with shims), `communities/{base,reports}.py`, `arms/` (five components),
-`engine.py` on config v2 with `Engine(config, components=[...])`, `profiles/` (`neutral`,
-`support_example`, neutral prompts, voices), `core/request.py`, CLI on v2 (`ingest --allow-partial`).
-Tests 156 → 229 passed (`tests/test_core.py` replaced by `tests/contract/test_engine_support_example.py`
-under `support_example`; `test_relative_config_paths` covered by `test_config_v2.py`); wheel/CLI smoke
-passed. Docs: CONFIGURATION, ARCHITECTURE, VALIDATION, schema regenerated.
-Deviations / interpretations: (1) `Relation.occurrences` (list of `Occurrence{span, provenance}`)
-added to the kernel type for dedupe. (2) Per-chunk `ExtractionOutput` uses mention-level entity ids
-(canonical key + chunk + offsets) so the endpoint-containment invariant holds; the write path
-canonicalises to `entity_key(type, name)` before storage; relation endpoint mentions are stored as
-their own span rows. (3) Graph/community arms and projection validation need operations outside the
-frozen protocols; they live in `backends/extras.py` as separately named protocols (candidates for
-the §3.5 changelog), not in `contracts.py`. (4) Community objects are stored through the graph facet
-(`put_communities`/`communities`), report statuses keep today's values (`disabled`, `partial`,
-`complete_input`, `rejected`, `pending`). (5) `core/config.py` edits beyond "one import + one field":
-`extraction.policy` no longer rejected, `extraction.prompt`, `review.prompt`,
-`generation.evidence_fields`, `pipeline.allow_incomplete_arms`, `request: RequestConfig`, neutral
-defaults (`labels`, `field_order` empty; `gliner`/`llm` require labels), profile overlay applied in
-`validate_config`. (6) `SearchRequest.record_context` keys are validated by the engine against
-`request.context_keys` (wire model keeps only a size bound). (7) v1 configs upgrade to
-`profile: support_example` (v1 had those conventions built in); `downgrade` maps overlay-equal
-prompts back to `None` so N6 round-trips hold. (8) `postgres`/`neo4j` validate but the engine refuses
-them (typed error) until Phase 1; `tests/test_external.py` is skip-marked with that reason.
-(9) `JsonModel.call_text` added (raw reply for the ledger); `call` validates on top of it.
-(10) Aggregate `denominator` is the eligible population (ACL + request filters), not the ACL-only corpus.
-(11) Lexical phrase boost ships with a simple DF guard (skip when the phrase matches more than half
-of the term hits). (12) `AnswerResult.coverage` is carried in `trace["coverage"]` until
-`generation/contract.py` lands (other agent's slice).
-Merge note for `v2/p0-s2-fix`: `backends/capabilities.py` here marks `sqlite` as `status="contracts"`
-(and `tests/unit/test_backends.py` expects `{"memory", "sqlite"}`); under the per-(adapter,
-capability) `CapabilityDecl` layout every sqlite capability should become `contracts`. The engine
-selects adapters by kind (`sqlite`, `memory`), not by matrix status, so the merge order is safe.
-Follow-ups: promote `extras` operations into the contracts via the §3.5 changelog; swap the engine's
-decision/fusion/answer paths for `decision/`, `selection/`, `generation/`, `pipeline/review.py`
-(move the two agentic tests to `tests/contract/test_review_stage.py`); recipe-composed fingerprint
-from every component (`WritePath.index_fingerprint` composes extractor/embedder/chunking/communities
-today); Phase 1 ports of postgres/neo4j onto the kit; `examples/*_v2.yaml` once the engine no longer
-needs v1 files for the smoke script.
+### 2026-11-04 — A1/L3a + A1/L3b: day partitions, compose, run-daily, retention, pins — DONE (synthetic/contract; ledger and pins real-service on PostgreSQL and MongoDB containers; N10 memory budget not met)
 
-### 2026-11-03 — Merges: `v2/p0-s2-fix` and S3 (`worktree-agent-a1a8201a5f0aed248`) into `v2/phase-0` — DONE
-Commits `v2(phase-0): merge kernel fixes (v2/p0-s2-fix)` and `v2(phase-0): merge
-decision/selection/contract/review (S3)`. Tests: 242 after the fix merge (229 + 13), 386 after the
-S3 merge (+ 144); ruff clean; `docs/config.schema.json` regenerated, drift-free.
-Judgement calls: (1) `backends/capabilities.py` is the fix side's per-(adapter, capability)
-`CapabilityDecl` layout with every `sqlite` capability `contracts` (memory `contracts`; postgres
-vector + lexical and neo4j graph `legacy`; the rest `planned`); `ARM_CAPABILITY` is now
-`(capability, flag)` and `arms/base.py` reads the first element. (2) The fix side's record-store
-gating (`unknown_fields: reject`, undeclared/non-filterable predicates → `field_not_filterable`,
-`missing` on non-nullable → `field_not_nullable`, datetime/date range bounds → `unparseable_bound` /
-`timezone_missing`) and the record-identity rule now live in `backends/_scope.py` and apply to the
-memory fake **and** the sqlite adapter alike; the page-size cap is `core/types.py::Page` (`le=10000`)
-and each adapter converts an over-limit page into a `BackendError`; the unknown-vector-id error is
-implemented per adapter; S3's date-field
-`date_interval` handling is subsumed by that helper. (3) Fix-side `RECORD_KEYS` (`id`, `dataset`,
-`kind` bypass the schema) collided with the S3 fixture that declares `kind` as a non-nullable enum:
-identity keys now bypass the schema only while it does not declare them. (4) `compat/config_v1.py`
-keeps the fix's lossy-upgrade diagnostics/`strict`, S3's ordering map (`per_arm → reciprocal_rank`,
-`rrf → rrf`, `ORDERING_BACK` accepts both) and S4's `profile: support_example` mapping with prompt
-round-trip. (5) `fusion.FusionLike` maps v2 `reciprocal_rank`/`per_arm` to the alpha's per-arm
-formula and `rrf` to rrf; `best_arm_rank`/`stable_interleave` raise a typed `ConfigError` at engine
-construction until `selection/` is wired (next slice; decision/contract/review/selection are not
-wired into the engine by these merges). (6) `tests/conftest.py` is one file: S4's support_example
-engine fixtures plus S3's `v2_*` synthetic fixtures. (7) Docs keep every side's entry in the order
-S2-fix, S3, S4.
+Branch `worktree-agent-a5655a86a55ddb2f6` (base `a27ab5a`, `v2/logs`), commits `92fd93b`, `00591d2`,
+`b2881d2`. Scope: addendum rev 3
+§3.5, §3.7, §3.8.1–3.8.4.
 
-### 2026-11-03 — P0/S5 engine integration: harness end to end, serving parity — DONE
-Commit `v2(phase-0/s5)`. Landed: `engine.py` rewritten on the harness (`RunContext` → intent pre-pass
-→ `DecisionAgent` built from `pipeline.decision` (`rules`/`llm`/`classifier`/`cascade`) → arms →
-`selection.select`/`pack` → `ReviewStage` when enabled → generation → `AnswerContract.enforce`;
-explicit v1 `aggregate` mapped to `DecisionRequest.scope`; `Engine(config, components=[...])` also
-accepts a decision-agent instance, a reviewer object and a classifier runtime); v1 planner/fusion/
-agentic paths and the `best_arm_rank`/`stable_interleave` stubs removed (`fusion.fuse` kept as the
-parity oracle only); `models.py` owns the wire `Answer`/`Claim`/`Coverage`/`Violation`/
-`UnsupportedConstraint` (contract and `core.types` re-export them), `AnswerResult` + `SearchResult`
-gain additive fields, v1 `Plan`/`PlanStep`/`Review` retired; `serving/parity.py` + typed `mcp.py`
-tools with a start-up drift check; HTTP `/v2/search`, `/v2/answer`; `doctor` reports a construction
-error instead of a traceback; neutral prompts: one planner prompt (`profiles.prompts`, used by
-`decision/llm.py`), review prompt shared with `pipeline/review.py`, generator prompts ask for
-`claims`. Tests 386 → 429 passed (`tests/contract/test_engine_harness.py` 41,
-`tests/parity/test_request_parity.py` 2; `test_engine_support_example.py` llm/agentic/generation
-tests ported to `LlmPlan`/`pipeline.Review`/contract outcomes, `test_per_arm_preserves_union...`
-replaced by the engine-level ordering test; `test_domains.py` planner payload keys). Docs:
-ARCHITECTURE ("Retrieval and selection semantics", "Model flow", request flow diagram),
-CONFIGURATION, VALIDATION; schema regenerated (no drift — `Config` unchanged).
-Deviations / interpretations: (1) An explicit caller `aggregate` bypasses the `ScopeCompiler` and
-runs as given (the arm allowlist and the record store's `unsupported` cover it): the compiler is
-stricter than the backend about declared types (v1 upgrades declare `created_at` as `string`, which
-would have refused `first_seen`), and a typed request is not a model-invented value. With the
-`rules` agent it is added to the plan next to the raw retrieval steps (today's raw mode); with
-`llm` the engine appends it when the planner's plan has no structured step. (2) `DecisionRequest`
-gained `scope` and `canonical_record`; the llm payload gained `canonical_record`/`explicit_scope`
-next to the unchanged `caller_context_unverified`. (3) Effective packing priority =
-`selection.packing.field_priority` + `generation.evidence_fields` + chunking order; the generator's
-`evidence_budget.chars` overrides `packing.budget_chars` when set (v1 compat). (4) A planner failure
-(disabled arm, request-filter override, undeclared filter field) is no longer a `ValueError`: it is
-an abstention with the category in `trace.decision` and the constraint in
-`unsupported_constraints`; a generator citing unsupplied evidence abstains with `unknown_evidence`
-(default) instead of raising. (5) `arm_hits` keeps a key for every arm that ran (v1 behaviour)
-even when empty. (6) `AnswerResult.coverage` is set when the manifest policy is not `strict`, a
-stage is incomplete or the status is `partial`; `trace.coverage` keeps the raw manifest coverage.
-(7) `LlmAgent.validate` sees the process environment (`Environment(env=os.environ)`), so a planner
-role with an unset `api_key_env` fails engine construction (fail closed; `doctor` reports it).
-(8) `/v2/*` HTTP paths are aliases of the existing routes; streaming, `capabilities`,
-`list_values`, `lookup_record` stay Phase 1. (9) The nine probes and the two agentic intents are
-asserted on declared claims; prose numerals are Phase 2.
-Follow-ups: cascade and classifier through the engine with an injected runtime; exact_id arm +
-alias map → `Capabilities.id_patterns`; `generation/generator.py` as a component (the engine calls
-`JsonModel` directly through `BudgetBridge`); `tests/smoke_wheel.py` still asserts the old MCP tool
-set only by name (unchanged); `docs/plans/reviews/p0_s3_s4_review.md` (untracked, another agent's)
-not touched.
+**L3a done.**
 
-### 2026-11-03 — P1 MongoDB adapter on the contracts (branch `worktree-agent-abd12a2ec9a5ab040`) — DONE
-Commit `v2(phase-1/mongodb)` (`f214fc7`), to be merged by the coordinator. Landed:
-`backends/mongodb/` (`adapter.py` MongoBackend with six facets, `_db.py` naming/typed rows/predicate
-compilation/text-search strings/error mapping, `catalog.py` Catalog + RecordStore, `search.py`
-text-index LexicalIndex with `$lookup` scope pushdown, `runtime.py` cache/ledger/sessions with TTL
-indexes, `registry.py` MongoGenerationRegistry with an atomic `CURRENT` pointer document and a write
-lease); `backends/capabilities.py` mongodb rows `contracts` for catalog/lexical/records/cache/ledger/
-session, `vector` kept `planned` (assumed default #8: Atlas-only, never claimed against community
-MongoDB), no graph; `testing/backend_conformance.py::check_protocols` compares only non-`planned`
-declarations; `engine.py` builds `kind: mongodb` via `MongoBackend.from_config`; pyproject extra
-`mongodb` (`pymongo>=4.6,<5`), services workflow installs it; `tests/conformance/
-test_mongodb_conformance.py` (16 `external` tests: kit per capability + `run_all`, collection naming
-and isolation, lexical predicate pushdown, cardinality cap, TTL indexes, registry pointer/failure/
-lock, `from_config`, unreachable server); `tests/unit/test_mongodb_adapter.py` (12: compilation,
-naming, paging, text strings, fake-client error mapping). Docs: CONFIGURATION (mongodb row, kinds),
-ARCHITECTURE, VALIDATION (real-service entry with digest and version), services README.
-Tests: non-external 386 → 398 passed; external `-k mongo` 16 passed against `mongo:7.0.16`
-(`sha256:c630c593…`), ruff clean, `docs/config.schema.json` drift-free (Config unchanged).
-Deviations / interpretations: (1) measures and groups are computed over the matched rows with the
-shared `_scope` helpers (sqlite does the same; rows are fetched anyway for `matched_ids`), so the
-plan's "aggregation pipeline" is used for predicates, population counts, `exists` and `values`
-only; results are identical to sqlite/memory by construction. (2) `values` refuses fields with more
-than `max_values_cardinality` (10000) distinct values instead of truncating silently. (3) Session TTL
-index only when `session_ttl_seconds` is passed on the Python API (the contract's `expire()` is the
-explicit path; config has no such field). (4) `lock()` takes a lease document; a held lease is a
-typed error, a lease older than 600 s is taken over (documented). (5) Lexical scores are MongoDB
-`textScore`, documented as not BM25; `analyzer_id` is `mongo_text_english`. (6) The kit's
-`check_protocols` change was needed because mongodb legitimately declares a `planned` vector row;
-the memory/sqlite suites are unaffected. (7) The ground-rules schema command imports the v1
-re-export `su_multi_arm.config.Config`; the checked-in file is the v2 `core.config.Config` schema
-and was regenerated from that (unchanged). (8) The external suite defaults `SU_TEST_MONGO_URI` to
-the stack default and skips with a reason only when the variable is unset and the default is
-unreachable; an explicitly configured unreachable server fails.
-Follow-ups: engine end-to-end on a mongodb catalog needs the multi-backend write path slice
-(`generation_registry()` is ready); Atlas vector search remains unimplemented and untested; cross-
-engine lexical agreement report (`tests/services/test_lexical_agreement.py`) once the Lucene
-adapters land; the `.venv` editable install points at the main checkout, so worktree runs need
-`PYTHONPATH=<worktree>/src`.
+- `core/config_logs.py`: `logs` (source, timezone, partitions path and clock, parse, compose,
+  retention, pins, schedule, settle), `ingestion.line_recipe`, `ingestion.projections`. Cross-key
+  rules in `Config.logs_coherent`: known source, `pattern` extractor, line recipe with `exemplars`,
+  the n1 bound (`max_line_bytes + multiline.max_bytes <= max_chunk_chars`), the embedding
+  invariant (no log-line field embedded), `trace_masking: privacy`, no `store_text`, and a catalog
+  registry with pins (refused on mongodb/elasticsearch).
+- `ingestion/partitions.py`: `FilePartitionStore` with `begin` (resume only with the same source
+  query sha, else `PartitionConflict`), atomic `put_unit`, `seal`, `reparse`/`repull` as `v+1`,
+  `expire` to a content-free tombstone (line and source-id hashes, minus lines of live days), and
+  the schedule lock (`flock`, a `LeaseStore`).
+- `ingestion/logs_parse.py`: head-line matching, unit and signature rows with row exactness under
+  the coverage condition (scaled `approximate` estimates otherwise), hourly cells, exemplars,
+  unparsed queue; a spawn process pool whose workers must report the parent's library identity.
+- `ingestion/rollups.py`: per-day and window documents of every §3.7 kind except `issue_report`,
+  each with a rendered `header` (date basis and timezone included).
+- `ingestion/logs_compose.py`: `day_window` (`index_date` and `event_time` clocks, DST-aware,
+  overlapping UTC index dates), identity check with reparse of stale partitions (N11), compose
+  identity (an unchanged window is not rebuilt), build through `WritePath.ingest(replace=True)`
+  with a `logs` manifest section.
+- `ingestion/schedule.py`: `LogsPipeline.run_daily|backfill|settle` under the schedule lock;
+  refuses a mapping without a redactor before any request; per-unit resume; content-free run
+  reports rotated at the window length; `logs_cli` for `su-multi-arm logs …` and `retention …`.
+- Write path: `line` chunk recipe (`extraction/chunking.py`), projection exclusions and
+  `embed_fields`, `manifest_extra`, `chunking_recipe()` (both new keys enter the index recipe only
+  when set; golden fingerprints unchanged).
+- Source: `ElasticsearchRestSource.discover(window, index_dates=…)` resolves a dated expression for
+  each overlapping index date and slices units to the window (event-time clock).
 
-### 2026-11-03 — P0 review fixes for S3/S4 (branch `v2/p0-review-fix`, base `9f26b88`) — DONE
-Fixes all four blocking findings of `docs/plans/reviews/p0_s3_s4_review.md` and the cheap
-non-blocking ones (N1, N2, N4, N5, N6, N7, N9, N10); see `docs/VALIDATION.md` for the per-finding
-summary. Tests 386 → 418; conformance 31/31 on memory, sqlite, sqlite_faiss; ruff clean; no schema
-drift. Judgement calls: (1) the storage rule for temporal values is "naive = UTC" on both adapters,
-which is sound because `require_offset` rejects naive values at ingestion, so a naive value can
-only come from an `assume_utc` field (an undeclared field that happens to hold an ISO stamp gets the
-same reading); document-scope predicates (no schema) compare instants without date truncation,
-typed records truncate for `date` fields. (2) `detect_intents(query, id_patterns, targets=None)`
-keeps the permissive grammar when no targets are given (schema-less callers); agents always pass
-`Capabilities.structured_targets()`; targets are whole phrases, never split into words.
-(3) `ReviewConfig`/`ReviewStageConfig` keep `ge=1` but reject `enabled` with `max_hops < 2`
-(a v1 `routing.max_hops: 1` file still upgrades when review is disabled). (4) `remaining` in
-`coverage.stages` stays in units (chunks/communities); `documents_not_processed` lists the documents.
-Left to the integration slice: N3 (records facet convention), N8 (single planner prompt),
-N11 (`zero_match_fields` on `AnswerResult`), N12 (relocation-aware reuse key).
-### 2026-11-03 — P1/opensearch OpenSearch adapter on the frozen contracts — DONE
-Branch `worktree-agent-a1c794b75ac6aff4c` (commit `v2(phase-1/opensearch)`), to be merged by the coordinator.
-Landed: `backends/opensearch/` (`OpenSearchBackend` with `catalog`, `lexical`, `vector`, `records`
-facets; `transport.py` over `opensearch-py` with `max_retries=0`), `backends/_lucene_common.py`
-(index naming, typed field layout `s/n/b/t/v/p`, predicate → DSL, scope → `bool.filter`, lexical
-templates, paging, `Transport`/`TransportError`, bulk checks; shared with the future Elasticsearch
-adapter), matrix rows (`opensearch`: four capabilities `contracts`, flags `analyzer_id:
-lucene_standard`, `highlight`, `field_boost`, `ann: hnsw_optional`, `max_dimensions: 16000`,
-`namespaces`, `exactness: exact`, `max_matched: 10000`), engine wiring (`kind: opensearch` →
-`OpenSearchBackend.from_config`, env-var hosts), pyproject extra `opensearch = ["opensearch-py>=2.8,<4"]`,
-services workflow installs it, `tests/unit/test_opensearch_backend.py` (fake transport, 14),
-`tests/conformance/` parametrised over `opensearch` / `opensearch_hnsw` (marked `external`, random
-`su_test_<hex>` prefix per test, test-side cleanup), `tests/services/test_opensearch_adapter.py` (6),
-docs (CONFIGURATION backend row + "OpenSearch semantics", ARCHITECTURE, services README, VALIDATION).
-Real-service result against `opensearchproject/opensearch:2.19.1` (digest in VALIDATION.md):
-conformance 12 passed / 8 skipped (undeclared capabilities) / 0 failed; adapter checks 6 passed.
-Tests 386 → 401 passed (`-m 'not external'`), ruff clean, schema drift-free.
-Deviations / interpretations: (1) graph/cache/ledger/session are **not declared** for `opensearch`
-rather than `planned`: the plan's §3.5 table says "no" for them, and a `planned` declaration would
-make the derived adapter status `legacy` (meaning "v1 code serves it"), which is false; configuration
-naming them fails with "does not declare capability". (2) Records exactness is `exact` via native
-filter pushdown + a bounded id-ordered scan feeding `_scope.scope_result`, not the plan's approximate
-`cardinality`/`date_histogram` aggregations: the frozen `ScopeResult` carries `matched_ids`, so the
-scan is unavoidable and the measures then come for free and identical to sqlite/memory; a scope above
-`max_matched` (10000) is a typed `BackendError`, never a truncated result. (3) `knn.exact_rescore:
-false` with `method: hnsw` is refused at construction (ANN scores are engine-normalised, not cosine);
-HNSW uses the Lucene engine with the eligibility filter inside the graph search and oversamples
-`max(50, 4k)` candidates. (4) Per-generation identity is the three generation-named indices; the
-plan's "per-generation alias" is interpreted as the dataset-level aliases
-`<prefix>_<dataset>_{docs,chunks,records}` switched atomically by `activate(gen)`; `delete_generation`
-refuses an aliased or protected generation. (5) Chunk documents carry the parent document's typed
-fields (denormalised at write; re-putting a document re-derives its chunks with `_update_by_query`,
-`conflicts: abort`) so lexical/vector scope is a native filter without a join. (6) `casefold_match`
-is Lucene `lowercase`, not Python `casefold`. (7) Catalog `iter_scope`/counts refresh before reading
-and records write with `refresh=true` (RecordStore has no `refresh`); lexical/vector writes need
-`refresh(gen)` as the contract says. (8) Conformance tests for adapters that declare a subset of the
-capabilities skip the undeclared checks explicitly (`tests/conformance/test_backend_conformance.py`).
-(9) The container `su-multi-arm-tests-opensearch-1` was started alone (another agent's `mongo`
-service shares the compose project), so teardown removed only the `opensearch` service, not `down -v`.
-(10) Tests must run with `-o pythonpath=src` from a worktree: the `.venv` editable install points at
-the main checkout.
-Follow-ups: call `backend.activate(gen)` from the multi-backend write path's release step (Phase 1
-row "Multi-backend write path"); `doctor --probe` should call `OpenSearchBackend.probe()`; the
-cross-engine lexical agreement report (`tests/services/test_lexical_agreement.py`); an HNSW
-filter-recall gate on a larger fixture before recommending `method: hnsw`; Elasticsearch adapter
-reusing `_lucene_common.py` (`dense_vector` mapping, `knn` top-level search, ES error shapes).
+**L3b done.**
 
+- `backends/extras.py`: `LedgerRetention` (`put_raw(tags=)`, `tag_raw`, `raw_tags`, `tagged`,
+  `add_refs`/`refs`/`referencing_generations` on a `ledger_refs` side table, `purge(PurgeSpec)`,
+  `drop_job`, `jobs`, `raw_entries`) on the memory, sqlite, sqlalchemy, postgres and mongodb
+  ledgers; conformance kit `check_ledger_retention`.
+- `WritePath` records every ledger key a generation uses (salted `extraction:` keys, `embedding:`,
+  `raw:` and the `pattern_library:` snapshot) in `ledger_refs`, with `ledger_refs_count`/`_sha` in
+  the manifest; failed builds and `delete_generation` drop their refs.
+- `ingestion/pins.py`: TTL pins on the file registry (sqlite sidecar), memory, SQL and PostgreSQL
+  registries; `PinsUnsupported` elsewhere; `ProcessPins` (one heartbeat pin per process and
+  generation, refcounted; `for_config`).
+- `ingestion/retention.py`: rule (a) plan and `run` (pins honoured with a bounded retry, cache
+  invalidation, job entries, tag and reference purge, tombstones, session expiry, audit records),
+  `report` (including O7 approved examples), content-based `verify`.
 
-### 2026-11-03 — P1 model providers (branch `worktree-agent-ac4c7bd31a141cbc7`, base `783d821`) — DONE
-Commit `v2(phase-1/providers)` (`5bf8f55`), to be merged by the coordinator. Landed: `providers/`
-package replacing `providers.py` (`__init__` re-exports `JsonModel`, `Embedder`, `CallBudget`,
-`tokens`): `base.py` (typed `ProviderError` categories, `SchemaViolation(ValueError)` with the raw
-reply, normalised `Usage`, `CallEstimate`, `CallMeter`, `RoleSpec`, `ChatProvider` protocol,
-strict-schema conversion, single-request `HttpCall`), `capabilities.py` (registry keyed
-`(provider, model-pattern)`: native flag and kind, request modes, prompt caching, output-token and
-reasoning parameter names), `anthropic.py`, `openai.py`, `openai_compatible.py`, `none.py`,
-`embeddings.py` (`hash`, `sentence_transformers`, `openai`, `openai_compatible`), `accounting.py`
-(`RunBudgetMeter`: Budget calls/tokens/USD + `model_call` trace events), `json_model.py`.
-`core/config.py`: `ChatRole.provider` adds `openai`, `reasoning_effort`, registry-backed validation of
-`structured_output`/`prompt_caching`/`reasoning_effort`/openai token parameter, `openai` requires
-`api_key_env`; `EmbedderRole.provider` adds `openai`. `runtime/budget.py`: `ModelPrice.
-cache_write_input_per_million`, `PriceTable.cost(..., cache_write_tokens)`, USD reserved whenever the
-table prices the key. `decision/llm.py` (`_BudgetBridge`/`BudgetBridge` are aliases of
-`RunBudgetMeter`; `ProviderTimeout` → `timeout`, `SchemaViolation` → `schema_violation`),
-`pipeline/review.py`, `engine.py` switched to `RunBudgetMeter`; `compat/config_v1.py::downgrade`
-refuses `openai` roles. Tests 473 → 558 passed (+85: `tests/contract/test_providers.py`,
-`tests/unit/test_provider_capabilities.py`); `tests/services/test_local_llm.py` (`external`, skipped:
-`SU_TEST_LOCAL_LLM_URL` unset; no model server touched). Ruff clean; schema regenerated.
-Docs: CONFIGURATION (providers section with Anthropic, OpenAI and local examples), ARCHITECTURE,
-VALIDATION (hosted providers contract-mocked only).
-Deviations / interpretations: (1) `CapabilityDeclaration.structured_output` default changed from
-`json_schema` to `none`: `none` is exactly the alpha's wire behaviour (prompt schema + strict
-validation), whereas keeping `json_schema` would have started sending `response_format` to every
-existing `openai_compatible` server and is meaningless for Anthropic (rejected there now). The
-effective-config `fingerprint()` of v2 configs changes accordingly (it is recorded, not checked; the
-index fingerprint is unaffected). (2) Semantics per mode: `native` = provider-enforced (Anthropic forced
-tool use; OpenAI `strict: true`), `json_schema` = `response_format` with `strict: false`,
-`json_mode` = `json_object`; the last two are OpenAI-style only. (3) OpenAI native with a schema strict
-mode cannot express (free-form `dict` fields, e.g. `LlmPlan.filters`) is a `CapabilityMismatch` before
-any request — no silent non-strict fallback; such roles declare `json_schema`. (4) Anthropic native uses
-tool use, not the newer `output_format` structured-outputs beta (stable, widely available; recorded in
-the registry as `native_kind: tool_use`). (5) `max_tokens_parameter` keeps applying to
-`openai_compatible` only; `anthropic` ignores it (v1 upgrades always emit it), `openai` must match the
-registry. (6) Reservation before each request-path call = 1 call + input estimate (chars/4) + the
-`max_tokens` output ceiling (+ USD when priced); commit = reported usage, or the estimate when the
-server reports none (`usage_reported: false`), including for failed calls. (7) Anthropic
-`cache_creation_input_tokens` are priced with the new optional `cache_write_input_per_million`
-(defaults to the input rate). (8) The protocol method is `complete_json(system, payload, schema,
-budget, ctx)` per the slice brief rather than the plan's `complete(ctx, role_cfg, ..., stream)`;
-streaming is not implemented in this slice. (9) Plan says `openai_compatible` capabilities come from the
-role config: the registry entry is `role_declared` and only bounds what may be declared (never native,
-caching at most passive). (10) Missing key = `MissingSecret(ProviderError, ValueError)` so existing
-`ValueError` handlers keep working.
-Follow-ups: streaming (plan Phase 1 row) and `doctor --probe` per role; Responses API; embedding usage
-into the request budget (recorded on the provider as `last_usage` only); the write path's `CallBudget`
-records usage but does not enforce token/USD limits; real-provider smoke awaits owner decision #14;
-`examples/*_v2.yaml` with provider examples once the examples move to v2.
+**Deviations.**
 
-### 2026-11-03 — P1/elasticsearch adapter on the frozen contracts — DONE
-Branch `worktree-agent-adc476aefbf7e9366` (merge of `v2/phase-0` at 74b8595 included), commit
-`v2(phase-1/elasticsearch)`. Landed: `backends/elasticsearch/` (`adapter.py`, `transport.py`,
-`search.py`, `registry.py`) as subclasses of the OpenSearch classes over `backends/_lucene_common.py`:
-same three indices per generation, dataset aliases switched atomically by `activate(gen)`, typed-field
-pushdown, BM25 lexical, bounded records scan with the shared `_scope` measures; Elasticsearch-specific
-transport (official client, `TransportError` mapping, ndjson bulk), `probe` (8.x only), `dense_vector`
-exact (`index: false` + `script_score` cosine) / float HNSW opt-in (top-level `knn` candidates, exact
-rescore), no `index.knn` setting, and an alias-backed `generation_registry()` (manifests, failures,
-create-only lock in `<prefix>__registry`; `current()` through the `docs` alias). Engine dispatch for
-`kind: elasticsearch` (passes `config.dataset` for the registry), extra `elasticsearch`
-(`elasticsearch>=8.17,<9`), services workflow install step, matrix rows `contracts` for
-catalog/lexical/vector/records, conformance conftest params `elasticsearch`/`elasticsearch_hnsw`
-(engine-neutral cleanup by index name), `tests/conformance/test_elasticsearch_conformance.py`
-(probe, isolation/listing/delete, registry alias switch + failed build + lock, exact-vector parity
-with the fake), `tests/unit/test_elasticsearch_backend.py` (10 fake-transport tests). Docs:
-CONFIGURATION (row, semantics section renamed, typed-field bullet), ARCHITECTURE, VALIDATION
-(real-service entry with digest), services README.
-Tests: `-m 'not external'` 498 passed on the merged tree (pre-merge worktree 418 → merged baseline +
-10 new unit tests); external `-k elasticsearch` **16 passed, 8 skipped** against Elasticsearch
-8.17.4 (kit over both parametrisations + 4 module tests; skips are the undeclared capabilities);
-ruff clean; schema unchanged.
-Shared-code changes (beyond the agreed files, made after the coordinator's merge instruction):
-(1) `backends/opensearch/{adapter,catalog,search}.py` are engine-parametrised: typed errors use
-`self.kind`/`self._b.kind`, and four override hooks were added (`_default_transport`, `index_body`,
-`OpenSearchVector._exact_script`/`_ann_candidate_ids` plus `vector_type`/`dimension_key`); no
-behaviour change for OpenSearch, its fake-transport unit tests pass. (2) `_lucene_common.py`:
-`typed_fields`, `_scalar_query`, `_bound`, `predicate_query`, `predicates_filter` take an optional
-field spec and use `_scope.temporal_key` (naive stamps/date-only strings as UTC instants, `date`
-fields as calendar dates, temporal `eq` as instant equality); the OpenSearch records facet passes
-`schema.field`. This is what the kit's new `assume_utc`/`date` checks (merged with S5) require and
-it applies to OpenSearch identically; its external suite was not re-run here (container not up).
-Deviations / interpretations: (1) the plan's `_lucene_common.py` is used, but the engine-neutral
-adapter/facet classes still live in `backends/opensearch/`; Elasticsearch subclasses them rather
-than duplicating them — hoisting them into a neutral `backends/lucene/` package is a follow-up.
-(2) Records use the shared bounded scan (exact, `max_matched`), not native `cardinality`/
-`date_histogram` aggregations; the pre-merge private implementation with native aggregations was
-dropped for consistency with OpenSearch (matrix flags `exactness: exact`, `max_matched: 10000`).
-(3) `generation_registry()` exists only on the Elasticsearch adapter (the write path needs it for
-`storage.catalog`); OpenSearch has `activate(gen)` but no registry — follow-up to share the registry.
-(4) `test_config_v2.py`'s "planned kind" case now uses `sqlalchemy` (elasticsearch is on the
-contracts). (5) `tests/unit/test_backends.py` matrix assertions include elasticsearch as `contracts`.
-(6) The `elasticsearch` client is 8.19.3 against server 8.17.4 (8.x major gate in `probe`).
-Follow-ups: hoist the shared classes out of `backends/opensearch/`; registry for OpenSearch; re-run
-the OpenSearch external suite after the temporal-key change; end-to-end `ingest` through `Engine`
-on Elasticsearch/OpenSearch (`storage.catalog`); HNSW filter-recall gate; the cross-engine lexical
-agreement report (`tests/services/test_lexical_agreement.py`); `tests/services/` adapter test for
-Elasticsearch mirroring `test_opensearch_adapter.py`.
+- (a) **Redactor.** B11 has not landed, so there is no configured redactor. `run-daily`,
+  `backfill` and `settle` refuse with `RedactionRequired` before any request; the CLI therefore
+  refuses them today. The Python API accepts an injected redactor (the tests use a synthetic
+  e-mail/IPv4 redactor). `compose` and `retention` work from the CLI.
+- (b) **Clock name.** The clocks are `index_date` and `event_time` (with `logs.timezone`);
+  the addendum's `event_time_utc` is `event_time` with `timezone: UTC`.
+- (c) **Raw records** are kept per unit as gzip JSON (`units/<unit>.json.gz`), not one
+  `raw.jsonl.zst`: zstd is not a package dependency.
+- (d) **`seal(key, parsed)`** takes the parse result, and `reparse(key, library, parse)` takes the
+  parse function, instead of the addendum's argument-free signatures.
+- (e) **Unreferenced purge** spares tagged entries (learning replies live until a tagged
+  partition expires). It is skipped, and recorded in the retention report, while any remaining
+  generation predates `ledger_refs`; verify then does not count unreferenced keys as orphans.
+- (i) "Ledger on the 5 adapters plus memory" is read as every adapter that serves a ledger:
+  sqlite, sqlalchemy, postgres and mongodb, plus memory. OpenSearch, Elasticsearch, neo4j and kuzu
+  serve no ledger.
+- (f) **`signature` documents are one per signature**, so a `$service` attribute link (which needs
+  `service` in the document metadata) is not emitted from them; the graph wiring is L5.
+- (g) **Not in this slice:** `limits.window` pause, the learning step (reported `not_run`; L4b),
+  proposals and their `expire` records (L4b), `issue_report` and co-firing communities (L5),
+  serving-path wiring of `ProcessPins` into `Engine` (the class and its config are here).
+- (h) Generation manifests deleted with a sqlite generation (the file registry keeps them in the
+  snapshot folder) are preserved as content-free audit records under `<partitions>/audit/`.
+
+**Tests.** `not external`: 1779 → **1856** passed, 73 skipped (+77). ruff clean, schema regenerated
+with `write_all`, golden fingerprints unchanged. New: `tests/unit/test_log_partitions.py`,
+`test_log_day_window.py`, `test_logs_config_and_recipes.py`, `test_logs_parse.py`,
+`test_pins_and_gc.py`, `tests/contract/test_run_daily.py`, `test_retention_11_days.py`,
+`test_logs_cli.py`, `tests/logs_support.py`; postgres pins test in
+`tests/conformance/test_postgres_conformance.py`; ledger retention in the conformance kit.
+Real-service: postgres, mongodb and sql[postgres] conformance (with ledger retention) and the
+postgres pin test passed against throwaway `pgvector:0.8.0-pg17` and `mongo:7.0.16` containers
+(69 passed; the one failure, `test_records_use_native_types`, fails identically at base `a27ab5a`).
+
+**Scale (N10).** `scripts/compose_scale.py`, sqlite, external workspace: 10^6 synthetic aggregate rows
+(1,113,100 documents) composed in 1118.8 s (within 20 min) with peak RSS 10.28 GiB, **above the
+8 GB budget, so N10 is not met on memory**; 10^5 rows: 117 s, 1.07 GiB. Follow-up: streaming or
+per-partition delta compose (§4.3).
+
+**Follow-ups.** B11 redactor wiring into `logs_cli`; `ProcessPins` in the serving path; L4b
+learning step, proposal expiry and `raw:` tagging of learning replies; L5 graph wiring of attribute
+links and communities; the pull window; streaming/delta compose for the N10 memory budget; the
+pre-existing postgres native-types failure.
+
+### 2026-11-04 — addendum A1 L0 + L1: read-only log sources, synthetic log fixtures — DONE (synthetic/mocked only)
+Branch `worktree-agent-a37fff270f8499b43` (base `9ba767f`, `v2/phase-0`), commit `f6e6ec6`.
+
+**Done.**
+
+- **`sources/`.**
+  - `contracts.py`: `SourceCapabilities`, `SourceWindow`, `SourceUnit`, `UnitCount`, `SourceCursor`,
+    `SourceDoc`, `SourceBatch`, the `Source` protocol, and the shared minimal types `SamplePlan`,
+    `Stratum` and `PartitionBudget`.
+  - `errors.py`: the nine typed errors of §3.1.
+  - `transport.py`: the §3.1.1 allow-list on the percent-decoded path, per-row parameters and bodies,
+    before any I/O. Refused: scripts, runtime fields and aggregations, unbounded keepalives,
+    redirects and env proxies. `DELETE` only for own and cursor-listed ids. Typed HTTP errors, no
+    retries.
+  - `elasticsearch_rest.py`: capability probe (403 on `/` tolerated); `_has_privileges` self-check
+    (OpenSearch account endpoint gives `unknown`); `_resolve`/`_alias` discovery; per-index count
+    queries from the mapping; scroll and `search_after` pulls with a stratum restart on cursor
+    expiry; partition budget; capped context; PIT probe.
+  - `cursor.py`: open-context registry; atexit and signal close.
+  - `sampling.py`: `hourly_quota` with an `outside` stratum, and `random_score`.
+  - `logs.py`: index-name parser, `LogRecord`, `LogMapping`.
+  - `multiline.py` and `probe.py`.
+- **CLI:** `su-multi-arm sources check|discover|count|probe`.
+- **Config:** `ComponentKind` gains `source`; `core/config_sources.py` adds the `sources` key; the
+  schema is regenerated.
+- **`testing/fixtures/logs/`:** the generator (three line styles, fragments, noise, synthetic PII
+  shapes), `FakeLogCluster` and `redos_corpus.yaml`.
+- **Docs:** CONFIGURATION, ARCHITECTURE, VALIDATION, CHANGELOG, and the main-plan changelog row.
+
+**Deviations.**
+
+- (a) **PIT is probed but not used for pulls.** A PIT search needs `POST /_search` without an index,
+  and that path is not in the §3.1.1 table. Pulls use scroll or `search_after`, which matches the
+  task. Adding that row is an owner or reviewer decision.
+- (b) **The B11 rule "any config with `sources:` requires `privacy.engine: safe`" is not enforced.**
+  B11 has not landed. `LogMapping` takes an injected redactor and reports `redaction: none` without
+  one. L1 persists nothing, and the probe reports aggregates only. **L3a and L4b must refuse a
+  mapping whose redaction is `none`.**
+- (c) **No user regex in this slice.**
+  - Index names are parsed with a literal vocabulary (longest suffix first) and a closed
+    `%Y/%m/%d` date format, instead of a library `index_name` entry.
+  - Multiline uses a closed set of built-in continuation rules, with the head defined as "not a
+    continuation".
+  - `assemble()` accepts `is_head`/`is_continuation` predicates for the L2 library.
+- (d) **`LogRecord` gains fields:** `file` (the multiline key `(container, file)`), `truncated`
+  (§3.4.2 n1), `source_id`/`index` (retention verify) and `lines`.
+- (e) **Unit time slices.** A dated index expression gives units without a slice (index-date
+  clock). An undated expression gives units sliced to the window (event time). The partition clock
+  itself is L3a.
+- (f) **`Source.pull` takes an optional `budget`.** It also builds the `SamplePlan` itself when none
+  is given (`plan_sample`).
+- (g) **The ReDoS corpus is a YAML fixture with a loader.** RE2 is not installed in the dev venv,
+  so the corpus is checked for shape and for super-linear growth under Python `re` only.
+- (h) **`sources` is a full-config key.** The CLI loads the whole config but never builds an engine.
+
+**Tests.** `not external`: 1189 → **1627 passed**. ruff is clean, the golden fingerprints are
+unchanged, and the wheel includes the new files. New test files:
+
+- `tests/unit/test_source_allowlist.py` (351 cases, including a 303-case method × path matrix with
+  zero requests reaching the fake);
+- `test_source_self_check.py`, `test_log_mapping.py`, `test_source_sampling.py`,
+  `test_synthetic_logs.py`;
+- `tests/contract/test_source_pull.py`, with CLI runs against a localhost fake and a SIGTERM
+  subprocess;
+- `tests/sources_support.py`.
+
+**Note.** The venv's editable install points at the main checkout. Tests in a worktree need
+`PYTHONPATH=src`, or they import the main checkout's code.
+
+**Follow-ups.**
+
+- The real-service tier: isolated ES 7.x and OpenSearch 2.x containers with synthetic data. Not run.
+- The PIT pull row (see a).
+- Sliced scroll (`pull.slices` only bounds open contexts today).
+- Data-stream backing indices (skipped with a diagnostic).
+- B11 redaction wiring and the `engine: safe` requirement.
+- L2 replaces the built-in continuation rules and the vocabulary parser with library kinds.
 
 
 ### 2026-11-03 — P1 Neo4j graph adapter on the contracts (branch `worktree-agent-abe51c291233d8741`) — DONE
@@ -1157,6 +962,117 @@ Follow-ups: query-encode cost (ONNX/quantised encoder, or encode cache for repea
 (serving-level `gc.freeze()` option); `bm25` segment for incremental (delta) ingest is a full rebuild;
 `hit_parts` document heads still parse the stored document JSON (a heads column would avoid it).
 
+### 2026-11-04 — A1/L2 + A1/L4a: `pattern` extractor (with reuse salt), template miner and synthesiser — DONE (synthetic/contract evidence)
+
+Branch `worktree-agent-a7b9050a7409e5f0b` (base `9ba767f`, `v2/phase-0`). Scope: addendum
+`v2_addendum_logs_and_patterns.md` rev 3, §3.3–3.4, §3.6.1 rows 1–3, plus the owner policy amendment
+of 2026-11-04 (LLM/system auto-promotion with a human in the loop later).
+
+**L2 done.**
+
+- `extraction/patterns/engine.py`:
+  - an explicit `re2` engine (`google-re2`; integer group spans; RE2 `Set` prefilter) and a `regex`
+    engine (`regex.ASCII`, per-call timeout, `deterministic: False`);
+  - `PatternEngineUnavailable` when the package is missing, with no fallback;
+  - the RE2-subset validator and ReDoS lint (star height, quantified alternation, adjacent unbounded
+    repeats, unbounded-repeat follow) on the stdlib parse tree, plus an RE2 compile when `re2` is
+    importable.
+- `library.py`:
+  - four files: `library.yaml` (human, never written); `learned.yaml`, `proposed.yaml` and
+    `decisions.yaml` (system, append-only YAML sequences);
+  - a merge with owner precedence (user > learned > proposed, with an `info` diagnostic);
+  - decisions replay (`approve | deprecate | supersede | expire | disable`): a human `disable` is final,
+    and system records never change human entries;
+  - every lint class of §3.3, including the `$attribute` rule and PII shapes in examples;
+  - inactive proposals keep lint errors as warnings;
+  - hand-edit detection via `.writer_state.json`;
+  - `library_identity` and the snapshot.
+- `extractor.py`: staged matching (format → message → annotate / noise), selectors on format groups
+  then document metadata, line truncation at `max_line_bytes`, line-scoped facts (a trigger group plus
+  a negation check, otherwise `PredicateSupport.check`), header-scoped `native_link` attribute links,
+  and the residue.
+- `coverage.py` and `writer.py` (sha CAS append, `SystemFileRefused`/`Corrupt`/`Conflict`).
+- `sugar.py`: `regex` → `annotate` entries.
+- `BuiltinExtractor` gains:
+  - a `pattern` dispatcher member, with residue composition when it is listed first (later extractors
+    see blanked parsed lines; a guard fails the chunk if a span reaches into one);
+  - `routing` on `ExtractionResult`;
+  - `reuse_salt()` and `prepare_build()`;
+  - static-only validation unless `probe`.
+- `WritePath`:
+  - loads the library before the lease, so a lint error fails the build before any write;
+  - salts the reuse key `extraction:{recipe}:{salt[:16]}:{chunk}` only for a non-empty salt;
+  - records `pattern_provenance` and `pattern_library_snapshot` (a content-addressed ledger raw entry).
+- Config `extraction.pattern_library` (`PatternLibraryRef`: path, engine, max_line_bytes, mode,
+  promotion, min_literal_chars, regex_timeout_ms, gate). Only `engine`/`max_line_bytes`/`mode` enter
+  the recipe, and the key is omitted while unset. Paths resolve relative to the config file.
+- Extras `patterns` (google-re2) and `patterns-lite` (regex).
+- CLI `patterns lint|coverage|mine` (read-only).
+
+**L4a done.** `learning/patterns/`:
+
+- `mining.py`: a Drain-style miner per `(service, level)` with masks, depth 3, LRU eviction under
+  `max_clusters`, and `max_children`/`max_examples`/`max_tokens` bounds; it is deterministic.
+- `synthesis.py`: an anchored template regex with typed groups, rejected with a reason (never loosened).
+- `bootstrap.py`: coverage before and after, with no LLM.
+- `gate.py`: `run_gate` / `run_configured_gate` with the checks `re2_compile`, `lint`, `cited_examples`,
+  `no_regressions`, `min_support` and `novelty`.
+- `promotion.py`: `submit` under `auto` (default; `message` only, RE2 gate, not a fix of a human
+  entry) appends to `learned.yaml` plus an `approve` record; `manual` and ineligible proposals go to
+  `proposed.yaml`; a failed gate writes nothing.
+
+**Deviations.**
+
+- (a) The owner amendment supersedes the addendum's manual-only promotion. There is a new
+  `learned.yaml`, `promotion: auto|manual` (default `auto`) and a human `disable` op. Main-plan
+  changelog row added (§3.16 policy amendment).
+- (b) No generation artifact directory exists yet. The library snapshot is stored content-addressed in
+  the ledger and named in the manifest, instead of `library.snapshot.json` in a release sha manifest.
+- (c) The ReDoS lint uses the stdlib parser, which folds some alternations (`x|x` becomes a class).
+  The `regex` engine's timeout and RE2 linearity remain the runtime guards. Rule 4 is applied to every
+  unbounded repeat, not only those inside groups, and reaching the end of an unanchored pattern
+  violates it. Masks are linted as `^(?:mask)$` and again in context.
+- (d) `regex` still runs on Python `re` (O10 says the switch is in 2.1). `sugar.regex_entries` is the
+  mapping and fails rather than changing matches.
+- (e) Attribute-link endpoint values come from document metadata (`service`, `tenant`, `env`,
+  `signature_id`) and must occur in the `header` chunk. The header renderer is L3a.
+- (f) `mode` has one value (`line`), because the addendum names `mode` as a recipe key without
+  defining it.
+- (g) Miner depth defaults to 3 rather than Drain's 4: depth 4 split templates whose second token
+  varies.
+- (h) Without a format match, the message stage runs on the whole line.
+- (i) The writer's git commit step (§3.6.3 step 7) and the `promote|deprecate|disable` CLI are left
+  for L4b.
+
+**Tests.**
+
+- `not external`: 1189 → **1293 passed, 73 skipped** without google-re2 (the RE2 params skip), and
+  **1366 passed** with google-re2 1.1.20251105 from an isolated `--target` directory in
+  `~/su_mutliarm_tests/claude/l2/`.
+- Bare `pytest -q` (no google-re2): 1296 passed, 197 skipped.
+- ruff is clean; the schema was regenerated with `core.schema.write_all`; the golden fingerprints are
+  unchanged.
+- New test files:
+  - `tests/unit/test_pattern_engine.py`
+  - `tests/unit/test_pattern_library.py`
+  - `tests/unit/test_pattern_extractor_contract.py`
+  - `tests/unit/test_library_writer_cas.py`
+  - `tests/unit/test_pattern_gate_promotion.py`
+  - `tests/unit/test_bootstrap_synthesis.py`
+  - `tests/contract/test_pattern_write_path.py`
+  - fixture `tests/pattern_fixtures.py` (synthetic generator and library; a stand-in until the L0
+    generator lands)
+
+**Follow-ups.**
+
+- L4b: LLM proposer and egress, git commit of system files, CLI promote/deprecate/disable, and the
+  human-review option over `auto`.
+- L3a: `line` chunk recipe, header renderer, partitions, typed-field consumers, request-time snapshot
+  readers.
+- L3b: `ledger_refs` for salted keys.
+- Add `google-re2` to CI so the RE2 cases run there.
+- Throughput per engine and miner coverage on a public log corpus (benchmark tier).
+
 ### 2026-11-04 — 2.0.0a3/parity-fixes: package defects from the final parity run — DONE (synthetic/mocked evidence)
 
 Base `94d978e` (v2/phase-0), commit `85e4f05`. No paid or real-service call.
@@ -1280,3 +1196,78 @@ Follow-ups:
   - an in-place 2.x → 3.x upgrade;
   - security-enabled clusters.
 - CI (`services.yml`) still starts only the default profile. Adding a 3.x leg is a CI-cost decision.
+
+### 2026-11-04 — logs/native-aggs: native aggregation pushdown for the Lucene records facets — DONE (real-service on OS 2.19.1, 3.9.0, ES 8.17.4; synthetic data)
+
+Base `a27ab5a` (`v2/logs`). Code commit `22e70c3`.
+
+Done:
+1. **`LuceneBackend.records`** (`core/config.py`): `aggregation: client | native` (default `client`),
+   `matched_ids_cap` (10000), `max_groups` (10000), `distinct_exact_cap` (100000). The block is
+   query-time: `LuceneBackend.recipe()` excludes it, so index identities and golden fingerprints are
+   unchanged. The schema is regenerated with `write_all`. Constructor arguments and `from_config` are
+   updated on both adapters.
+2. **`backends/_lucene_aggs.py`** (`NativeAggregation`) compiles every `ScopeSpec` operation to
+   aggregations, with the semantics of `_scope.scope_result`. The group ordering is factored out as
+   `_scope.order_groups` and shared by both paths; the client path is unchanged.
+   - Group keys are composite over `v.<field>` and decoded back to their JSON type.
+   - A per-field kind probe (`s`/`n`/`b`/`t` exists counts) handles mixed-type and absent fields.
+3. **`matched_ids` decision.**
+   - The list stays in the contract. Under native it is the first `matched_ids_cap` ids in id order,
+     and the new additive `ScopeResult.matched_ids_truncated` says more matched. `total` is always
+     the full count.
+   - The default cap equals the client `max_matched`, so wherever the client path answers, native
+     returns the same ids. Where the client path would refuse, native answers with a flagged prefix.
+   - The structured arm passes the flag as `document_ids_truncated`, which stays out of the prompt;
+     `scope_result_of` round-trips it.
+   - `AggregateEvidence.empty()` also requires `total == 0`. The other contract guarantees are
+     unchanged: approximate and bounded results never back count, list or absence claims.
+   - The exact_id arm uses a prefix of at most `max_ids` ids, which is identical while the cap
+     is ≥ `max_ids`.
+4. **Honest exactness.**
+   - Counts, composite enumeration and pair-paged distinct counts are exact.
+   - `cardinality` is used only above `distinct_exact_cap`, labelled `approximate` with the reason
+     in `basis`.
+   - More than `max_groups` groups gives a `bounded` result with an `UnsupportedConstraint`.
+   - Python-equal keys that the index stores apart are a typed `BackendError`.
+   - A lower-bound hit total is a typed error.
+5. **Conformance.**
+   - The records kit runs natively (`opensearch_native`, `elasticsearch_native`). The kit's
+     `max_matched` check is mode-aware: native counts exactly and flags the capped ids.
+   - New kit `testing/aggregation_parity.py`: 352 client/native comparisons, ACL isolation, caps.
+   - New tests: `tests/conformance/test_lucene_native_aggregation.py`, the env-gated
+     `tests/services/test_native_aggregation_scale.py`, and 25 fake-transport unit tests.
+6. **Docs**: CONFIGURATION (compilation table), ARCHITECTURE, capability flag
+   `native_aggregation: optional` with regenerated `docs/backends.md`, CHANGELOG `[Unreleased]`,
+   VALIDATION (scale numbers).
+
+Deviations:
+- (a) Addendum §3.9.2/§4.3 deferred pushdown aggregation in favour of rollups. This slice implements
+  it as an opt-in, so rollups remain the default plan.
+- (b) `percentiles` is not compiled: `MeasureKind` has no percentile kind and the contract was not
+  extended.
+- (c) The task suggested "nested composite" for cross-tabs. One composite with two sources is used:
+  it is equivalent and pages once.
+- (d) "Over-cap gives a typed bounded result" is implemented for groups and for ranking past
+  `max_groups`. Distinct counts go `approximate` instead of bounded, as the task specified.
+- (e) The terms ranking path is trusted only on the engine's own `doc_count_error_upper_bound == 0`.
+  The 200k scale run on OpenSearch 3.9.0 showed that one shard is not enough there: concurrent
+  segment slices are the default. This was found by the scale run, fixed, and regression-tested.
+- (f) The containers ran under compose project `su-ma-claude-aggs` on ports 19210–19212, so they
+  could not collide with parallel agents. They are removed.
+
+Tests:
+- `not external`: 1778 passed at base → **1804 passed**, 73 skipped.
+- External: OS 2.19.1 + ES 8.17.4, 59 passed. OS 3.9.0, 29 passed.
+- Scale test with `SU_TEST_AGG_SCALE_DOCS=200000`: 2 passed (OS 3.9.0, ES 8.17.4).
+- Benchmark at 200k on all three servers: every question agrees, native is 4–61× faster.
+- ruff is clean.
+
+Follow-ups:
+- Multi-shard or multi-node clusters and security-enabled clusters are untested.
+- Floating-point sum and avg can differ from the client path in the last ulps.
+- Sub-millisecond first/last-seen ties are broken by id (index resolution).
+- DST-gap calendar labels are untested.
+- `percentiles` would need a measure-contract change.
+- The other records adapters (sqlite, postgres, mongodb) still scan. Pushdown there is a separate
+  slice.

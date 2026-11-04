@@ -210,6 +210,8 @@ def aggregate_record(spec: ScopeSpec, result: ScopeResult) -> dict[str, Any]:
     if spec.limit is not None:
         aggregate["listed"] = [r.model_dump(mode="json", exclude_none=True) for r in result.listed]
         aggregate["shown"] = f"showing {len(result.listed)} of {result.total}"
+    if result.matched_ids_truncated:  # native aggregation: ``document_ids`` is the first matched_ids_cap ids of ``total``
+        aggregate["document_ids_truncated"] = True
     if result.unknown:
         aggregate["unknown"] = dict(result.unknown)
     if result.numerator is not None:

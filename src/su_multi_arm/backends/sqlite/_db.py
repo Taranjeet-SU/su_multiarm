@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS jobs(job_id TEXT PRIMARY KEY, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS raw_replies(key TEXT PRIMARY KEY, raw_reply TEXT NOT NULL, valid INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, data TEXT NOT NULL, last_seen_at REAL NOT NULL);
 """
+# Ledger retention side tables (addendum A1 §3.8.3); also created on first use in an older runtime file.
+RETENTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS raw_tags(key TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(key, tag));
+CREATE INDEX IF NOT EXISTS raw_tags_tag ON raw_tags(tag);
+CREATE TABLE IF NOT EXISTS ledger_refs(generation TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(generation, key));
+CREATE INDEX IF NOT EXISTS ledger_refs_key ON ledger_refs(key);
+"""
 
 
 @contextmanager
@@ -77,7 +84,7 @@ def connect(path: Path, timeout: float, readonly: bool = False) -> Iterator[sqli
 def ensure_runtime(path: Path, timeout: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path, timeout) as db:
-        db.executescript(RUNTIME_SCHEMA)
+        db.executescript(RUNTIME_SCHEMA + RETENTION_SCHEMA)
 
 
 # --- typed field rows -------------------------------------------------------------------------

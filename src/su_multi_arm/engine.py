@@ -121,6 +121,7 @@ def scope_result_of(aggregate: dict[str, Any]) -> ScopeResult:
         unsupported=aggregate.get("unsupported", []),
         zero_match=aggregate.get("zero_match", False),
         matched_ids=aggregate.get("document_ids", []),
+        matched_ids_truncated=aggregate.get("document_ids_truncated", False),
         missing_or_invalid=aggregate.get("missing_or_invalid", 0),
         total=aggregate.get("total"),
         listed=aggregate.get("listed", []),
@@ -1055,7 +1056,7 @@ class Engine:
             )
         extras = [
             # Aggregates are exact derived records; member IDs stay in the search output, not in the prompt.
-            PackExtra(id=a["id"], source="structured", passage=json.dumps({k: v for k, v in a.items() if k not in {"document_ids", "groups"}}))
+            PackExtra(id=a["id"], source="structured", passage=json.dumps({k: v for k, v in a.items() if k not in {"document_ids", "document_ids_truncated", "groups"}}))
             for a in state.aggregates
         ]
         result = pack(records, config, extras)

@@ -3,7 +3,8 @@
 Top-level keys: ``dataset``, ``profile``, ``plugins``, ``backends`` (named instances), ``storage``
 (authoritative backend per non-arm capability), ``metadata_schema``, ``models.roles``, ``pipeline``
 (decision, arms, selection, review, guards, generation), ``extraction``, ``communities``,
-``ingestion``, ``sessions``, ``budgets``, ``privacy``, ``serving``.
+``ingestion``, ``sessions``, ``budgets``, ``privacy``, ``serving``, ``sources`` (read-only log
+sources, ``core/config_sources.py``), ``learning`` (LLM pattern learning, ``core/config_learning.py``).
 
 Validation is static: it never connects to anything (that is ``doctor --probe``). Every failure is a
 ``ConfigError`` with the dotted path of the offending key. Unknown keys are errors. No value in a
@@ -31,7 +32,10 @@ from ..profiles import apply_profile, available_profiles
 from .component import scan_for_code_references
 from .config_decision import StagePolicies
 from .config_graph import GraphOntology, TraversalTemplate
+from .config_learning import LearningConfig
 from .config_selection import OrderingKind, PackingConfig
+from .config_logs import LINE_TEXT_FIELDS, PIN_REGISTRY_KINDS, LineRecipeConfig, LogsConfig, ProjectionsConfig
+from .config_sources import SOURCE_NAME, SourceConfig
 from .errors import ConfigError
 from .request import RequestConfig
 from .types import MetadataSchema
@@ -142,12 +146,32 @@ class KnnConfig(StrictModel):
     exact_rescore: bool = True
 
 
+class LuceneRecordsConfig(StrictModel):
+    """How the ``records`` facet evaluates a typed scope. ``client`` (default): the matched records are
+    scanned and the operations computed in Python, bounded by ``max_matched`` (typed refusal above
+    it). ``native``: the operations are compiled to aggregations on the server (no record scan);
+    ``matched_ids`` then holds at most ``matched_ids_cap`` ids (``matched_ids_truncated`` above it), more
+    than ``max_groups`` groups is a ``bounded`` result, and ``count_distinct`` is exact up to
+    ``distinct_exact_cap`` distinct values, ``approximate`` (engine ``cardinality``) above it. A query-time
+    setting: not part of the index recipe."""
+
+    aggregation: Literal["client", "native"] = "client"
+    matched_ids_cap: int = Field(default=10000, ge=1, le=100000)
+    max_groups: int = Field(default=10000, ge=1, le=50000)
+    distinct_exact_cap: int = Field(default=100000, ge=1, le=1000000)
+
+
 class LuceneBackend(StrictModel):
     kind: Literal["opensearch", "elasticsearch"]
     hosts_env: str
     index_prefix: str = Field(default="su_multi_arm", pattern=SQL_IDENTIFIER)
     knn: KnnConfig = Field(default_factory=KnnConfig)
     timeout_seconds: float = Field(default=30, gt=0, le=600)
+    records: LuceneRecordsConfig = Field(default_factory=LuceneRecordsConfig)
+
+    def recipe(self) -> dict[str, Any]:
+        """The index-recipe dump: ``records`` is query-time only, so it never changes an index identity."""
+        return self.model_dump(mode="json", exclude={"records"})
 
 
 class Neo4jBackend(StrictModel):
@@ -426,6 +450,7 @@ class ModelRoles(StrictModel):
     extractor: ChatRole | None = None
     generator: ChatRole | None = None
     community: ChatRole | None = None
+    pattern_learner: ChatRole | None = None  # ``patterns learn|propose`` (learning.patterns)
     embedder: EmbedderRole = Field(default_factory=EmbedderRole)
     reranker: RerankerRole | None = None
 
@@ -453,7 +478,7 @@ class ModelRoles(StrictModel):
         return self
 
     def chat_roles(self) -> dict[str, ChatRole]:
-        names = ("planner", "reviewer", "extractor", "generator", "community")
+        names = ("planner", "reviewer", "extractor", "generator", "community", "pattern_learner")
         return {n: getattr(self, n) for n in names if getattr(self, n) is not None}
 
 
@@ -746,8 +771,44 @@ class GroundingConfig(StrictModel):
     ambiguous: Literal["reject", "first"] = "reject"
 
 
+class PatternGateConfig(StrictModel):
+    """The deterministic validation gate a learned pattern must pass (``learning/patterns/gate.py``)."""
+
+    min_support: int = Field(default=3, ge=1, le=1000)  # evidence lines the pattern must match
+    require_re2: bool = True  # the gate compiles with RE2; the ``regex`` engine cannot pass it
+    # Learning loop (L4b) only: share of the cluster's lines the pattern must match, and the absolute
+    # bound on matches among unparsed lines outside the cluster.
+    min_cluster_coverage: float = Field(default=0.9, gt=0, le=1)
+    max_out_of_cluster: int = Field(default=0, ge=0, le=100_000)
+
+
+class PatternLibraryRef(StrictModel):
+    """``extraction.pattern_library``: the library directory of the ``pattern`` extractor.
+
+    Only ``engine``, ``max_line_bytes`` and ``mode`` enter the index recipe. The library contents,
+    the engine version and the promotion policy are build provenance (generation manifest), so a
+    library edit never changes the live fingerprint; it changes the extraction reuse salt instead.
+    """
+
+    path: Path
+    engine: Literal["re2", "regex"] = "re2"  # explicit; a missing engine is an error, never a fallback
+    max_line_bytes: int = Field(default=8192, ge=256, le=1_048_576)
+    mode: Literal["line"] = "line"  # every line of a chunk is matched on its own (line-scoped facts)
+    # ``auto``: a proposal that passes the gate is appended to learned.yaml with its decision record;
+    # ``manual``: it waits in proposed.yaml for a human ``approve`` decision.
+    promotion: Literal["auto", "manual"] = "auto"
+    min_literal_chars: int = Field(default=4, ge=0, le=64)
+    regex_timeout_ms: int = Field(default=100, ge=1, le=10_000)  # ``regex`` engine only
+    gate: PatternGateConfig = Field(default_factory=PatternGateConfig)
+
+    def recipe(self) -> dict[str, Any]:
+        return {"engine": self.engine, "max_line_bytes": self.max_line_bytes, "mode": self.mode}
+
+
 class ExtractionConfig(StrictModel):
-    extractors: list[Literal["gazetteer", "regex", "spacy", "gliner", "llm"]] = Field(default_factory=lambda: ["gazetteer"])
+    extractors: list[Literal["pattern", "gazetteer", "regex", "spacy", "gliner", "llm"]] = Field(default_factory=lambda: ["gazetteer"])
+    # Omitted from the extractor recipe while unset, so existing index fingerprints are unchanged.
+    pattern_library: PatternLibraryRef | None = None
     grounding: GroundingConfig = Field(default_factory=GroundingConfig)
     policy: Literal["strict", "quarantine", "partial"] = "strict"
     prompt: str | None = None  # llm extractor prompt; built-in neutral prompt when unset
@@ -776,6 +837,8 @@ class ExtractionConfig(StrictModel):
             raise ValueError("extractors must be unique")
         if any(e in self.extractors for e in ("gliner", "llm")) and not self.labels:
             raise ValueError("extraction.labels must declare entity types when gliner or llm extraction is selected")
+        if ("pattern" in self.extractors) != (self.pattern_library is not None):
+            raise ValueError("the pattern extractor and extraction.pattern_library are set together")
         return self
 
 
@@ -841,6 +904,9 @@ class InputMapping(StrictModel):
 class IngestionConfig(StrictModel):
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     input_mapping: InputMapping | None = None
+    # Addendum A1 (L3a). Both enter the index recipe only when set, so existing fingerprints hold.
+    line_recipe: LineRecipeConfig | None = None
+    projections: ProjectionsConfig | None = None
 
 
 # --- sessions, budgets, privacy, serving -------------------------------------------------------
@@ -1012,6 +1078,13 @@ class Config(StrictModel):
     serving: ServingConfig = Field(default_factory=ServingConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     actions: ActionsConfig = Field(default_factory=ActionsConfig)
+    # Read-only log sources (addendum A1 §3.1, slice L1). Consumed by ``su-multi-arm sources``; the
+    # engine never opens a source on the request path.
+    sources: dict[str, SourceConfig] = Field(default_factory=dict)
+    # LLM pattern learning (addendum A1 §3.6, slice L4b; ``core/config_learning.py``).
+    learning: LearningConfig = Field(default_factory=LearningConfig)
+    # Daily log analytics (addendum A1 L3a/L3b; ``core/config_logs.py``): partitions, compose, retention.
+    logs: LogsConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1057,6 +1130,14 @@ class Config(StrictModel):
             raise ValueError("plugins must be unique")
         return value
 
+    @field_validator("sources")
+    @classmethod
+    def source_names(cls, value):
+        for name in value:
+            if not re.fullmatch(SOURCE_NAME, name):
+                raise ValueError(f"source name {name!r} must be an identifier")
+        return value
+
     @field_validator("backends")
     @classmethod
     def backend_names(cls, value):
@@ -1079,6 +1160,50 @@ class Config(StrictModel):
                 warnings.warn(f"{diagnostic.path}: {diagnostic.message}" if diagnostic.path else diagnostic.message, stacklevel=2)
         raise_for(diagnostics)
         scan_for_code_references(self.model_dump(mode="json"), skip_keys=SCAN_EXEMPT_KEYS)
+        return self
+
+    @model_validator(mode="after")
+    def logs_coherent(self):
+        """Cross-key rules of ``logs`` (addendum A1 §3.4.2 n1, §3.8.3, §3.8.4 n4)."""
+        logs = self.logs
+        if logs is None:
+            return self
+        if logs.source not in self.sources:
+            raise ConfigError(f"logs.source {logs.source!r} is not a configured source ({sorted(self.sources)})", "logs.source")
+        if "pattern" not in self.extraction.extractors:
+            raise ConfigError("logs needs the pattern extractor (extraction.extractors: [pattern, ...])", "extraction.extractors")
+        kind = self.backends[self.storage.catalog].kind
+        if kind not in PIN_REGISTRY_KINDS:
+            raise ConfigError(
+                f"logs needs a pin registry on the catalog's generation registry; {kind!r} has none (planned), "
+                f"use one of {list(PIN_REGISTRY_KINDS)}",
+                "storage.catalog",
+            )
+        recipe = self.ingestion.line_recipe
+        if recipe is None or "exemplars" not in recipe.fields:
+            raise ConfigError("logs needs ingestion.line_recipe with the exemplars field (one chunk per log record)", "ingestion.line_recipe")
+        source = self.sources[logs.source]
+        bound = source.max_line_bytes + source.multiline.max_bytes
+        if bound > recipe.max_chunk_chars:
+            raise ConfigError(
+                f"sources.{logs.source}.max_line_bytes + multiline.max_bytes ({bound}) exceeds "
+                f"ingestion.line_recipe.max_chunk_chars ({recipe.max_chunk_chars}); a record could span two chunks",
+                "ingestion.line_recipe.max_chunk_chars",
+            )
+        if self.pipeline.arms.dense is not None:
+            projections = self.ingestion.projections or ProjectionsConfig()
+            for kind, fields in LINE_TEXT_FIELDS.items():
+                embedded = [f for f in fields if projections.embeds(kind, f)]
+                if embedded:
+                    raise ConfigError(
+                        f"documents of kind {kind!r} carry log-line text in {embedded}; exclude the kind from vector "
+                        f"or set ingestion.projections.embed_fields.{kind} without them (retention invariant)",
+                        "ingestion.projections",
+                    )
+        if self.privacy.trace_masking != "privacy":
+            raise ConfigError("logs requires privacy.trace_masking: privacy (traces hold no passages)", "privacy.trace_masking")
+        if self.sessions.memory.store_text:
+            raise ConfigError("logs refuses sessions.memory.store_text (sessions keep ids and hashes only)", "sessions.memory.store_text")
         return self
 
     def capability_problem(self, backend_name: str, capability: str, flag: str | None = None) -> str | None:
@@ -1163,6 +1288,16 @@ def _resolve_paths(config: Config, base: Path) -> Config:
             pipeline.arms.exact_id.alias_map = (base / pipeline.arms.exact_id.alias_map).resolve()
     if config.budgets.price_table:
         config.budgets.price_table = (base / config.budgets.price_table).resolve()
+    for source in config.sources.values():
+        if source.ca_bundle is not None:
+            source.ca_bundle = (base / source.ca_bundle.expanduser()).resolve()
+    if config.extraction.pattern_library is not None:
+        library = config.extraction.pattern_library
+        library.path = (base / library.path.expanduser()).resolve()
+    if config.learning.patterns is not None and config.learning.patterns.spend_ledger is not None:
+        config.learning.patterns.spend_ledger = (base / config.learning.patterns.spend_ledger.expanduser()).resolve()
+    if config.logs is not None:
+        config.logs.partitions.path = (base / config.logs.partitions.path.expanduser()).resolve()
     embedder = config.models.roles.embedder
     if embedder is not None and embedder.precomputed is not None:
         embedder.precomputed.vectors = (base / embedder.precomputed.vectors.expanduser()).resolve()
@@ -1192,6 +1327,11 @@ def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
             add(pipeline.get(stage), "prompt_file", f"{prefix}.{stage}.prompt_file")
         add((pipeline.get("arms") or {}).get("exact_id"), "alias_map", f"{prefix}.arms.exact_id.alias_map")
     add(data.get("budgets"), "price_table", "budgets.price_table")
+    for name, source in (data.get("sources") or {}).items():
+        add(source, "ca_bundle", f"sources.{name}.ca_bundle")
+    add((data.get("extraction") or {}).get("pattern_library"), "path", "extraction.pattern_library.path")
+    add((data.get("learning") or {}).get("patterns"), "spend_ledger", "learning.patterns.spend_ledger")
+    add((data.get("logs") or {}).get("partitions"), "path", "logs.partitions.path")
     embedder = ((data.get("models") or {}).get("roles") or {}).get("embedder")
     precomputed = embedder.get("precomputed") if isinstance(embedder, dict) else None
     add(precomputed, "vectors", "models.roles.embedder.precomputed.vectors")

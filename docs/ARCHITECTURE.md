@@ -121,7 +121,13 @@ dataset aliases are the serving pointer and are switched in one atomic `_aliases
 older generations stay until `delete_generation` (refused for a protected or aliased generation).
 Vector search is exact by default (cosine `script_score`); HNSW is an explicit opt-in that always
 rescores its candidates exactly. Records push every filter down and compute measures with the
-shared `_scope.py` code, so `ScopeResult`s are exact and identical across adapters. The adapter never
+shared `_scope.py` code, so `ScopeResult`s are exact and identical across adapters. With
+`records.aggregation: native` (both Lucene adapters) the scope operations are compiled to server-side
+aggregations instead (`backends/_lucene_aggs.py`: `composite`, `terms`, `date_histogram`, `filters`,
+`stats`, `top_hits`, and `cardinality` only above the exact distinct cap, labelled `approximate`). The
+ACL filter is the query of every aggregation request, nothing is scanned, `matched_ids` is capped at
+`matched_ids_cap` with `matched_ids_truncated`, and every other result field is identical to the
+client path (kit `testing/aggregation_parity.py`). The adapter never
 retries and never degrades: unreachable server, refused query, bulk item failure, missing generation
 and mapping-version mismatch are typed `BackendError`s. The conformance kit runs against the real
 service under `-m external` (`tests/conformance/`, `tests/services/test_opensearch_adapter.py`).
@@ -498,6 +504,73 @@ fingerprint and the embedding recipe is its digests (`PrecomputedVectors.identit
 paths, so relocated files keep the index and changed content changes it; the recipe's `input` is
 `imported: …` because the engine's `{title}\n{field}: {text}` template does not apply to imported rows.
 
+### Pattern extractor and pattern learning (addendum A1, slices L2, L4a and L4b)
+
+`extraction/patterns/` adds `pattern` as a first-class member of the built-in extractor's dispatcher,
+alongside `gazetteer`, `regex`, `spacy`, `gliner` and `llm`.
+
+- `engine.py` holds the explicit engine choice (`re2` via `google-re2`, or the ASCII `regex`
+  development engine with per-call timeouts, never substituted), the RE2-subset validator and the
+  ReDoS lint, which walks the standard library's parse tree.
+- `library.py` holds the four-file library. `library.yaml` is human-owned; `learned.yaml`,
+  `proposed.yaml` and `decisions.yaml` are system-owned and append-only. It also holds the merge with
+  owner precedence, decisions replay (a human `disable` is final), lint and `library_identity`.
+- `extractor.py` holds staged line matching with a per-stage RE2 `Set` prefilter, line-scoped
+  relations, header-scoped `native_link` attribute links, and the residue that later extractors see
+  when `pattern` is listed first.
+- `writer.py` is the sha256 compare-and-swap appender for the system files.
+
+**Library identity is build provenance, not index identity.** Only static options (`engine`,
+`max_line_bytes`, `mode`) enter the extractor recipe, and the key is omitted while unset, so the
+2.0.0a1/a2 golden fingerprints hold. `BuiltinExtractor.prepare_build()` (re)loads the library at the
+start of every build, before anything is written, and returns three things:
+
+- the provenance (identity, engine, engine version, validator version, determinism), which goes into
+  the generation manifest;
+- the effective approved snapshot, which is stored content-addressed in the ledger;
+- the extraction reuse salt.
+
+`WritePath._extract` keys reuse as `extraction:{recipe[:16]}:{salt[:16]}:{chunk}` when the salt is
+non-empty. Every other extractor has an empty salt and keeps the unchanged key. Serving constructs the
+extractor but never reads library files: `validate()` checks only the engine and the directory unless
+`probe` is set.
+
+`learning/patterns/` covers L4a plus the gate interface:
+
+- a deterministic Drain-style miner with bounded memory (`max_clusters` with counted LRU evictions,
+  `max_children`, `max_examples`, `max_tokens`), run per `(service, level)` on lines masked by the
+  library masks;
+- a synthesiser that turns templates into anchored, lint-clean `proposed` message entries with typed
+  groups;
+- `bootstrap` (coverage before and after, no LLM);
+- the deterministic validation `gate`, with the checks `re2_compile`, `lint`, `cited_examples`,
+  `no_regressions`, `min_support` and `novelty`;
+- the `promotion` policy (`auto` → `learned.yaml` plus an `approve` record; `manual` →
+  `proposed.yaml`).
+
+L4b adds the LLM learning loop on top (`loop.py`): mine → propose → gate → write → reparse.
+
+- `egress.py`: only lines processed by the configured `privacy` redaction (stamped with its identity)
+  may reach the model; a residual e-mail, IPv4, token or key shape refuses the run before any call;
+  `pseudonymise` attributes become per-run aliases before mining, so neither prompt lines nor
+  templates carry them; a hosted role needs `allow_hosted`.
+- `propose.py`: one structured call per cluster through the providers package (role
+  `pattern_learner`; reply schema `PatternProposalReply`, strict-expressible for OpenAI and within the
+  Anthropic `output_config.format` limits). A reply becomes a `proposed` entry or a typed reason; it is
+  never repaired. `issue_name` and `rationale` are inert provenance.
+- `spend.py`: every call is reserved before it is sent against a run `Budget` (calls, USD from the
+  price table) and a persistent per-day SQLite ledger (one conditional `UPDATE` under
+  `BEGIN IMMEDIATE`). A refusal stops the run; nothing is retried.
+- The gate gains `cluster_coverage`, `out_of_cluster` (absolute bound) and `fix_target` when the loop
+  supplies the evidence. Promotion writes a passing fix of a system entry as `supersede`, and
+  `human_decision` appends the CLI-only `approve | deprecate | disable` records.
+- `writer.py` optionally commits the changed system files when the library is a git work tree, and
+  refuses to start on uncommitted system-file edits.
+
+The day ledger here covers only the `learning.patterns` scope on SQLite; the general `SpendLedger` on
+every ledger backend (B10), raw-reply tagging by partition, partitions, compose and the `line` chunk
+recipe (L3a) are not implemented in this slice.
+
 ## Retrieval and selection semantics
 
 Selection order of stages: collapse, per-arm limits (optionally with `selection.source_slots`:
@@ -685,3 +758,100 @@ serving/http.py (FastAPI)              serving/mcp.py (FastMCP)          CLI
   closes the provider's HTTP stream. Spent usage is committed and recorded on the session.
 * **Sessions.** HTTP binds via `X-Session-Id`; MCP binds every call to an engine session created
   for the MCP session id and the calling principal (`SessionBinder`).
+
+## Read-only log sources (addendum A1, slices L0 and L1)
+
+`su_multi_arm/sources/` is a component kind (`source`) separate from the storage adapters. A source
+reads operational logs from a cluster it does not own, so it is read-only, bounded and
+self-checking:
+
+- `transport.py`: an exact `(method, anchored path)` allow-list. It is applied to the
+  percent-decoded path, the query parameters and the JSON body **before any I/O**.
+  - `{idx}` must be a discovered name.
+  - Wildcards are allowed only in discovery and `_count`.
+  - Scripts, runtime fields, aggregations and write keys are refused at any depth.
+  - `DELETE` only closes scrolls or PITs that this transport opened and that the cursor lists, and
+    never `_all`.
+  - Keepalives are bounded. Redirects are not followed, there are no retries, and environment
+    proxies are ignored.
+  - HTTP failures become typed errors: `SourceAuthError`, `SourceForbidden`, `SourceRateLimited`,
+    `SourceUnavailable`, `SourceTimeout`, `SourceCursorExpired`, `SourceSchemaDrift`,
+    `SourceQueryRejected`, and `SourceRequestRefused` for allow-list refusals.
+- `elasticsearch_rest.py`: Elasticsearch ≥ 7.9 / OpenSearch ≥ 1.0 over httpx.
+  - The capability probe reads `GET /`; a 403 is tolerated.
+  - The read-only self-check uses `_has_privileges`.
+  - Discovery uses `_resolve/index`, falling back to `_alias`.
+  - Count queries are built per index from the mapping, with basis `level_field` or `token_match`.
+  - Pulls use scroll or `search_after`, with stratified caps and a partition budget. A cursor that
+    expires restarts its stratum, de-duplicating by `source_id`.
+  - Context fetches are capped per partition.
+- `cursor.py`: a per-source registry of open contexts, limited to `max_concurrency × slices`.
+  Contexts are closed in `finally`, from an `atexit` hook and, under the CLI, on SIGTERM/SIGINT.
+- `sampling.py`: `hourly_quota` (largest-remainder quotas per hour, plus an `outside` stratum) and
+  `random_score` on `_seq_no`. The `SamplePlan` records the method, seed and per-stratum counts.
+- `logs.py`: index-name parsing with a configurable grammar (optional prefix, optional deployment
+  prefixes with `{n}` for digits, segment vocabularies matched longest first, date suffix). A name
+  that does not fit exactly once is `unparsed` with a typed reason, never a guess.
+  `LogRecord` mapping strips ANSI and control characters, cuts at `max_line_bytes` with a
+  `truncated` flag, and counts malformed documents by reason.
+- `multiline.py`: built-in continuation rules join stack frames onto the head of the same
+  `(container, file)`. Head-less fragments are counted, and a deterministic sample is kept.
+- `probe.py` and `su-multi-arm sources check|discover|count|probe`: aggregate-only operator reports.
+
+The source contract does not cover the following. Each is a later slice of the addendum:
+
+- persistence (day partitions; see the next section, slice L3a, which refuses a mapping without a redactor);
+- redaction (`LogMapping` takes an injected redactor and reports `redaction: none` without one);
+- the pattern library, whose `format` and `continuation` kinds will replace the built-in rules;
+- PIT-based pulls. A PIT search needs an index-less `/_search` path, which the allow-list does not
+  contain.
+
+`testing/fixtures/logs/` ships the synthetic generator (three line styles, multiline fragments,
+health-check noise, synthetic PII shapes), the fake cluster used by the tests (an
+`httpx.MockTransport` or a localhost server that records every request) and the ReDoS corpus.
+
+## Day partitions, compose and retention (addendum A1, slices L3a and L3b)
+
+`ingestion/` turns one configured source (`logs.source`) into a rolling serving generation:
+
+- `partitions.py`: `FilePartitionStore` keeps each day of a source in versions under
+  `<logs.partitions.path>/<source>/<day>/v<n>/`. `begin` resumes an open version only with the same
+  source query sha; `put_unit` stores one pulled unit (redacted `LogRecord`s, count, sample plan)
+  atomically; `seal` writes the parse artifacts (matches, aggregates, hourly cells, exemplars,
+  unparsed queue) and freezes the version. `reparse` (new library) and `repull` (settle) write
+  `v+1`. `expire` deletes every version and leaves a content-free tombstone with line and
+  source-id hashes. The store's `flock` is the **schedule lock**, separate from the registry write
+  lease.
+- `logs_parse.py`: matches each record's head line with the compiled library, builds unit and
+  signature rows (signature rows are `exact` only under the coverage condition, otherwise scaled
+  `approximate` estimates), hourly co-firing cells, exemplars and the unparsed queue. With
+  `parse.workers > 1` it uses a spawn process pool; a worker that loads another library identity
+  fails the parse (`LibraryDrift`).
+- `rollups.py`: per-day documents (`unit_day`, `signature_day`, `service_day`,
+  `signature_service_day`, opt-in `signature_hour`) and window documents (`signature_window`,
+  `signature_tenant_window`, `signature`), each with a rendered `header` field; the header renderer
+  states the date basis and timezone.
+- `logs_compose.py`: `day_window` maps a partition key to its UTC window and index dates
+  (`index_date` or `event_time` clock). `compose` reparses partitions with a stale library identity,
+  derives a compose identity from the window's `(day, version, library identity)` list, does nothing
+  when the active generation has the same identity, and otherwise builds through
+  `WritePath.ingest(replace=True)` with a content-free `logs` manifest section.
+- `schedule.py`: `LogsPipeline.run_daily` (schedule lock → redaction check → self-check → discover
+  → count/pull/map/multiline per unit → parse → seal → compose → retention → verify → content-free
+  run report), `backfill`, `settle`.
+- `retention.py`: rule (a) `gc` across catalog, lexical, vector, records, graph and communities
+  (`WritePath.delete_generation`), cache invalidation, ledger job entries, tag- and
+  reference-based ledger purge, tombstones, session expiry, audit records; `report` and the
+  content-based `verify`.
+- `pins.py`: cross-process pins (`pin:<generation>:<holder>` rows with a TTL) on the file registry
+  (sqlite sidecar), memory, SQL and PostgreSQL registries; `ProcessPins` keeps one heartbeat-renewed
+  pin per serving process and generation with an in-process refcount. MongoDB and Elasticsearch
+  registries have no pins (`PinsUnsupported`), so `logs` is refused there.
+
+Write-path additions used by compose (all inert unless configured): the `line` chunk recipe
+(`ingestion.line_recipe`: one chunk per record, never split), projection exclusions
+(`ingestion.projections.exclude_kinds`, `embed_fields`), `ledger_refs` (every ledger key a
+generation uses goes to a side table; the manifest keeps only `ledger_refs_count` and
+`ledger_refs_sha`), and `manifest_extra`. The ledger's retention operations (`tag_raw`, `refs`,
+`purge`, `drop_job`, `raw_entries`) are the `extras.LedgerRetention` protocol, implemented on the
+memory, sqlite, sqlalchemy, postgres and mongodb ledgers and checked by the conformance kit.

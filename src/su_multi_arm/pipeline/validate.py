@@ -188,10 +188,18 @@ def role_schemas() -> dict[str, list[type]]:
     """The reply schemas the package sends per chat role (QA-13). The generator's per-request
     variant (evidence-id and claim-kind enums) has the same shape as ``Answer``."""
     from ..decision.llm import LlmPlan
+    from ..learning.patterns.propose import PatternProposalReply
     from ..models import Answer, CommunityReport, Extraction
     from .review import Review
 
-    return {"planner": [LlmPlan], "generator": [Answer], "reviewer": [Review], "extractor": [Extraction], "community": [CommunityReport]}
+    return {
+        "planner": [LlmPlan],
+        "generator": [Answer],
+        "reviewer": [Review],
+        "extractor": [Extraction],
+        "community": [CommunityReport],
+        "pattern_learner": [PatternProposalReply],
+    }
 
 
 def strict_schema_problems(provider: str, model: str, structured_output: str, role: str) -> list[str]:
@@ -285,6 +293,9 @@ def config_diagnostics(config: Config) -> list[Diagnostic]:
     out.extend(_strict_schema_diagnostics(config))
     if "llm" in config.extraction.extractors and roles.extractor is None:
         out.append(_error("extraction.extractors", "role_missing", "extraction.extractors includes llm: models.roles.extractor is required"))
+    from ..core.config_learning import learning_problems
+
+    out.extend(_error(path, "learning_incoherent", message) for path, message in learning_problems(config))
     pipelines = config.all_pipelines()
     for name, pipeline in pipelines.items():
         out.extend(_pipeline_diagnostics(config, name, pipeline))
