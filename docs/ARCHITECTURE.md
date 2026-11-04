@@ -921,6 +921,39 @@ log kinds is refused (`intent_required`). The engine executes an intent step wit
 `runtime/log_tools.run_intent`, the function behind `Engine.call_tool`, `POST /v2/tools/{name}` and
 the MCP tools, so every surface returns the same rows and rendering.
 
+**Level questions against the source's counts.** A level question (`log_top` by service, tenant
+or signature with `level`, `log_trend`/`log_compare` with `level`, `log_tenants`) also reads the
+source's own per-unit counts (`unit_day` `count_<query>` of a single-level count query) in the same
+window and filters. The output's `source_counts` lists, per (service, tenant, level),
+`lines_source` with its `basis` (`level_field` exact; `token_match` labelled approximate),
+`lines_answered` (what the rows count), `lines_parsed` and `lines_unparsed`. When the source counts
+more lines than the rows do, the answer is `bounded` with that reason and the rendering lists the
+source counts ("No FATAL-level lines in the parsed rows …; source counts: svc-x t01: 3 lines
+containing 'fatal' (token_match, approximate), 3 unparsed; bounded: …"): never "none … exact" when
+the parse missed lines the source counted. A level without a single-level count query is named in
+`notes` (not cross-checked).
+
+**Vocabulary, error rate and the default day.** In the rules grammar a named level ("ERROR",
+"FATAL", "warnings") is that level, while words for failure in general ("errors", "failing",
+"failures", "issues", "problems", "broken") mean ERROR and FATAL; a level word inside a named value
+(`dependency.connect_failed`) is not a level. `log_top` takes `metric: error_rate` (by service or
+tenant): lines at the levels (default ERROR and FATAL) over all deterministic lines of the group,
+ranked by the share, with the source counts of those levels ("which service has the highest error
+rate"). A question that names no date (no window, start/end or `as_of`) is anchored on the
+**latest served day** when today has no composed data yet, and the rendering says so ("latest
+available day: …"); a named window ("yesterday") stays relative to today, and its days that are not
+composed yet are `source_unavailable` (a window with no composed day at all is `bounded`).
+
+**Logs planner context pack.** Under the logs profile the llm planner (alone, or reached by a
+cascade whose rules found no log intent; `logs.intents.cascade_to_planner`) gets `log_context`
+(`decision/log_context.py`): what each arm stores, the structured kinds, graph edge kinds, a capped
+summary of the approved pattern-library entries (signature, issue name, category, services,
+fields), the served dates, value vocabularies of service/tenant/env/level, the ten intents with
+their input schemas, and few-shot examples (profile default, or `few_shot_file`). It carries
+identifiers and aggregates only, never line text or configuration secrets, and is bounded by
+`planner_context_max_chars`. The planner still answers with `log_intent` + `log_args`, compiled
+like a tool call; a free scope over the log kinds is still refused (`intent_required`).
+
 **Answers state the aggregate's numbers.** Every aggregate record carries `rendering`; the
 generator is asked to quote it, and when the answer text states a number the cited exact aggregate
 does not back, the contract replaces the text with the rendering (plus the model's number-free

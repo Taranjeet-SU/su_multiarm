@@ -7,6 +7,7 @@ import { ErrorBanner } from "../components/common";
 import { EvidenceTabs, type Focus } from "../components/EvidenceTabs";
 import { EMPTY_RUN, reduceRun, ThinkingTimeline, type RunLog } from "../components/ThinkingTimeline";
 import { useApp } from "../context";
+import { submitOnEnter } from "../lib/keys";
 import { displayText } from "../lib/text";
 
 export function timeFieldsOf(fields: Array<{ name: string; type: string }> | undefined): Set<string> {
@@ -82,7 +83,7 @@ export function AskView({ initialQuestion = "", initialAsOf = "" }: { initialQue
         <label htmlFor="question" className="muted small">
           Question
         </label>
-        <textarea id="question" value={question} onChange={(e) => setQuestion(e.target.value)} rows={2} maxLength={16000} placeholder="Ask about the indexed logs and documents" />
+        <textarea id="question" value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={submitOnEnter} rows={2} maxLength={16000} placeholder="Ask about the indexed logs and documents" />
         <div className="row">
           <span className="hint muted small">
             <label htmlFor="as-of">As of </label>

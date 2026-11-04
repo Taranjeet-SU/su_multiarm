@@ -115,7 +115,18 @@ class IndexNameParser:
 
     def fields(self) -> list[str]:
         out = [*self.config.prefix_fields, "service", "index_date"]
+        if self.config.service_suffix == "numeric":
+            out.insert(out.index("service") + 1, "deployment_id")
         return ["deployment", *out] if self.config.deployment_prefixes or self.config.deployment_position == "after_env" else out
+
+    def _suffix(self, body: str) -> tuple[str, str | None]:
+        """``body`` without a trailing numeric deployment id (``service_suffix: numeric``) and the id."""
+        if self.config.service_suffix != "numeric":
+            return body, None
+        rest, sep, tail = body.rpartition(self.sep)
+        if sep and rest and tail.isdigit() and tail.isascii() and len(tail) >= self.config.service_suffix_min_digits:
+            return rest, tail
+        return body, None
 
     def _unparsed(self, name: str, reason: UnparsedReason, why: str, day: date | None = None) -> ParsedIndexName:
         attrs = {key: UNKNOWN for key in self.fields()}
@@ -130,6 +141,9 @@ class IndexNameParser:
         before_service`` a declared deployment prefix may stand between the prefix fields and the
         service; it is returned as ``deployment``."""
         sep = self.sep
+        body, deployment_id = self._suffix(body)
+        if service is not None and deployment_id is not None and not (body == service or body.endswith(sep + service)):
+            return None, "service", f"service {service!r} does not end the name before its numeric suffix"
         if service is None and self.services:
             for candidate in self.services:  # longest first
                 if body == candidate or body.endswith(sep + candidate):
@@ -167,6 +181,8 @@ class IndexNameParser:
         if rest:
             return None, "segments", f"expected prefix fields {self.config.prefix_fields}; {rest!r} is left over"
         values["service"] = service
+        if self.config.service_suffix == "numeric":
+            values["deployment_id"] = deployment_id or "none"
         return values, "segments", ""
 
     def _parse_before_service(self, name: str, head: str, day: date) -> ParsedIndexName:
@@ -175,7 +191,8 @@ class IndexNameParser:
         deployment prefix (``ops-admin-kafka`` declared as a service *and* ``ops-admin`` as a
         deployment) is ``ambiguous``."""
         sep = self.sep
-        candidates = [c for c in self.services if head == c or head.endswith(sep + c)] if self.services else [None]
+        bare, _ = self._suffix(head)
+        candidates = [c for c in self.services if bare == c or bare.endswith(sep + c)] if self.services else [None]
         if not candidates:
             return self._unparsed(name, "service", "no service vocabulary entry ends the name", day)
         parses: list[dict[str, str]] = []

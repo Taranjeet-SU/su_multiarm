@@ -67,6 +67,10 @@ class LogToolOutput(StrictModel):
     rendering: str
     document_ids: list[str] = Field(default_factory=list)
     truncated: bool = False
+    # Level questions (real-run fix): the source's own per-unit level counts next to the parsed
+    # rows, per (service, tenant, level): lines_source, basis, source_exactness, lines_answered
+    # (what the rows above count), lines_parsed (parsed at that level) and lines_unparsed.
+    source_counts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # --- execution -------------------------------------------------------------------------------------
@@ -85,7 +89,8 @@ def _days_unavailable(window: Any, manifest: dict[str, Any]) -> list[str]:
     known = set((manifest.get("logs") or {}).get("days") or [])
     if not known:
         return []
-    return [d.isoformat() for d in window.days() if d.isoformat() not in known and d <= date.fromisoformat(max(known))]
+    # a day after the latest composed one is not composed yet: unavailable too, never "none, exact"
+    return [d.isoformat() for d in window.days() if d.isoformat() not in known]
 
 
 def _methods(ops: Any, ctx: Any, spec: ScopeSpec) -> list[str]:
@@ -182,6 +187,117 @@ def _fold_rows(rows: list[dict[str, Any]], successors: dict[str, str]) -> tuple[
     return out, sorted(set(folded))
 
 
+LEVEL_INTENTS = {"log_top", "log_trend", "log_compare", "log_tenants"}
+
+
+def _levels_of(compiled: CompiledIntent) -> list[str]:
+    """The levels a level question asks about (lower case); empty for any other question."""
+    if compiled.intent not in LEVEL_INTENTS or compiled.window is None:
+        return []
+    if compiled.intent == "log_top" and compiled.args.get("by") not in {"service", "tenant", "signature"}:
+        return []
+    level = compiled.args.get("level")
+    if compiled.intent == "log_top" and compiled.args.get("metric") == "error_rate" and not level:
+        level = ["error", "fatal"]
+    if compiled.intent == "log_tenants":
+        level = [level or "fatal"]
+    return sorted({str(lv).casefold() for lv in level or []})
+
+
+def _grouped(ops: Any, ctx: Any, spec: ScopeSpec) -> dict[tuple, Any]:
+    result = ops.log_execute(ctx, spec)
+    return {tuple(g.key.get(k) for k in spec.group_by): _value(g) for g in result.groups}
+
+
+def source_counts(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[list[dict[str, Any]], list[str]]:
+    """The source's own per-unit level counts (``unit_day`` ``count_<query>``) next to what the
+    parsed rows count, per (service, tenant, level) of the question's window and filters
+    (real-run fix: FATAL lines in mostly unparsed units were answered "none, exact").
+
+    Returns the rows and notes. A level without a single-level count query of the source is
+    named in a note (its parsed rows cannot be cross-checked). ``lines_answered`` is the main
+    scope regrouped by (service, tenant); ``lines_parsed`` counts parsed lines at that level;
+    ``lines_unparsed = lines_source - lines_parsed`` (never below 0). A ``token_match`` basis is
+    ``source_exactness: approximate``: a line containing the word is not always at that level."""
+    from ..core.types import Measure, Predicate
+
+    levels = _levels_of(compiled)
+    if not levels:
+        return [], []
+    queries = ops.log_context(ctx).count_queries
+    main = compiled.scopes["main"]
+    filters = [p for p in main.predicates if p.field in {"service", "tenant"} and not p.negate]
+    window = compiled.window.predicate()  # type: ignore[union-attr]
+    from_counts = any(p.field == "kind" and p.value == "unit_day" for p in main.predicates)
+    rows: list[dict[str, Any]] = []
+    notes: list[str] = []
+    pair = ["service", "tenant"]
+    for level in levels:
+        query = next((name for name, lv in sorted(queries.items()) if lv == [level]), None)
+        if query is None:
+            notes.append(f"no single-level source count query for {level.upper()}: the parsed rows are not cross-checked against source counts")
+            continue
+        field = f"count_{query}"
+        base = [Predicate(field="kind", op="eq", value="unit_day"), window, *filters, Predicate(field=field, op="range", lower=1)]
+        source = _grouped(ops, ctx, ScopeSpec(predicates=base, group_by=pair, measure=Measure(kind="sum", field=field)))
+        if not source:
+            continue
+        bases: dict[str, set[str]] = {}
+        for (service, basis), _n in _grouped(ops, ctx, ScopeSpec(predicates=base, group_by=["service", f"basis_{query}"], measure=Measure(kind="sum", field=field))).items():
+            if basis:
+                bases.setdefault(service, set()).update(str(basis).split(","))
+        parsed_spec = ScopeSpec(
+            predicates=[
+                Predicate(field="kind", op="eq", value="log_day"),
+                window,
+                *filters,
+                Predicate(field="level", op="eq", value=level),
+                Predicate(field="extraction_source", op="eq", value="deterministic"),
+                Predicate(field="status", op="eq", value="parsed"),
+            ],
+            group_by=pair,
+            measure=Measure(kind="sum", field="lines"),
+        )
+        parsed = _grouped(ops, ctx, parsed_spec)
+        if from_counts:
+            answered = dict(source)
+        else:
+            predicates = [p for p in main.predicates if p.field != "level"] + [Predicate(field="level", op="eq", value=level)]
+            answered_spec = main.model_copy(
+                update={"predicates": predicates, "group_by": pair, "measure": Measure(kind="sum", field="lines"), "order": None, "top_n": None, "nth": None, "sort": None, "limit": None, "periods": [], "time_basis": None}
+            )
+            answered = _grouped(ops, ctx, answered_spec)
+        for key, n in sorted(source.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+            n = int(n or 0)
+            basis = ",".join(sorted(bases.get(key[0], set()))) or "unknown"
+            got = int(parsed.get(key) or 0)
+            rows.append(
+                {
+                    "service": key[0],
+                    "tenant": key[1],
+                    "level": level.upper(),
+                    "lines_source": n,
+                    "basis": basis,
+                    "source_exactness": "exact" if basis == "level_field" else "approximate",
+                    "lines_answered": int(answered.get(key) or 0),
+                    "lines_parsed": got,
+                    "lines_unparsed": max(0, n - got),
+                }
+            )
+    return rows, notes
+
+
+def _source_phrase(row: dict[str, Any]) -> str:
+    level = row["level"]
+    if row["basis"] == "level_field":
+        what = f"{level}-level lines (level_field)"
+    elif row["basis"] == "token_match":
+        what = f"lines containing '{level.lower()}' (token_match, approximate)"
+    else:
+        what = f"{level} lines ({row['basis']}, approximate)"
+    return f"{row['service']} {row['tenant']}: {row['lines_source']} {what}, {row['lines_unparsed']} unparsed"
+
+
 def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogToolOutput:
     compiled = compile_intent(call, ops.log_context(ctx))
     successors = lineage(ops, ctx)
@@ -190,6 +306,8 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
     logs = manifest.get("logs") or {}
     basis_note = f"({logs.get('date_basis', 'index_date')}, {logs.get('date_timezone', 'UTC')})"
     window = {"start": compiled.window.start.isoformat(), "end": (compiled.window.end - timedelta(days=1)).isoformat(), "label": compiled.window.label} if compiled.window else None
+    if window is not None and compiled.window is not None and compiled.window.latest_anchor is not None:
+        window["latest_available_day"] = compiled.window.latest_anchor.isoformat()
     unavailable = _days_unavailable(compiled.window, manifest) if compiled.intent != "log_around" else []
     if compiled.refusal is not None:
         return LogToolOutput(intent=call.intent, args=call.args, status="refused", exactness="bounded", refusal=compiled.refusal, window=window, rendering=f"Not answered: {compiled.refusal}.", notes=compiled.notes)
@@ -220,6 +338,25 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
             exactness = "approximate"
     methods = _methods(ops, ctx, compiled.scopes["main"]) if exactness == "approximate" else []
     unsupported = [u for r in results.values() for u in r.unsupported]
+    try:
+        counted, count_notes = source_counts(ops, ctx, compiled)
+    except BackendError as exc:
+        counted, count_notes = [], [f"source counts unavailable: {exc}"]
+    compiled.notes.extend(count_notes)
+    short = [r for r in counted if r["lines_source"] > r["lines_answered"]]
+    if short:
+        # never "none ... exact" while the source counts lines at this level that the parse missed
+        exactness = "bounded"
+        missing = sum(r["lines_source"] - r["lines_answered"] for r in short)
+        unparsed = sum(r["lines_unparsed"] for r in short)
+        levels = "/".join(sorted({r["level"] for r in short}))
+        compiled.notes.append(
+            f"the source counts {missing} more {levels} lines than the parsed rows in {len(short)} service/tenant units "
+            f"({unparsed} of their source-counted lines are unparsed; parse coverage below 100%)"
+        )
+    if compiled.window is not None and unavailable and len(unavailable) == len(compiled.window.days()) and not rows:
+        exactness = "bounded"  # nothing of the window is composed: no answer, not zero
+        compiled.notes.append("no requested day has composed data")
     status = "bounded" if exactness == "bounded" else ("empty" if not rows else "answered")
     output = LogToolOutput(
         intent=call.intent,
@@ -237,6 +374,7 @@ def run_intent(ops: LogOperations, ctx: RunContext, call: LogIntentCall) -> LogT
         rendering="",
         document_ids=documents,
         truncated=bool(main.ties) or any(r.matched_ids_truncated for r in results.values()),
+        source_counts=counted,
     )
     output.rendering = render(output, basis_note, ops, ctx, compiled)
     return output
@@ -284,6 +422,16 @@ def _rows(compiled: CompiledIntent, results: dict[str, ScopeResult], ops: Any, c
             m = docs[r.id].metadata if r.id in docs else {}
             out.append({k: m.get(k) for k in ("date", "tenant", "endpoint", "http_method", "status_class", "latency_ms_p95", "lines", "row_exactness")})
         return out
+    if intent == "log_top" and "total" in results:  # error_rate
+        by = compiled.scopes["main"].group_by[0]
+        failing = {g.key[by]: _value(g) or 0 for g in main.groups}
+        rows = []
+        for g in results["total"].groups:
+            total = _value(g) or 0
+            lines = failing.get(g.key[by], 0)
+            rows.append({by: g.key[by], "lines": lines, "lines_total": total, "error_rate": round(lines / total, 4) if total else None})
+        rows.sort(key=lambda r: (-(r["error_rate"] or 0), -r["lines"], str(r[by])))
+        return [r for r in rows if r["lines"]][: compiled.args.get("top_n", 10)]
     if intent == "log_new":
         return [{"signature_id": g.key["signature_id"], "first_seen": g.key["first_seen"], "lines_history": _value(g)} for g in main.groups]
     measure = "lines"
@@ -356,6 +504,8 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
     if window is not None and compiled.intent != "log_around":
         where = f" for index dates {window['start']} to {window['end']} {basis_note}" if window["start"] != window["end"] else f" for index date {window['start']} {basis_note}"
     tail = []
+    if compiled.window is not None and compiled.window.latest_anchor is not None:
+        tail.append(f"latest available day: {compiled.window.latest_anchor.isoformat()} (the question names no date and today has no composed data yet)")
     span = (ops.log_manifest(ctx).get("logs") or {}).get("identity_span") if compiled.window is not None else None
     if span:  # H2: days built under different library versions
         tail.append(f"spans {span['identities']} library identities")
@@ -365,14 +515,22 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
         tail.append(f"includes {share[0]} model-assisted lines ({share[0] / share[1]:.0%} of {share[1]}; extracted by the fallback, labelled extraction_source=model_assisted)")
     if output.source_unavailable:
         tail.append("source_unavailable (no composed data, not zero): " + ", ".join(output.source_unavailable))
+    shown = [r for r in output.source_counts if r["lines_unparsed"] or r["lines_source"] > r["lines_answered"]]
+    if shown:
+        tail.append("source counts: " + "; ".join(_source_phrase(r) for r in shown))
     if output.status == "bounded":
         tail.append("bounded: " + "; ".join(output.notes[-1:]) if output.notes else "bounded")
     tail.append(_exactness_text(output) + ".")
     counted = _counted(output, compiled)
     rows = output.rows
     intent = compiled.intent
+    short = any(r["lines_source"] > r["lines_answered"] for r in output.source_counts)
     if not rows:
-        head = f"No {counted}{where}"
+        head = f"No {counted} in the parsed rows{where}" if short else f"No {counted}{where}"
+    elif intent == "log_top" and "error_rate" in rows[0]:
+        key = compiled.scopes["main"].group_by[0]
+        levels = ", ".join(lv.upper() for lv in compiled.args.get("level") or ["error", "fatal"])
+        head = f"Top {len(rows)} {key} by error rate ({levels} lines / all lines){where}: " + "; ".join(f"{r[key]}: {r['error_rate']:.2%} ({r['lines']} of {r['lines_total']})" for r in rows)
     elif intent == "log_top":
         key = compiled.scopes["main"].group_by[0]
         head = f"Top {len(rows)} {key} by {counted}{where}: " + "; ".join(f"{r[key]}: {r['lines']}" for r in rows)

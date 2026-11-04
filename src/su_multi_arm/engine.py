@@ -27,6 +27,7 @@ outcome, then ``done`` with the same ``AnswerResult`` ``answer`` returns, or ``e
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 import os
 import time
@@ -79,6 +80,7 @@ from .pipeline.validate import decision_for_mode, raise_for
 from .profiles.prompts import GENERATOR_PROMPT, voice_instruction
 from .providers import Embedder, JsonModel, RunBudgetMeter
 from .providers._chat import MissingSecret
+from .providers.base import SchemaViolation
 from .decision.log_guard import guard_active, log_scope_guard
 from .runtime.acl import ANONYMOUS, AccessPolicy, Principal, policy_from_config, require_single_tenant
 from .runtime.actions import ActionRequest, ActionRunner
@@ -95,6 +97,7 @@ from .selection import Candidate, PackExtra, PackRecord, PerArm, Selected, Selec
 
 ARM_NAMES = ARM_ORDER
 DERIVED_ARMS = ("graph", "community")
+LOGGER = logging.getLogger("su_multi_arm.engine")
 UNKNOWN_ID_SUGGESTION = "identifier not found in this generation within the request scope; no fuzzy match is attempted"
 UNRESOLVED_CONTEXT_SUGGESTION = "record_context record id not found in this generation within the caller's access scope; it was not used"
 
@@ -528,6 +531,7 @@ class Engine:
             id_patterns=runtime.id_patterns(),
             graph_templates={name: t.description for name, t in graph.templates.items()} if (graph := runtime.config.arms.graph) else {},
             log_intents=bool(self.config.logs is not None and self.config.logs.intents.enabled),
+            log_cascade_to_planner=bool(self.config.logs is not None and self.config.logs.intents.enabled and self.config.logs.intents.cascade_to_planner),
         )
 
     def _limits(self) -> BudgetLimits:
@@ -742,6 +746,19 @@ class Engine:
         self, ctx: RunContext, request: SearchRequest, pipe: PipelineRuntime, mode: str
     ) -> tuple[DecisionRequest, Capabilities, Decision, Intents, str | None]:
         capabilities = self.capabilities(pipe.name)
+        logs = self.config.logs
+        if capabilities.log_intents and logs is not None and logs.intents.planner_context:
+            from .decision import log_context
+
+            built: dict[str, Any] = {}
+
+            def pack() -> dict[str, Any]:  # built once, only when the llm planner runs
+                if not built:
+                    built.update(log_context.build(self, ctx, arms=capabilities.arms, max_chars=logs.intents.planner_context_max_chars))
+                    ctx.trace.event("planner_log_context", chars=len(json.dumps(built, default=str)), truncated=built.get("truncated", []))
+                return built
+
+            capabilities = capabilities.model_copy(update={"log_context": pack})
         explicit = scope_spec_for(request.aggregate) if request.aggregate else None
         canonical, unresolved = self._canonical_record(ctx, request)
         record_context = dict(request.record_context)
@@ -845,6 +862,7 @@ class Engine:
                 "status": output.status,
                 "source_unavailable": output.source_unavailable,
                 "methods": output.methods,
+                "source_counts": output.source_counts,
             }
         )
         if output.document_ids:
@@ -1237,10 +1255,23 @@ class Engine:
             kinds = CLAIM_KINDS if has_aggregate else ("narrative",)
             schema = answer_schema([row["id"] for row in evidence], kinds)
             ctx.trace.event("generator_schema", evidence_ids=len(evidence), claim_kinds=list(kinds))
-        if on_delta is not None and generator.streams():
-            reply = generator.call_stream(prompt, payload, schema, bridge, "generator", on_delta)
-        else:
-            reply = generator.call(prompt, payload, schema, bridge, "generator")
+        try:
+            if on_delta is not None and generator.streams():
+                reply = generator.call_stream(prompt, payload, schema, bridge, "generator", on_delta)
+            else:
+                reply = generator.call(prompt, payload, schema, bridge, "generator")
+        except SchemaViolation as error:
+            # Real-run fix: the stream used to end with a bare "error: schema_violation" and nothing
+            # logged. The cause is logged (field paths and error types, the provider's stop reason;
+            # never the reply or the evidence) and the run returns its evidence with an abstain.
+            details = {"stage": error.stage or "generator", "errors": error.error_count, "paths": error.paths, "stop_reason": error.stop_reason, "model": role.model if role else None}
+            LOGGER.warning("generator reply violated the answer schema: %s", json.dumps(details, sort_keys=True))
+            ctx.trace.event("generator_schema_violation", **details)
+            reason = "the reply was cut off" if error.stop_reason in {"length", "max_tokens"} else "the reply did not match the answer schema"
+            return Answer(
+                answer=f"No answer was generated ({reason}: schema_violation); the retrieved evidence is returned for inspection.",
+                insufficient_evidence=True,
+            )
         return reply if isinstance(reply, Answer) else Answer.model_validate(reply.model_dump(mode="json"))
 
     def answer(self, request: SearchRequest | str, principal: Principal | None = None, session_id: str | None = None) -> AnswerResult:
@@ -1435,7 +1466,10 @@ class Engine:
         source = self.config.sources.get(logs.source)
         counts = {name: [lv.casefold() for lv in q.levels] for name, q in (source.counts.items() if source is not None else [])}
         today = datetime.now(ZoneInfo(logs.timezone)).date()
-        return CompileContext(today=today, default_window=logs.intents.default_window, count_queries=counts)
+        days = sorted((self.log_manifest(ctx).get("logs") or {}).get("days") or [])
+        latest = date.fromisoformat(days[-1]) if days else None
+        fallback = latest if latest is not None and latest < today and today.isoformat() not in days else None
+        return CompileContext(today=today, default_window=logs.intents.default_window, count_queries=counts, latest_day=fallback)
 
     def log_execute(self, ctx: RunContext, spec: ScopeSpec) -> ScopeResult:
         """A compiled log scope on the record store under the caller's constraints (the scope guard

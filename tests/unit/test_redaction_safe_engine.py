@@ -72,7 +72,7 @@ def test_clock_times_and_versions_are_not_ipv6():
 
 @pytest.mark.parametrize("engine", ENGINES)
 def test_redaction_is_idempotent_and_leaves_no_finding(engine):
-    safe = redactor(REDACTOR_NAMES, engine)
+    safe = redactor(REDACTOR_NAMES, engine, prose_products=["Kafka"])  # product_prose needs its names
     text = " ".join(t for _, t, _ in CASES) + " request_id=abcdef123 id 123e4567-e89b-12d3-a456-426614174000"
     once = safe(text)
     assert safe(once) == once
@@ -80,8 +80,10 @@ def test_redaction_is_idempotent_and_leaves_no_finding(engine):
 
 
 def test_every_builtin_is_in_the_safe_subset():
-    assert set(BUILTIN) == set(REDACTOR_NAMES)
-    for item in BUILTIN.values():
+    from su_multi_arm.privacy.redactors import CONFIGURED_ONLY, product_prose
+
+    assert set(BUILTIN) | CONFIGURED_ONLY == set(REDACTOR_NAMES)
+    for item in [*BUILTIN.values(), product_prose(["Kafka", "Postgre SQL", "Node.js"])]:
         for regex in item.regexes:
             assert [i for i in validate_regex(regex) if i.severity == "error"] == [], (item.name, regex)
 

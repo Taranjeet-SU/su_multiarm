@@ -1779,3 +1779,74 @@ Deviations / notes:
 
 Tests: pytest `not external` 2338 passed, 110 skipped; vitest 62 passed; ruff clean; tour and smoke
 0 CSP violations, 0 page errors.
+
+### 2026-11-04 — Logs: real-deployment defect fixes (levels vs source counts, P19, stored examples, theme path, redactors, anchor/vocabulary, schema violations, index suffixes, planner context, Enter to submit) — DONE (synthetic/mocked)
+
+Base `v2/logs` at `002b213`. Commits: `971cabd` level answers read source counts + P19
+`regex_too_long`; `0d7692a` pseudonymised stored examples + theme path; `cf35e24` five redactors;
+`b7e3ff4` undated anchor, failure vocabulary, `error_rate`; `d75e3a7` numeric index-name suffix;
+`ba25ffa` generator `schema_violation` logged and answered; `f36b856` logs planner context pack;
+`dc041b5` UI Enter to submit; `0e22e7c` and the docs commit: docs only. All reproductions use the
+synthetic generators; no private line, tenant or host name was copied.
+
+Done:
+1. Level questions (`log_top` by service/tenant/signature, `log_trend`, `log_compare`,
+   `log_tenants`) return `source_counts` per (service, tenant, level) from `unit_day`
+   `count_<query>` (basis `level_field` exact, `token_match` approximate; lines answered, parsed,
+   unparsed). Source > answered gives `bounded` with the reason; the rendering lists the counts and
+   says "No … in the parsed rows" instead of "none … exact". Gold set plants unparsed FATAL lines.
+2. P19: `synthesise` rejects regexes over `MAX_REGEX_CHARS` (4096) as `regex_too_long`; the
+   fallback's labelled entry catches the same validation error.
+3. Stored examples (learned, proposed, decisions) pseudonymised with the run's `Pseudonymiser` in
+   the learning loop and the fallback template tier.
+4. `serving.ui.theme` in `_resolve_paths`/`_path_slots`; `config validate` and `doctor` load it.
+5. Redactors `phone`, `long_numeric_id` (hash), `person_name` (`person_name_fields`), `record_list`
+   (`record_list_fields`), `product_prose` (`prose_products`); off by default like every built-in.
+6. Undated questions anchor on the latest served day when today is not composed ("latest available
+   day: …"); uncomposed days of a named window are `source_unavailable`.
+7. Failure words map to ERROR+FATAL; `log_top metric: error_rate`.
+8. Generator `SchemaViolation` logged (paths, error types, stop reason; no reply text) and answered
+   with evidence plus an abstain; `SchemaViolation.paths`/`stop_reason`.
+9. `index_name.service_suffix: numeric` → `deployment_id`.
+10. `decision/log_context.py` planner pack; `logs.intents.{planner_context, planner_context_max_chars,
+    cascade_to_planner, few_shot, few_shot_file}`; profile ships 8 synthetic few-shot examples.
+11. UI: Enter submits (Ask, Logs, Patterns), Shift+Enter newline, no submit while composing.
+
+Deviations:
+- `log_affected` has no `level` argument, so the source-count cross-check covers the level
+  intents listed above; `log_top` by `exception_class`/`endpoint` is not cross-checked (no level
+  dimension).
+- The bounded rule compares source counts with what the rows count; a `level_field` unit whose
+  FATAL lines are unparsed but carry the level field is reported (`lines_unparsed`) but not bounded
+  for by-service/tenant answers, since those rows already count them.
+- "errors" (plural) now means ERROR+FATAL as instructed; two gold `QUESTIONS` expectations changed.
+- The default anchor applies only to questions with no window, start/end or `as_of`: a named
+  relative window ("yesterday") stays relative to today, otherwise "yesterday" would shift.
+- `_days_unavailable` now also lists days after the latest composed day (they used to count as
+  "none, exact"); a window with no composed day is `bounded`.
+- `product_prose` interpretation: the free text after an allow-listed product or technology name is
+  masked to the end of the line; the names stay visible and do not end the masking. The owner's
+  intent was ambiguous; this is the reading implemented and documented.
+- The egress detector does not use `long_numeric_id`, `person_name` or `product_prose` (ids,
+  epoch-ms timestamps and `name=` component keys would refuse whole learning runs); it does use
+  `phone` and `record_list`.
+- Stored examples that no longer match the regex after pseudonymisation are left out and counted
+  (`provenance.examples_dropped_after_pseudonymisation`); with none left the entry is not written.
+- Cascade under the logs profile skips the stages before `llm` when the rules find no log intent
+  (`cascade_to_planner`, traced as `stages_skipped`); the rules' log-intent detection still runs
+  first in every mode.
+- The UI bundle was built from a copy under `~/su_mutliarm_tests/claude/ui_build` (npm cache there
+  too) to keep `node_modules` out of the worktree; asset hashes changed for every chunk.
+
+Tests: pytest `not external` 2442 passed, 99 skipped (was 2338 passed, 110 skipped at the base on
+the logs branch per the U4 entry; this venv has no google-re2). Fresh `[dev]`-only:
+1814 passed, 563 skipped, 0 failed, 0 errors. vitest 65 passed (was 62). ruff clean. One existing
+test lost and regained `engine_or_skip("re2")` between `0d7692a` and `cf35e24` (an editing slip,
+fixed in `cf35e24`).
+
+Follow-ups:
+- Re-run the FATAL, default-anchor, vocabulary and planner-context questions on the deployment
+  (local model first) and record the measured outcome.
+- RE2 runs of the new redactors and pseudonymisation tests (google-re2 not installed here).
+- `log_tenants` takes one level, so "tenants with errors" asks ERROR only; a multi-level variant.
+- A browser (Playwright) pass of the Enter-to-submit change.

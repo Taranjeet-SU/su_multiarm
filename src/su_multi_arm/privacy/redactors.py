@@ -25,8 +25,15 @@ name               matches                                                replac
 ``query_values``   every ``?key=value`` / ``&key=value`` value            value: ``[REDACTED_QUERY_VALUE]``
 ``ipv6``           full or ``::``-compressed IPv6 (validated)             ``[REDACTED_IPV6]``
 ``ipv4``           dotted quad                                            ``[REDACTED_IPV4]``
+``phone``          ``+<cc>`` digit groups, ``(415) 555-0100``, phone keys  ``[REDACTED_PHONE]``
+``long_numeric_id`` 13–19 digit runs                                      ``[LONG_NUMERIC_ID:<hash>]``
 ``hex_secret``     32–128 hex digits (noisy on hashes; opt-in)            ``[REDACTED_HEX_SECRET]``
 =================  =====================================================  ==========================
+
+The payload redactors follow (``llm_text``, ``content``, ``query``, ``tracking_id``, ``pg_row``,
+``record_payload``), then ``person_name`` (JSON and ``key=value`` person-name fields),
+``record_list`` (JSON arrays of records under list keys, ``<record>``) and ``product_prose`` (free
+text after a configured product name, ``<prose>``; exists only with ``privacy.prose_products``).
 
 ``<hash>`` is the first 12 hex digits of a sha256 of the value, keyed with the secret in
 ``privacy.hash_key_env`` when set: equal ids stay joinable, the value is not readable. User
@@ -54,7 +61,7 @@ from ..extraction.patterns.engine import Hit, PatternEngine, PatternTimeout, sel
 
 REDACTOR_VERSION = "1"
 # A redaction token written by this module (never redacted again).
-MARKERS = ("llm_text", "content", "query", "record", "value")  # payload markers: ``<llm_text>`` …
+MARKERS = ("llm_text", "content", "query", "record", "value", "prose")  # payload markers: ``<llm_text>`` …
 _TOKEN = r"\[(?:REDACTED_[A-Z0-9_]{1,40}|[A-Z0-9_]{1,40}:[0-9a-f]{12})\]|<(?:" + "|".join(MARKERS) + r")>"
 TOKEN = re.compile(r"^(?:" + _TOKEN + r")$")
 TOKENS = re.compile(_TOKEN)
@@ -90,12 +97,13 @@ class Redactor:
     # the one before the value). ``None``: the regex match itself.
     extend: str | tuple[str | None, ...] | None = None
     marker: str | None = None  # mask written as ``<marker>`` instead of ``[REDACTED_<NAME>]``
+    stops: tuple[str, ...] = ()  # ``prose`` mode: lower-case names that end one masked span (kept visible)
 
     def mode(self, index: int) -> str | None:
         return self.extend[index] if isinstance(self.extend, tuple) else self.extend
 
     def with_action(self, action: str) -> "Redactor":
-        return Redactor(self.name, self.regexes, action, self.accept, self.extend, self.marker)
+        return Redactor(self.name, self.regexes, action, self.accept, self.extend, self.marker, self.stops)
 
     def token(self, value: str, key: bytes | None) -> str:
         label = self.name.upper()
@@ -114,6 +122,7 @@ class Redactor:
             "accept": self.accept.__name__ if self.accept else None,
             **({"extend": list(self.extend) if isinstance(self.extend, tuple) else self.extend} if self.extend else {}),
             **({"marker": self.marker} if self.marker else {}),
+            **({"stops": list(self.stops)} if self.stops else {}),
         }
 
 
@@ -160,8 +169,30 @@ def _bracket_end(text: str, start: int) -> int:
     return len(text)
 
 
-def extend_value(text: str, start: int, end: int, mode: str) -> tuple[int, int]:
+def _prose_end(text: str, start: int, stops: tuple[str, ...]) -> int:
+    """End of the free text starting at ``start``: the end of the line, or just before the next
+    word-bounded ``stops`` name (case-insensitive), trailing spaces excluded."""
+    stop = text.find("\n", start)
+    stop = len(text) if stop < 0 else stop
+    low = text[start:stop].casefold()
+    for name in stops:
+        i = low.find(name)
+        while i >= 0:
+            before = low[i - 1] if i else " "
+            after = low[i + len(name)] if i + len(name) < len(low) else " "
+            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                stop = min(stop, start + i)
+                break
+            i = low.find(name, i + 1)
+    while stop > start and text[stop - 1] in " \t":
+        stop -= 1
+    return stop
+
+
+def extend_value(text: str, start: int, end: int, mode: str, stops: tuple[str, ...] = ()) -> tuple[int, int]:
     """The payload span of a value that starts at ``start`` (see ``Redactor.extend``)."""
+    if mode == "prose":
+        return start, _prose_end(text, start, stops)
     if mode == "eol":
         stop = text.find("\n", start)
         return start, len(text) if stop < 0 else stop
@@ -297,10 +328,11 @@ BUILTIN: dict[str, Redactor] = {
 
 def builtin_redactors(names: list[str] | tuple[str, ...]) -> list[Redactor]:
     """The named built-ins in the fixed application order."""
-    unknown = sorted(set(names) - set(BUILTIN))
+    unknown = sorted(set(names) - set(ORDER))
     if unknown:
         raise ValueError(f"unknown redactors {unknown}; known: {list(ORDER)}")
-    return [BUILTIN[name] for name in ORDER if name in names]
+    # ``product_prose`` needs its configured names: built by ``configured_redactors`` only
+    return [BUILTIN[name] for name in ORDER if name in names and name in BUILTIN]
 
 
 def _disjoint(spans: Any) -> list[tuple[int, int]]:
@@ -323,7 +355,106 @@ def record_payload(fields: list[str] | tuple[str, ...]) -> Redactor:
 
 
 BUILTIN["record_payload"] = record_payload(RECORD_FIELDS)
-ORDER = tuple(BUILTIN)
+
+
+def _phone(text: str) -> str | None:
+    """The phone number in a candidate (trailing separators and an unclosed parenthesis dropped)
+    when it has 7–15 digits (E.164 allows 15), and 8 or more after a ``+``."""
+    end = len(text)
+    while end and not text[end - 1].isdigit():
+        end -= 1
+    candidate = text[:end]
+    digits = sum(ch.isdigit() for ch in candidate)
+    low = 8 if candidate.startswith("+") else 7
+    return candidate if low <= digits <= 15 else None
+
+
+BUILTIN["phone"] = Redactor(
+    "phone",
+    (
+        # international: +<country code> then digit groups (spaces, dots, dashes, an area code in parentheses)
+        r"(?:^|[^0-9A-Za-z_+])(?P<value>\+[0-9]{1,3}(?:[ .-]{0,2}\(?[0-9]{1,5}\)?){1,6})",
+        # national with the area code in parentheses: (415) 555-0100
+        r"(?:^|[^0-9A-Za-z_(])(?P<value>\([0-9]{2,5}\)[ .-]{0,2}[0-9]{2,5}(?:[ .-][0-9]{2,5}){1,3})",
+        # any shape after a phone key: phone=0049 30 1234567, "mobile": "030-1234567"
+        r"(?i)(?P<keep>\b(?:phone|phone_?number|telephone|tel|mobile|cell|fax|msisdn)[\"']?[ \t]{0,3}[:=][ \t]{0,3}[\"']?)(?P<value>\+?[0-9(][0-9 ().-]{5,30}[0-9])",
+    ),
+    accept=_phone,
+)
+# 13–19 digit runs (card numbers, account and national ids, epoch-millisecond timestamps too): hashed,
+# so equal ids stay joinable. A longer run is not an id of this class and is left alone.
+BUILTIN["long_numeric_id"] = Redactor("long_numeric_id", (r"\b[0-9]{13,19}\b",), "hash")
+
+# Person-name fields of JSON objects and key=value text. ``privacy.person_name_fields`` replaces the
+# key list (matched case-insensitively, so ``firstName`` is ``firstname``).
+PERSON_NAME_FIELDS = ("name", "firstname", "first_name", "lastname", "last_name", "fullname", "full_name", "displayname", "display_name", "username", "user_name", "author")
+
+
+def person_name(fields: list[str] | tuple[str, ...]) -> Redactor:
+    """``person_name``: a JSON string value (``"firstName": "…"``), a quoted ``key="…"`` value, or an
+    unquoted ``key=Value`` with up to three following capitalised words (``author=Jane Q Doe``)."""
+    names = sorted({f.casefold() for f in fields}, key=lambda f: (-len(f), f))
+    alternation = "|".join(re.escape(n) for n in names)
+    return Redactor(
+        "person_name",
+        (
+            r"(?P<keep>\"(?i:" + alternation + r")\"[ \t]{0,3}:[ \t]{0,3})(?P<value>\")",
+            r"(?P<keep>\b(?i:" + alternation + r")[ \t]{0,3}[:=][ \t]{0,3})(?P<value>[\"'])",
+            r"(?P<keep>\b(?i:" + alternation + r")[ \t]{0,3}[:=][ \t]{0,3})(?P<value>[^\s\"',;&{}\[\]()<>=]{1,100}(?: [A-Z][A-Za-z'.-]{0,60}){0,3})",
+        ),
+        extend=("smart", "smart", None),
+    )
+
+
+BUILTIN["person_name"] = person_name(PERSON_NAME_FIELDS)
+
+# JSON arrays of objects under a list key (``"customers": [{…}, …]``): the whole array becomes
+# ``<record>``. ``privacy.record_list_fields`` replaces the key list.
+RECORD_LIST_FIELDS = (
+    "records", "rows", "items", "results", "entities", "accounts", "customers", "clients", "companies", "organizations",
+    "organisations", "businesses", "merchants", "vendors", "suppliers", "partners", "contacts", "users", "members", "employees",
+)  # fmt: skip
+
+
+def record_list(fields: list[str] | tuple[str, ...]) -> Redactor:
+    """``record_list``: the value of a named JSON key when it is an array of objects (a list of
+    business-entity records), replaced whole by ``<record>``; arrays of scalars are kept."""
+    names = sorted({f.casefold() for f in fields}, key=lambda f: (-len(f), f))
+    alternation = "|".join(re.escape(n) for n in names)
+    return Redactor("record_list", (r"(?P<keep>\"(?i:" + alternation + r")\"[ \t]{0,3}:[ \t]{0,3})(?P<value>\[)[ \t\r\n]{0,16}\{",), extend="smart", marker="record")
+
+
+BUILTIN["record_list"] = record_list(RECORD_LIST_FIELDS)
+
+
+def product_prose(tokens: list[str] | tuple[str, ...]) -> Redactor:
+    """``product_prose``: the free text that follows a known product or technology name, to the end
+    of the line, becomes ``<prose>``. The names themselves (``privacy.prose_products``, an
+    allow-list) stay visible, and a later name in the same text does not end the masking: the prose
+    after it is masked again (``Kafka <prose> Redis <prose>``)."""
+    from ..extraction.patterns.library import escape_literal
+
+    names = sorted({t.casefold() for t in tokens}, key=lambda t: (-len(t), t))
+    if not names:
+        raise ValueError("product_prose needs privacy.prose_products")
+    alternation = "|".join(escape_literal(n) for n in names)
+    return Redactor(
+        "product_prose",
+        (r"(?P<keep>\b(?i:" + alternation + r")\b[ \t:,;-]{0,3})(?P<value>[^\s])",),
+        extend="prose",
+        marker="prose",
+        stops=tuple(names),
+    )
+
+
+# ``product_prose`` has no default token list: it exists only when configured (``configured_redactors``).
+CONFIGURED_ONLY = frozenset({"product_prose"})
+ORDER = (
+    "url_credentials", "bearer_token", "jwt", "api_key", "aws_key", "request_id", "uuid", "email", "query_values", "ipv6", "ipv4",
+    "phone", "long_numeric_id", "hex_secret", "llm_text", "content", "query", "tracking_id", "pg_row", "record_payload",
+    "person_name", "record_list", "product_prose",
+)  # fmt: skip
+assert set(ORDER) == set(BUILTIN) | CONFIGURED_ONLY
 
 
 def configured_redactors(privacy: Any) -> list[Redactor]:
@@ -333,9 +464,18 @@ def configured_redactors(privacy: Any) -> list[Redactor]:
     names = list(privacy.redactors)
     if privacy.redact_emails and "email" not in names:
         names.append("email")
-    out = builtin_redactors(names)
+    builtins = builtin_redactors(names)
     fields = [f for f in (privacy.record_fields if privacy.record_fields is not None else RECORD_FIELDS) if f.casefold() not in {a.casefold() for a in privacy.record_fields_allow}]
-    out = [record_payload(fields) if r.name == "record_payload" else r for r in out]
+    person = getattr(privacy, "person_name_fields", None)
+    lists = getattr(privacy, "record_list_fields", None)
+    configured = {
+        "record_payload": lambda: record_payload(fields),
+        "person_name": lambda: person_name(person) if person is not None else BUILTIN["person_name"],
+        "record_list": lambda: record_list(lists) if lists is not None else BUILTIN["record_list"],
+        "product_prose": lambda: product_prose(getattr(privacy, "prose_products", []) or []),
+    }
+    by_name = {r.name: r for r in builtins}
+    out = [configured[n]() if n in configured else by_name[n] for n in ORDER if n in names]
     out = [r.with_action(privacy.actions[r.name]) if r.name in privacy.actions else r for r in out]
     out += [Redactor(c.name, (c.regex,), c.action) for c in privacy.custom]
     out += [Redactor(label.casefold(), ("(?i)" + regex,)) for label, regex in privacy.patterns.items()]
@@ -382,7 +522,7 @@ class SafeRedactor:
         (empty, or overlapping a redaction token already in the text)."""
         start, end = hit.groups.get("value") or (hit.start, hit.end)
         if mode and hit.groups.get("value"):
-            start, end = extend_value(text, start, end, mode)
+            start, end = extend_value(text, start, end, mode, redactor.stops)
         if end <= start or any(a < hit.end and hit.start < b for a, b in tokens) or TOKEN.match(text[start:end]):
             return None
         if redactor.accept is not None:

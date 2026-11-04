@@ -1672,6 +1672,35 @@
       "title": "FallbackBudgetConfig",
       "type": "object"
     },
+    "FewShotExample": {
+      "additionalProperties": false,
+      "description": "One planner example: a question and the typed intent call it should plan (the arguments are\nvalidated against the intent's input model).",
+      "properties": {
+        "question": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        },
+        "intent": {
+          "maxLength": 32,
+          "minLength": 1,
+          "title": "Intent",
+          "type": "string"
+        },
+        "args": {
+          "additionalProperties": true,
+          "title": "Args",
+          "type": "object"
+        }
+      },
+      "required": [
+        "question",
+        "intent"
+      ],
+      "title": "FewShotExample",
+      "type": "object"
+    },
     "FieldSpec": {
       "additionalProperties": false,
       "properties": {
@@ -2216,7 +2245,7 @@
     },
     "IndexNameConfig": {
       "additionalProperties": false,
-      "description": "Index-name grammar: ``[<prefix>-][<deployment prefix>-]<prefix fields>-<service>-<date>``\n(``deployment_position: leading``) or ``[<prefix>-]<prefix fields>-[<deployment prefix>-]<service>-<date>``\n(``deployment_position: before_service``).\n\n- ``date_format`` matches the trailing date (``%Y``, ``%m``, ``%d`` and literal separators).\n- ``prefix`` (optional) is a literal every name must start with, followed by ``separator``. It\n  is stripped before the segments are read, so it never becomes part of the first prefix field\n  (``prefix: logs`` reads ``logs-acme-prod-crawler-\u2026`` as tenant ``acme``).\n- ``deployment_prefixes`` (optional) are deployment or infrastructure prefixes, tried longest\n  first; ``{n}`` stands for a run of digits (``os-data-{n}`` matches ``os-data-1``). A matched\n  prefix is recorded as the ``deployment`` attribute (``none`` when the name has none).\n  ``deployment_position`` says where they stand: at the left of the prefix fields (``leading``,\n  the default) or between the prefix fields and the service (``before_service``). ``after_env``\n  is env-anchored and needs no list: the deployment is whatever lies between the last prefix\n  field (matched by its vocabulary) and the service (matched by its vocabulary).\n- ``prefix_fields`` (default ``tenant``, ``env``) and ``service`` are the segments. A segment\n  with a vocabulary takes the **longest** vocabulary entry that fits (``query-gateway`` wins\n  over ``gateway``); a segment without one is exactly one separator-free token, so service\n  names such as ``slack_bot`` parse with the ``-`` separator.\n\nA name that does not fit the grammar, or that fits it in more than one way (with and without\na deployment prefix), is ``unparsed`` with a typed reason and ``unknown`` attributes: never a\nguess.",
+      "description": "Index-name grammar: ``[<prefix>-][<deployment prefix>-]<prefix fields>-<service>-<date>``\n(``deployment_position: leading``) or ``[<prefix>-]<prefix fields>-[<deployment prefix>-]<service>-<date>``\n(``deployment_position: before_service``).\n\n- ``date_format`` matches the trailing date (``%Y``, ``%m``, ``%d`` and literal separators).\n- ``prefix`` (optional) is a literal every name must start with, followed by ``separator``. It\n  is stripped before the segments are read, so it never becomes part of the first prefix field\n  (``prefix: logs`` reads ``logs-acme-prod-crawler-\u2026`` as tenant ``acme``).\n- ``deployment_prefixes`` (optional) are deployment or infrastructure prefixes, tried longest\n  first; ``{n}`` stands for a run of digits (``os-data-{n}`` matches ``os-data-1``). A matched\n  prefix is recorded as the ``deployment`` attribute (``none`` when the name has none).\n  ``deployment_position`` says where they stand: at the left of the prefix fields (``leading``,\n  the default) or between the prefix fields and the service (``before_service``). ``after_env``\n  is env-anchored and needs no list: the deployment is whatever lies between the last prefix\n  field (matched by its vocabulary) and the service (matched by its vocabulary).\n- ``service_suffix: numeric`` reads a trailing digit run (at least ``service_suffix_min_digits``)\n  after the service as the ``deployment_id`` attribute (``ml-service-1658254295-2026.03.01`` is\n  service ``ml-service``, deployment id ``1658254295``).\n- ``prefix_fields`` (default ``tenant``, ``env``) and ``service`` are the segments. A segment\n  with a vocabulary takes the **longest** vocabulary entry that fits (``query-gateway`` wins\n  over ``gateway``); a segment without one is exactly one separator-free token, so service\n  names such as ``slack_bot`` parse with the ``-`` separator.\n\nA name that does not fit the grammar, or that fits it in more than one way (with and without\na deployment prefix), is ``unparsed`` with a typed reason and ``unknown`` attributes: never a\nguess.",
       "properties": {
         "separator": {
           "default": "-",
@@ -2285,6 +2314,22 @@
           },
           "title": "Vocabularies",
           "type": "object"
+        },
+        "service_suffix": {
+          "default": "none",
+          "enum": [
+            "none",
+            "numeric"
+          ],
+          "title": "Service Suffix",
+          "type": "string"
+        },
+        "service_suffix_min_digits": {
+          "default": 6,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Service Suffix Min Digits",
+          "type": "integer"
         }
       },
       "title": "IndexNameConfig",
@@ -2788,6 +2833,44 @@
           "minLength": 1,
           "title": "Default Window",
           "type": "string"
+        },
+        "planner_context": {
+          "default": true,
+          "title": "Planner Context",
+          "type": "boolean"
+        },
+        "cascade_to_planner": {
+          "default": true,
+          "title": "Cascade To Planner",
+          "type": "boolean"
+        },
+        "planner_context_max_chars": {
+          "default": 24000,
+          "maximum": 200000,
+          "minimum": 2000,
+          "title": "Planner Context Max Chars",
+          "type": "integer"
+        },
+        "few_shot": {
+          "items": {
+            "$ref": "#/$defs/FewShotExample"
+          },
+          "maxItems": 50,
+          "title": "Few Shot",
+          "type": "array"
+        },
+        "few_shot_file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Few Shot File"
         }
       },
       "title": "LogIntentsConfig",
@@ -4170,7 +4253,12 @@
               "query",
               "tracking_id",
               "record_payload",
-              "pg_row"
+              "pg_row",
+              "phone",
+              "long_numeric_id",
+              "person_name",
+              "record_list",
+              "product_prose"
             ],
             "type": "string"
           },
@@ -4240,7 +4328,12 @@
               "query",
               "tracking_id",
               "record_payload",
-              "pg_row"
+              "pg_row",
+              "phone",
+              "long_numeric_id",
+              "person_name",
+              "record_list",
+              "product_prose"
             ]
           },
           "title": "Actions",
@@ -4266,6 +4359,44 @@
             "type": "string"
           },
           "title": "Record Fields Allow",
+          "type": "array"
+        },
+        "person_name_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Person Name Fields"
+        },
+        "record_list_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Record List Fields"
+        },
+        "prose_products": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Prose Products",
           "type": "array"
         }
       },

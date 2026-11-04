@@ -14,7 +14,9 @@ the example lines as positive examples, and ``applies_to`` set to the cluster's 
 
 A candidate that fails the validator/ReDoS lint, has fewer than ``min_literal_chars`` literal
 characters, or does not match every example it came from is **rejected with its reason**, never
-repaired or loosened.
+repaired or loosened. A regex longer than a library entry allows (``MAX_REGEX_CHARS``, 4,096) is
+rejected as ``regex_too_long`` (real-run fix P19: ``patterns mine`` used to abort the whole run on
+the entry's validation error); the cluster is skipped, never truncated into another pattern.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ...extraction.patterns.engine import PatternEngine, PatternTimeout, literal_chars, validate_regex
-from ...extraction.patterns.library import PatternEntry, escape_literal
+from ...extraction.patterns.library import MAX_REGEX_CHARS, PatternEntry, escape_literal
 from .mining import _CLOSE, _OPEN, WILDCARD, Cluster
 
 
@@ -87,6 +89,8 @@ def synthesise(cluster: Cluster, masks: dict[str, str], engine: PatternEngine, *
         regex, origins = template_regex(cluster.tokens, masks)
     except ValueError as exc:
         return Synthesis(cluster.id, None, str(exc))
+    if len(regex) > MAX_REGEX_CHARS:
+        return Synthesis(cluster.id, None, f"regex_too_long: {len(regex)} characters > {MAX_REGEX_CHARS}")
     errors = [i for i in validate_regex(regex) if i.severity == "error"]
     if errors:
         return Synthesis(cluster.id, None, f"lint: {errors[0].code}: {errors[0].message}")

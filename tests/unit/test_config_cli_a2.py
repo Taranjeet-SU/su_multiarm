@@ -264,3 +264,36 @@ def test_doctor_reports_missing_keys_per_pipeline(tmp_path, monkeypatch, capsys)
     code, out, err = run_main(monkeypatch, capsys, "--config", str(config), "doctor")
     assert code == 0, err
     assert json.loads(out)["missing_keys"] == {"pipeline:planned": {"planner": [PLANNER_ENV_NAME]}}
+
+
+# --- serving.ui.theme path (real-run fix) -----------------------------------------------------------
+
+
+def test_ui_theme_path_is_relative_to_the_config_and_checked_by_validate_and_doctor(tmp_path, monkeypatch, capsys):
+    """A relative ``serving.ui.theme`` resolves against the config file's directory (like every other
+    path) and ``config validate``/``doctor`` refuse a missing theme instead of ``serve`` failing."""
+    from su_multi_arm.core.config import load_config
+
+    conf = tmp_path / "conf"
+    (conf / "brand").mkdir(parents=True)
+    (conf / "brand" / "theme.json").write_text(json.dumps({"name": "synthetic", "colors": {"brand": "#225588"}}))
+    good = conf / "good.yaml"
+    good.write_text(yaml.safe_dump(data(serving={"ui": {"theme": "brand/theme.json"}})))
+    monkeypatch.chdir(tmp_path)  # another working directory: the path must not depend on it
+    assert load_config(good).serving.ui.theme == (conf / "brand" / "theme.json").resolve()
+    code, out, err = run_main(monkeypatch, capsys, "--config", str(good), "config", "validate")
+    assert code == 0 and json.loads(out)["config"] == "valid", err
+    code, out, err = run_main(monkeypatch, capsys, "--config", str(good), "doctor")
+    assert code == 0, err
+    bad = conf / "bad.yaml"
+    bad.write_text(yaml.safe_dump(data(serving={"ui": {"theme": "brand/absent.json"}})))
+    code, out, err = run_main(monkeypatch, capsys, "--config", str(bad), "config", "validate")
+    assert code != 0 and "theme" in err + out and "Traceback" not in err
+    code, out, err = run_main(monkeypatch, capsys, "--config", str(bad), "doctor")
+    assert code == 1 and json.loads(out)["config"] == "invalid" and json.loads(out)["path"] == "serving.ui.theme"
+
+
+def test_rebase_paths_moves_the_ui_theme_with_the_config(tmp_path):
+    raw = data(serving={"ui": {"theme": "brand/theme.json"}})
+    changed = rebase_paths(raw, tmp_path / "a", tmp_path / "b")
+    assert "serving.ui.theme" in changed and raw["serving"]["ui"]["theme"] == "../a/brand/theme.json"

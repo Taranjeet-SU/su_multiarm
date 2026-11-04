@@ -189,8 +189,12 @@ class LlmAgent(DecisionAgent):
             payload["log_intents"] = {name: sorted(model.model_fields) for name, model in INPUT_MODELS.items()}
             payload["log_intent_rule"] = (
                 "Log questions: a structured step names one of log_intents in `log_intent` and gives its arguments as "
-                "field/value pairs in `log_args` (repeat a field for a list); never write a scope over log documents."
+                "field/value pairs in `log_args` (repeat a field for a list); never write a scope over log documents. "
+                "`log_context` (when present) describes the stored data, the served dates, known values, each intent's input "
+                "schema and example question -> intent calls."
             )
+            if callable(capabilities.log_context):
+                payload["log_context"] = capabilities.log_context()
         if capabilities.graph_templates and "graph" in capabilities.arms:
             payload["graph_templates"] = dict(capabilities.graph_templates)
             payload["graph_template_rule"] = (

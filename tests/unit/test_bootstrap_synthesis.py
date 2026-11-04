@@ -129,3 +129,27 @@ def test_bootstrap_proposals_pass_the_gate(tmp_path):
     evidence = GateEvidence(lines={i: bodies[i] for i in support}, positive_ids=cited, held_out=held_out)
     result = run_gate(entry, evidence, library.library, re2)
     assert result.passed, result.summary()
+
+
+def test_a_regex_over_the_entry_limit_is_skipped_with_its_reason_never_aborting(tmp_path, engine):
+    """P19 (real-run fix): a template with many mask placeholders synthesises a regex longer than a
+    library entry accepts (4,096 characters). The cluster is rejected as ``regex_too_long``; the
+    bootstrap (``patterns mine``) still reports the other clusters."""
+    from su_multi_arm.extraction.patterns.library import MAX_REGEX_CHARS
+
+    library = compiled(tmp_path, engine, [])
+
+    def uuids(i: int) -> str:
+        return " ".join(f"{(i * 60 + k):08x}-0000-4000-8000-{k:012x}" for k in range(60))
+
+    lines = [LogLine(f"u{i}", f"sync {uuids(i)} done", {"service": "svc"}) for i in range(3)]
+    lines += [LogLine(f"w{i}", f"worker pool resized from {i} to {i + 1} slots", {"service": "svc"}) for i in range(3)]
+    miner = TemplateMiner(engine, MASKS)
+    for line in lines[:3]:
+        miner.add(line.id, line.text, "svc", None)
+    [cluster] = miner.result()
+    made = synthesise(cluster, MASKS, engine)
+    assert made.entry is None and made.reason.startswith("regex_too_long") and str(MAX_REGEX_CHARS) in made.reason
+    report = bootstrap(lines, library)
+    assert any(reason.startswith("regex_too_long") for _, reason in report.rejected)
+    assert len(report.proposals) == 1 and "worker" in report.proposals[0].examples.positive[0]

@@ -107,3 +107,33 @@ def test_the_grammar_is_validated(bad):
 def test_fields_list_the_deployment_attribute_only_when_declared():
     assert grammar().fields() == ["deployment", "tenant", "env", "service", "index_date"]
     assert grammar(deployment_prefixes=[]).fields() == ["tenant", "env", "service", "index_date"]
+
+
+# --- numeric service suffix (real-run fix) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("vocabulary", [True, False])
+def test_a_numeric_service_suffix_is_a_deployment_id(vocabulary):
+    vocab = {"vocabularies": {"service": ["ml-service", "crawler"]}} if vocabulary else {"vocabularies": {}}
+    parser = grammar(deployment_prefixes=[], service_suffix="numeric", **vocab)
+    parsed = parser.parse("acme-prod-ml-service-1658254295-2026.01.02") if vocabulary else parser.parse("acme-prod-mlservice-1658254295-2026.01.02")
+    assert parsed.status == "parsed", parsed.problem
+    assert parsed.attributes["service"] == ("ml-service" if vocabulary else "mlservice") and parsed.attributes["deployment_id"] == "1658254295"
+    plain = parser.parse("acme-prod-crawler-2026.01.02")
+    assert plain.attributes["service"] == "crawler" and plain.attributes["deployment_id"] == "none"
+    assert parser.fields() == ["tenant", "env", "service", "deployment_id", "index_date"]
+
+
+def test_short_digit_runs_stay_in_the_service_and_the_rule_is_off_by_default():
+    parser = grammar(deployment_prefixes=[], service_suffix="numeric", vocabularies={"service": ["svc-2"]})
+    assert parser.parse("acme-prod-svc-2-2026.01.02").attributes["service"] == "svc-2"  # 1 digit < min 6
+    off = grammar(deployment_prefixes=[], vocabularies={})
+    assert off.parse("acme-prod-ml-service-1658254295-2026.01.02").status == "unparsed"  # without the rule: leftover segments
+    assert "deployment_id" not in off.fields()
+
+
+def test_numeric_suffix_with_deployment_prefixes_before_the_service():
+    parser = grammar(deployment_position="before_service", deployment_prefixes=["os-data-{n}"], service_suffix="numeric", vocabularies={"service": ["ml-service"]})
+    parsed = parser.parse("acme-prod-os-data-3-ml-service-1658254295-2026.01.02")
+    assert parsed.status == "parsed", parsed.problem
+    assert parsed.attributes["deployment"] == "os-data-3" and parsed.attributes["service"] == "ml-service" and parsed.attributes["deployment_id"] == "1658254295"

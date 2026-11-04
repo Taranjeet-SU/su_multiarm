@@ -99,12 +99,12 @@ def build_gold(tmp: Path, *, days: list[date] | None = None, data: dict[str, Any
 # surface-parity and history-tier tests; kept here so neither needs the api extra to import it).
 QUESTIONS = [
     ("Which services had FATAL yesterday?", "log_top", {"by": "service", "level": ["fatal"], "window": "yesterday"}),
-    ("Top errors for svc-api yesterday", "log_top", {"by": "signature", "level": ["error"], "service": ["svc-api"], "window": "yesterday"}),
+    ("Top errors for svc-api yesterday", "log_top", {"by": "signature", "level": ["error", "fatal"], "service": ["svc-api"], "window": "yesterday"}),
     ("What's new today?", "log_new", {"window": "today"}),
     ("Which tenants are affected by feature.flag_conflict?", "log_affected", {"signature_id": "feature.flag_conflict", "window": "last 10 days"}),
     ("How has dependency.connect_failed trended over 10 days?", "log_trend", {"signature_id": "dependency.connect_failed", "window": "last 10 days"}),
     ("Which tenants had FATAL in svc-auth yesterday?", "log_tenants", {"service": "svc-auth", "level": "fatal", "window": "yesterday"}),
-    ("Errors for svc-api yesterday vs today", "log_compare", {"periods": ["yesterday", "today"], "service": "svc-api", "level": ["error"]}),
+    ("Errors for svc-api yesterday vs today", "log_compare", {"periods": ["yesterday", "today"], "service": "svc-api", "level": ["error", "fatal"]}),
     ("What else broke around 14:00 for t02 on 2026-03-05?", "log_around", {"at": "2026-03-05T14:00:00+00:00", "tenant": "t02"}),
     ("Slowest endpoints of svc-api yesterday", "log_endpoints", {"service": "svc-api", "metric": "latency_max", "window": "yesterday"}),
     ("What does process.crashed mean?", "log_signature", {"signature_id": "process.crashed", "window": "last 10 days"}),

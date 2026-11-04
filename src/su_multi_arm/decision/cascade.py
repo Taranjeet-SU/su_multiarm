@@ -65,7 +65,16 @@ class CascadeAgent(DecisionAgent):
     def attempt(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision:
         policies: StagePolicies = self.config.stage_policies  # type: ignore[attr-defined]
         last: DecisionFailure | None = None
-        for stage, agent in self.stages.items():
+        stages = dict(self.stages)
+        if capabilities.log_intents and capabilities.log_cascade_to_planner and "llm" in stages:
+            # Logs profile: the rules already looked for a log intent (``log_step``) and found none;
+            # the llm planner (with the logs context pack) plans next instead of a generic rules plan.
+            names = list(stages)
+            skipped = names[: names.index("llm")]
+            if skipped:
+                ctx.trace.event("stages_skipped", stages=skipped, reason="logs profile: no log intent found by the rules; the llm planner plans")
+            stages = {name: stages[name] for name in names[names.index("llm") :]}
+        for stage, agent in stages.items():
             try:
                 decision = agent.attempt(ctx, request, intents, capabilities)
             except DecisionFailure as failure:

@@ -151,10 +151,41 @@ class Pseudonymiser:
         return text
 
 
+def pseudonymise_examples(entry: Any, pseudo: Pseudonymiser, library: Any, engine: Any) -> tuple[Any, str | None]:
+    """``entry`` with its stored examples pseudonymised like the prompt text (real-run fix: the
+    positive examples written to ``learned.yaml``/``proposed.yaml`` and copied into decisions kept
+    tenant and host values). Case-insensitive and token-bounded (``Pseudonymiser.text``).
+
+    The library lint requires positive examples to match and negative ones not to; an example that
+    no longer does after pseudonymisation is left out and counted in
+    ``provenance.examples_dropped_after_pseudonymisation`` (never kept with its original value).
+    Returns ``(None, reason)`` when no positive example remains: the entry is not written."""
+    from ...extraction.patterns.library import expand
+
+    positive = [pseudo.text(t) for t in entry.examples.positive]
+    negative = [pseudo.text(t) for t in entry.examples.negative]
+    if positive == list(entry.examples.positive) and negative == list(entry.examples.negative):
+        return entry, None
+    regex, _ = expand(entry.regex, library.vocabularies, library.masks)
+    compiled = engine.compile(regex)
+    kept_pos = [t for t in positive if engine.search(compiled, t) is not None]
+    kept_neg = [t for t in negative if engine.search(compiled, t) is None]
+    if not kept_pos:
+        return None, "no positive example matches after pseudonymisation"
+    dropped = (len(positive) - len(kept_pos)) + (len(negative) - len(kept_neg))
+    provenance = dict(entry.provenance)
+    if dropped:
+        provenance["examples_dropped_after_pseudonymisation"] = dropped
+    examples = entry.examples.model_copy(update={"positive": kept_pos, "negative": kept_neg})
+    return entry.model_copy(update={"examples": examples, "provenance": provenance}), None
+
+
 # B11 built-ins used as an egress detector (real-run fix): every secret, personal and payload class,
-# cookies, session and tracking ids included. ``uuid`` and ``request_id`` are identifiers that log
-# templates legitimately carry, so they are not egress refusals.
-EGRESS_SCAN_EXCLUDED = frozenset({"uuid", "request_id"})
+# cookies, session and tracking ids included. ``uuid``, ``request_id`` and ``long_numeric_id`` are
+# identifiers (and epoch-millisecond timestamps) that log templates legitimately carry, and
+# ``person_name``'s keys (``name=``) name components as often as people, so they are not egress
+# refusals; ``product_prose`` exists only with configured names. Enable them as redactors instead.
+EGRESS_SCAN_EXCLUDED = frozenset({"uuid", "request_id", "long_numeric_id", "person_name", "product_prose"})
 _SCANNER: list[Any] = []
 
 

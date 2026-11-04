@@ -538,6 +538,9 @@ privacy:
   actions: {query: hash}             # per built-in: mask (default) or hash
   record_fields_allow: [city]        # record_payload: drop names from the built-in entity field list
   # record_fields: [customer_ref]    # ... or replace the list
+  # person_name_fields: [author, assignee]  # person_name: replace the key list (case-insensitive)
+  # record_list_fields: [customers]  # record_list: replace the list keys
+  # prose_products: [Kafka, Example Search]  # product_prose: required with it; the names stay visible
   custom:                            # user redactors, validated like library patterns
     - {name: ticket, regex: '\bTKT-[0-9]{4,8}\b', action: hash}
   hash_key_env: SU_REDACT_KEY        # optional key of the hash action (keyed sha256)
@@ -559,6 +562,11 @@ refused, never passed through). Built-ins run in a fixed order, then `custom`, t
 | `query` | end-user query and spell-check words: `q=`, `query=`, `search_term=`, `didyoumean=`, `suggestion=` … | `<query>`, or a hash with `actions: {query: hash}` |
 | `tracking_id` | `Cookie:`/`Set-Cookie:` header values (to the end of the line), `_ga`, `sessionid`, `visitor_id`, `device_id` … | `[TRACKING_ID:<hash>]` |
 | `record_payload` | values of named JSON fields of structured records (names, tax ids, addresses, contact data; objects and arrays whole) | `<record>` |
+| `phone` | phone numbers: `+<country code>` with digit groups (spaces, dots, dashes, an area code in parentheses), `(415) 555-0100`, any shape after `phone`/`mobile`/`tel`/`fax`/`msisdn` keys; 7–15 digits (8+ after `+`) | `[REDACTED_PHONE]` |
+| `long_numeric_id` | 13–19 digit runs (card, account and national ids; also epoch-millisecond timestamps) | `[LONG_NUMERIC_ID:<hash>]` |
+| `person_name` | person-name values of JSON fields and `key=value` text (`name`, `firstName`, `lastName`, `fullName`, `displayName`, `userName`, `author` and snake_case forms; `person_name_fields` replaces the list); an unquoted value takes up to three following capitalised words | `[REDACTED_PERSON_NAME]` |
+| `record_list` | a JSON array of objects under a list key (`customers`, `accounts`, `records`, `items`, `results` …; `record_list_fields` replaces the list), whole | `<record>` |
+| `product_prose` | the free text after a configured product or technology name (`prose_products`), to the end of the line; the names stay visible and a later name does not stop the masking (`Kafka <prose> Redis <prose>`) | `<prose>` |
 | `pg_row` | PostgreSQL row data: `Key (cols)=(values)`, `Failing row contains (values)`, logged parameters `$1 = '…'` | `<value>` (column names stay) |
 
 Quoted values are replaced inside their quotes, so JSON stays parseable. Redaction is idempotent:
@@ -575,7 +583,10 @@ identity. `engine: safe` has no schema_version 1 equivalent.
 [--output report.json]` scans text files, `.gz` files and SQLite databases (every text column) with
 the configured safe redactors (or the named ones, or every built-in under `engine: legacy`) and
 exits 1 on any hit. The report lists path, location (line, or `table.column#rowid`) and redactor per
-finding, never the matched text. Known false positives: `api_key` flags the lease `"token"` in
+finding, never the matched text. Like every built-in, the five redactors above `pg_row` are off
+until listed in `redactors`. The pattern learner's egress detector also checks `phone` and
+`record_list` shapes; it does not use `long_numeric_id`, `person_name` or `product_prose` (ids,
+timestamps and component names), so enable those as redactors where they apply. Known false positives: `api_key` flags the lease `"token"` in
 generation manifests, and `hex_secret` flags the package's own sha ids.
 
 ## Extraction and communities
@@ -863,7 +874,11 @@ learning:
    (anything but `openai_compatible` on a loopback host) needs `egress.allow_hosted: true` and both
    USD caps. Values of the `pseudonymise` attributes are replaced by stable per-run aliases in the
    attributes and in the line text before mining, so neither the prompt lines nor the cluster template
-   carry them.
+   carry them. The examples stored with a written entry (`learned.yaml`, `proposed.yaml` and the
+   decision record) are pseudonymised the same way (case-insensitive, token-bounded); an example
+   the entry's regex no longer matches after that is left out and counted in
+   `provenance.examples_dropped_after_pseudonymisation`, and an entry with no positive example left
+   is not written.
 2. **Match** every line with the current library: coverage *before*. The `unparsed` and `format_only`
    bodies form the queue.
 3. **Mine** the queue (the Drain-style miner), rank clusters by size times a level weight (error 3,
@@ -1693,6 +1708,8 @@ sources:
       prefix_fields: [tenant, env]     # one token each unless the field has a vocabulary
       vocabularies:                    # service and any prefix field; literal names, '_' allowed
         service: [ingest-worker, query-gateway, gateway, scheduler, slack_bot]
+      service_suffix: none             # numeric: ml-service-1658254295 = service ml-service + deployment_id
+      service_suffix_min_digits: 6     # shortest digit run read as a deployment id
     counts:
       errors: {levels: [ERROR, FATAL], tokens: [error, fatal]}
     multiline:
@@ -1758,7 +1775,10 @@ right:
    `ambiguous`;
 4. the `service` segment at the end, and the `prefix_fields` segments in order. A segment with a
    vocabulary takes the longest entry that fits (`query-gateway` before `gateway`). A segment
-   without one is exactly one token without the separator, so `slack_bot` is one token under `-`.
+   without one is exactly one token without the separator, so `slack_bot` is one token under `-`. With
+   `service_suffix: numeric`, a trailing run of at least `service_suffix_min_digits` digits after the
+   service is read first as the `deployment_id` attribute (`none` without one), so
+   `acme-prod-ml-service-1658254295-2026.03.01` is service `ml-service`, deployment id `1658254295`.
 
 A name that does not fit, or that fits both with and without its deployment prefix, is `unparsed`
 with a typed `reason` (`no_date`, `invalid_date`, `prefix`, `segments`, `service`, `vocabulary`,
@@ -2077,7 +2097,12 @@ serving:
 | `logs.compose.endpoints.max_per_service` | 500 | endpoint templates kept per (day, unit); the rest fold into `__other__` (row `approximate`) |
 | `logs.communities.co_firing` | as above | lift over cells, per tenant; components above `split_above` signatures are split by the deterministic Louvain constructor |
 | `logs.intents.enabled` | `false` | typed log intents for every decision agent, the log tools, and the scope guard; requires the analytics kinds and `exemplars: per_tenant` |
-| `logs.intents.default_window` | `today` | the window when a question or tool call names none |
+| `logs.intents.default_window` | `today` | the window when a question or tool call names none; anchored on the latest served day when today has no composed data (stated in the rendering) |
+| `logs.intents.planner_context` | `true` | the llm planner (alone or in a cascade) gets the logs context pack: what each arm stores, a pattern-library summary, served dates, value vocabularies, the intents with input schemas, few-shot examples |
+| `logs.intents.planner_context_max_chars` | `24000` | JSON size bound of the pack; lists are cut in a fixed order and named in `truncated` |
+| `logs.intents.cascade_to_planner` | `true` | in a cascade, when the rules find no log intent the llm stage plans (earlier stages skipped, traced) |
+| `logs.intents.few_shot` | profile: 8 synthetic examples | `{question, intent, args}` planner examples, validated against the intent input models |
+| `logs.intents.few_shot_file` | — | YAML list of the same shape, relative to the config file; replaces `few_shot` (checked at load) |
 | `logs.serving.allow_adhoc_scopes` | `false` | `true` turns the `intent_required` guard off |
 | `extraction.pattern_library.log_links` | `false` | header ontology edges (`emits`, `runs`, `serves`, `raises`, `co_fires_with`); enters the extraction reuse salt |
 | `communities.strategy: declared` | — | one community per `community_id` metadata value (the incidents) |
@@ -2096,6 +2121,10 @@ logs source. Tools (`tools.enabled`): `log_top`, `log_new`, `log_affected`, `log
 `log_compare`, `log_tenants`, `log_around`, `log_endpoints`, `log_signature`, `log_coverage`,
 `incidents`, `graph_neighbourhood`; each takes its typed input model on `POST /v2/tools/{name}` and
 on MCP, and returns rows, exactness, basis, `source_unavailable` days and a deterministic `rendering`.
+Level questions also return `source_counts` (the source's own per-unit level counts with their
+basis and the unparsed share; see ARCHITECTURE "Level questions against the source's counts"), so
+define a single-level count query (e.g. `counts: {fatal: {levels: [FATAL], tokens: [fatal]}}`) for
+every level operators ask about.
 
 ## Serving
 
@@ -2116,7 +2145,11 @@ is mounted on the HTTP app, or when `serving.allowed_hosts` is non-empty: an API
 a LAN forwarder lists the forwarder's name there. The standalone MCP streamable-HTTP app applies the
 same guard when `allowed_hosts` is set. With a `logs:` section every request
 pins the generation it reads in the cross-process pin registry (`logs.pins`), so retention in
-another process does not delete it mid-request. A 503 logs its cause (exception class, adapter,
+another process does not delete it mid-request. A generator reply that violates the answer
+schema is logged on the `su_multi_arm.engine` logger (violated field paths and error types, the
+provider's stop reason; never the reply or the evidence) and the run still ends with `done`: the
+retrieved evidence and an abstaining answer ("No answer was generated (…: schema_violation)"),
+never a bare `error` event. A 503 logs its cause (exception class, adapter,
 operation; never request content) on the `su_multi_arm.serving` logger, and `/ready` reports
 `not_ready` with the cause when the active generation cannot be served (the same check a request
 makes: fingerprint and every backend pointer).
@@ -2132,6 +2165,7 @@ serving:
     display_timezone: null                                       # IANA name; display only
     session_storage_token: false                                 # token in sessionStorage (never localStorage/cookie)
     allow_unauthenticated_loopback: false                        # explicit single-user opt-out (doctor warns)
+    theme: null                                                  # JSON theme file, relative to this config; checked by config validate/doctor
   allowed_hosts: []                                              # extra Host names for the allow-list (UI enabled)
 models:
   roles:

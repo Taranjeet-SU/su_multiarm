@@ -7,6 +7,69 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Fixed (defects found on a real log deployment; synthetic reproductions)
+
+- **Level questions read the source's counts.** A FATAL (or ERROR/WARN) question was answered
+  "No FATAL-level lines … exact" when the FATAL lines existed but were unparsed (their level was
+  unknown to the parse). Level questions (`log_top`, `log_trend`, `log_compare`, `log_tenants`) now
+  return `source_counts` per service/tenant (source-counted lines, `level_field` or `token_match`
+  basis, the latter labelled approximate, and how many are unparsed); when the source counts more
+  lines than the rows, the answer is `bounded` with the reason. The gold set plants unparsed FATAL
+  lines in its token-only service.
+- **`patterns mine` no longer aborts on a regex over 4,096 characters** (P19): the cluster is
+  rejected as `regex_too_long` and the run continues (also in the fallback's labelled entries).
+- **Stored gate examples are pseudonymised.** `examples.positive` of learned and proposed entries
+  (and the decision's copy) kept tenant and host values; they are now pseudonymised like the prompt
+  text (case-insensitive, token-bounded) before `learned.yaml`/`proposed.yaml`/decisions are
+  written, in the learning loop and in the fallback's template tier.
+- **Undated log questions read the latest served day.** With no date in the question and no composed
+  data for today, the default window is anchored on the latest served day and the rendering states
+  "latest available day: …" (it answered "No lines for index date <today> … exact"). Days of a named
+  window that are not composed yet are `source_unavailable`; a window with none composed is `bounded`.
+- **Failure vocabulary and error rate.** "failing", "failures", "errors", "issues", "problems" and
+  "broken" mean ERROR and FATAL in the rules grammar ("which service is failing the most" →
+  `log_top` by service, level ERROR and FATAL); a named level stays itself. `log_top` gains
+  `metric: error_rate` (failing lines / all lines, by service or tenant) with source counts.
+- **`serving.ui.theme` is relative to the config file** like every other path (it was relative to
+  the working directory, so `serve` refused to start), and `config validate` and `doctor` now check
+  that the theme exists and is valid.
+
+- **Index names with numeric service suffixes.** `index_name.service_suffix: numeric` reads
+  `ml-service-1658254295` as service `ml-service` plus the `deployment_id` attribute (off by
+  default; `service_suffix_min_digits`, default 6).
+
+- **Generator `schema_violation` is logged and answered.** A generator reply that violates the
+  answer schema used to end the answer stream with a bare `error: schema_violation` and nothing in
+  the server log. It is now logged (field paths and error types, the provider stop reason; no reply
+  text) and the run returns the evidence with an abstaining answer. `SchemaViolation` carries
+  `paths` and `stop_reason`.
+
+### Added (logs planner)
+
+- **Logs planner context pack** (`logs.intents.planner_context`, on by default under the logs
+  profile): the llm planner sees what each arm stores, a capped pattern-library summary, the served
+  dates, value vocabularies, the ten intents as typed tools with input schemas and few-shot examples
+  (a synthetic default set in the profile; `logs.intents.few_shot_file` replaces it), bounded by
+  `planner_context_max_chars`. In a cascade, when the rules find no log intent the llm stage plans
+  (`logs.intents.cascade_to_planner`). Plans still go through `StructuredStep.intent` and the scope
+  guard.
+
+### Changed (web UI)
+
+- **Enter submits** in the Ask question field and in the Logs and Patterns view fields, the same as
+  the button; Shift+Enter inserts a newline in the multi-line question; nothing is submitted during
+  an IME composition. The static bundle is rebuilt.
+
+### Added (safe redaction, B11)
+
+- Five named redactors, off until listed in `privacy.redactors` like every built-in: `phone`
+  (international formats, `(415) 555-0100`, phone keys), `long_numeric_id` (13–19 digits, hashed),
+  `person_name` (JSON and `key=value` person-name fields; `privacy.person_name_fields`),
+  `record_list` (JSON arrays of business-entity records; `privacy.record_list_fields`) and
+  `product_prose` (free text after configured product or technology names, `privacy.prose_products`,
+  which stay visible and do not stop the masking). Existing fingerprints are unchanged while the new
+  keys hold their defaults.
+
 ### Accounted coverage and LLM fallback extraction (preview, addendum A2 §4.2, slices C1–C4)
 
 - **Accounting** (`ingestion/accounting.py`): every head gets one final status (`parsed`,

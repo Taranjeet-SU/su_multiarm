@@ -18,6 +18,10 @@ Planted structure (``GoldSpec`` defaults, days ``D1``–``D10`` from ``first_day
 * ``svc-api`` endpoint ``/api/orders/{id}`` regresses on day 8 (latency ×10) with a 5xx burst at hour 9;
 * ``process.crashed`` FATAL lines on day 9 for ``svc-auth`` of ``t01`` and ``t03``;
 * ``svc-legacy`` has no level field (its counts use the ``token_match`` basis) and one ERROR line a day;
+* ``svc-legacy`` also writes FATAL lines in a line style no format pattern knows (``raw`` events:
+  unparsed, so the parse cannot see their level while the source's token count does): two for
+  ``t02`` and one for ``t04`` on day 9, one for ``t01`` on day 8 (the real-run "FATAL answered as
+  none" defect);
 * ``t04/svc-worker`` on day 8 logs more lines than ``max_docs_per_unit`` (a capped, sampled unit);
 * day 4 is never pulled (``source_unavailable``).
 """
@@ -42,6 +46,7 @@ ENDPOINTS = {
 }
 INCIDENT = ("cache.evicted", "queue.backlog", "worker.restarted")
 INCIDENT_HOURS = (13, 14, 16)
+UNPARSED_FATAL = {(9, "t02"): 2, (9, "t04"): 1, (8, "t01"): 1}  # (day number, tenant) -> raw FATAL lines of svc-legacy
 
 
 @dataclass(frozen=True)
@@ -115,6 +120,9 @@ def _unit_events(spec: GoldSpec, n: int, d: date, tenant: str, service: str) -> 
     if service == "svc-billing":
         for hour, klass in ((6, "TimeoutError"), (18, "KeyError")):
             out.append(Event(d, tenant, service, hour, 40, "ERROR", "handler.unhandled_exception", "parsed", f"unhandled exception={klass} in handler", {"exception_class": klass}))
+    unparsed_fatal = UNPARSED_FATAL.get((n, tenant), 0) if service in TOKEN_ONLY else 0
+    for k in range(unparsed_fatal):
+        out.append(Event(d, tenant, service, 4, 20 + k, "FATAL", None, "unparsed", f"FATAL batch {n}{t}{k} aborted: storage quota exhausted", {"raw": True}))
     if service == "svc-auth" and n == 9 and tenant in ("t01", "t03"):
         for hour in (2, 5):
             out.append(Event(d, tenant, service, hour, 45, "FATAL", "process.crashed", "parsed", "process crashed: out of memory"))
@@ -142,6 +150,8 @@ def index_name(tenant: str, service: str, d: date) -> str:
 
 
 def _line(event: Event) -> str:
+    if event.values.get("raw"):  # an unrecognised line style: the text alone, no timestamp or level prefix
+        return event.text
     ts = datetime(event.day.year, event.day.month, event.day.day, event.hour, event.minute, tzinfo=timezone.utc)
     if event.service in TOKEN_ONLY:
         return f"{ts:%Y-%m-%d %H:%M:%S},000 {event.level:<5} [main-1] org.example.legacy.Report - {event.text}"

@@ -43,7 +43,7 @@ from ...extraction.patterns.extractor import CompiledLibrary, LineResult
 from ...extraction.patterns.writer import commit_system_files, git_work_tree, require_clean_system_files
 from ...providers.base import CallEstimate, ProviderError, SchemaViolation
 from .bootstrap import with_proposals
-from .egress import EgressPolicy, RedactedLine
+from .egress import EgressPolicy, RedactedLine, pseudonymise_examples
 from .gate import GateEvidence, run_configured_gate
 from .mining import Cluster, MinerConfig, TemplateMiner
 from .promotion import submit
@@ -277,6 +277,10 @@ def learn(
             continue
         if any(p.regex == entry.regex or p.id == entry.id for p, _ in pending):
             outcome.outcome, outcome.reason = "duplicate", "same regex as another proposal of this run"
+            continue
+        entry, unwritable = pseudonymise_examples(entry, pseudo, compiled.library, compiled.engine)
+        if entry is None:
+            outcome.outcome, outcome.reason = "rejected", unwritable
             continue
         result = submit(root, entry, gate, policy=policy, library=compiled.library, target_pattern_id=made.target_pattern_id, actor=ACTOR, now=at)
         outcome.outcome, outcome.reason = result.action, result.reason or None

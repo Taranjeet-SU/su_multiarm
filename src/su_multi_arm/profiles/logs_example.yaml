@@ -94,5 +94,16 @@ overlay:
       tier: true
     intents:
       enabled: true
+      # Synthetic planner examples (question -> intent call) for the llm planner's context pack; a
+      # deployment replaces them with logs.intents.few_shot_file.
+      few_shot:
+        - {question: "which service is failing the most", intent: log_top, args: {by: service, level: [error, fatal]}}
+        - {question: "what are the issues that need my attention", intent: log_top, args: {by: signature, level: [error, fatal], window: yesterday}}
+        - {question: "anything new I should look at", intent: log_new, args: {window: last 2 days}}
+        - {question: "which customers hit FATAL today", intent: log_top, args: {by: tenant, level: [fatal], window: today}}
+        - {question: "which service has the worst error rate this week", intent: log_top, args: {by: service, metric: error_rate, window: last 7 days}}
+        - {question: "how have failures trended over the last week", intent: log_trend, args: {level: [error, fatal], window: last 7 days}}
+        - {question: "is the parser keeping up", intent: log_coverage, args: {window: yesterday}}
+        - {question: "what happened around 3pm on 2026-03-05", intent: log_around, args: {at: "2026-03-05T15:00:00+00:00"}}
   tools:
     enabled: [search, get_document, list_values, aggregate, log_top, log_new, log_affected, log_trend, log_compare, log_tenants, log_around, log_endpoints, log_signature, log_coverage, incidents, graph_neighbourhood]

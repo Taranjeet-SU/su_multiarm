@@ -129,8 +129,12 @@ class SchemaViolation(ValueError):
 
     category = "schema_violation"
 
-    def __init__(self, message: str, *, raw: str, stage: str | None = None, error_count: int = 0):
+    def __init__(self, message: str, *, raw: str, stage: str | None = None, error_count: int = 0, paths: list[str] | None = None, stop_reason: str | None = None):
         self.raw, self.stage, self.error_count = raw, stage, error_count
+        # Loggable without content: the violated field paths with the error type (never the input
+        # values) and the provider's stop reason (``length``/``max_tokens`` explain a cut reply).
+        self.paths = list(paths or [])
+        self.stop_reason = stop_reason
         super().__init__(f"{stage}: {message}" if stage else message)
 
 
@@ -320,8 +324,9 @@ def validate_reply(schema: type[T], raw: str, stage: str) -> T:
     try:
         return schema.model_validate_json(raw)
     except ValidationError as error:
+        paths = [(".".join(str(part) for part in item.get("loc", ())) or "<root>") + f" ({item.get('type', 'invalid')})" for item in error.errors()[:10]]
         raise SchemaViolation(
-            f"reply violates the {schema.__name__} schema ({error.error_count()} errors)", raw=raw, stage=stage, error_count=error.error_count()
+            f"reply violates the {schema.__name__} schema ({error.error_count()} errors)", raw=raw, stage=stage, error_count=error.error_count(), paths=paths
         ) from error
 
 

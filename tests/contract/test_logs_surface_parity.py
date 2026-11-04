@@ -54,7 +54,7 @@ def gold(tmp_path_factory):
 
 
 def comparable(output: dict) -> dict:
-    return {k: output[k] for k in ("intent", "args", "rows", "rendering", "exactness", "status", "source_unavailable")}
+    return {k: output[k] for k in ("intent", "args", "rows", "rendering", "exactness", "status", "source_unavailable", "source_counts")}
 
 
 def no_model(monkeypatch):

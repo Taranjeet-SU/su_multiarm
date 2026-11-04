@@ -115,6 +115,11 @@ class Capabilities(StrictModel):
     # Logs profile (``logs.intents.enabled``): log questions go through a typed intent step, and a
     # free structured scope that could span several log kinds is refused (``intent_required``).
     log_intents: bool = False
+    # The logs planner context pack (``decision/log_context.py``), built on first use by the llm
+    # planner: a zero-argument callable returning the pack, or None. Never serialised.
+    log_context: Any = Field(default=None, exclude=True)
+    # Logs profile cascade: when the rules find no log intent, go to the llm stage directly.
+    log_cascade_to_planner: bool = False
 
     @model_validator(mode="after")
     def known_arms(self):

@@ -7,7 +7,7 @@ from collections import Counter
 from datetime import date
 from typing import Any, Iterable
 
-from .generator import ENDPOINTS, INCIDENT, INCIDENT_HOURS, SERVICES, TENANTS, TOKEN_ONLY, Event, GoldSpec, day_of, index_name, indices, plan, pulled_days
+from .generator import ENDPOINTS, INCIDENT, INCIDENT_HOURS, SERVICES, TENANTS, TOKEN_ONLY, UNPARSED_FATAL, Event, GoldSpec, day_of, index_name, indices, plan, pulled_days
 
 TS = r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:.,]{8,12}Z?"
 
@@ -133,6 +133,7 @@ __all__ = [
     "SERVICES",
     "TENANTS",
     "TOKEN_ONLY",
+    "UNPARSED_FATAL",
     "Event",
     "GoldSpec",
     "day_of",

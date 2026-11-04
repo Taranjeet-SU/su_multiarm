@@ -6,6 +6,7 @@ import { z } from "zod";
 import { ErrorBanner, JsonBlock, KeyValues, Pre, Tabs, Text } from "../components/common";
 import { useApp } from "../context";
 import { decisionCommand, type DecisionOp } from "../lib/cli";
+import { submitOnEnter } from "../lib/keys";
 import { GenerationDays } from "./OpsViews";
 import { displayText, formatNumber } from "../lib/text";
 
@@ -109,7 +110,14 @@ export function PatternsView() {
       />
       {tab === "review" ? (
         <>
-          <form className="row" aria-label="review filters" onSubmit={(e) => e.preventDefault()}>
+          <form
+            className="row"
+            aria-label="review filters"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setReload((n) => n + 1); // Enter in a field: the same as clicking Reload
+            }}
+          >
             <label htmlFor="kind">kind</label>
             <select id="kind" value={kind} onChange={(e) => setKind(e.target.value)}>
               <option value="">all</option>
@@ -129,10 +137,10 @@ export function PatternsView() {
               ))}
             </select>
             <label htmlFor="cfg">config path</label>
-            <input id="cfg" value={config} onChange={(e) => setConfig(e.target.value)} maxLength={1000} />
+            <input id="cfg" value={config} onChange={(e) => setConfig(e.target.value)} onKeyDown={submitOnEnter} maxLength={1000} />
             <label htmlFor="by">your name (--by)</label>
-            <input id="by" value={by} onChange={(e) => setBy(e.target.value)} maxLength={64} placeholder="letters, digits, _ . @ -" />
-            <button type="button" onClick={() => setReload((n) => n + 1)}>
+            <input id="by" value={by} onChange={(e) => setBy(e.target.value)} onKeyDown={submitOnEnter} maxLength={64} placeholder="letters, digits, _ . @ -" />
+            <button type="submit">
               Reload
             </button>
           </form>

@@ -2421,3 +2421,71 @@ streaming model). No real deployment, model or customer data; no paid calls.
 - **Not established**: the deployment theme on the real server, axe accessibility, large graphs
   (> 80 nodes fall back to a grid layout), the with-model coverage numbers (the gold set reports
   regex-only coverage; the gauge shows "model n/a").
+
+## Real-deployment defect fixes: level answers vs source counts, regex length, stored examples, theme path, redactors, anchor and vocabulary, schema violations, index suffixes, planner context, Enter to submit — 2026-11-04 (branch `v2/logs`)
+
+Evidence level: **synthetic and mocked** (the 10-day synthetic gold set through the real pipeline
+with the fake source and the sqlite backend; scripted planners and loopback fake providers; jsdom
+for the UI). The defects were seen on a real deployment; they are reproduced here with synthetic
+data only, and none of the fixes has been re-run on that deployment. No model was called.
+
+- `tests/contract/test_logs_gold_questions.py` (+8): the gold set now plants unparsed FATAL lines in
+  its token-only service (2 + 1 on D9, 1 on D8). Level answers carry `source_counts` equal to a
+  recount of the plan (source lines per service/tenant, unparsed share, basis and its exactness);
+  D8 is answered "No FATAL-level lines in the parsed rows … bounded", never "none … exact"; fully
+  parsed ERROR answers stay exact; a level without a count query is named in the notes; the source
+  counts equal a pinned `unit_day` aggregate and a kind-less scope over `count_fatal` is still
+  refused by the scope guard. `test_logs_surface_parity.py` now also compares `source_counts`
+  across the decision modes, the tool call, HTTP and MCP (stdio and streamable HTTP).
+- `tests/unit/test_bootstrap_synthesis.py` (+1 per engine): a 60-uuid template synthesises a regex
+  over 4,096 characters; it is rejected as `regex_too_long` and the other cluster still yields a
+  proposal.
+- `tests/unit/test_pattern_learning_loop.py` (+3 per engine): bodies carrying their own host and
+  tenant values (one in upper case) yield stored examples (proposed, learned and the decision copy)
+  with aliases only, and the library still loads; a regex narrower than the aliases drops those
+  examples and, with none left, writes nothing (scripted fake provider, no network).
+- `tests/unit/test_config_cli_a2.py` (+2): a relative `serving.ui.theme` resolves against the config
+  file from another working directory; `config validate` and `doctor` refuse a missing theme
+  (`path: serving.ui.theme`); `rebase_paths` moves the theme with the config.
+- `tests/unit/test_redaction_more_redactors.py` (new, 22 on the `regex` engine; RE2 is not installed
+  in this venv, so the RE2 runs are not established here): phone numbers in seven international and
+  keyed shapes and five near-misses kept (timezone offsets, versions, counts, 20 digits); person
+  names in JSON, quoted and unquoted `key=value` text with key boundaries and a configured list;
+  13–19 digit ids hashed and joinable, 12 and 20 digits kept; lists of record objects masked whole
+  while scalar lists stay; product prose masked to the end of the line with later names kept
+  visible, token-bounded and idempotent; config coupling of `product_prose`/`prose_products`;
+  stamps change with the configured lists. The existing idempotence and safe-subset tests now
+  include the new redactors.
+- Vocabulary, error rate and the default day (synthetic): `test_log_intents_detect.py` (+12: failure
+  words, named levels, error-rate phrasing, a level word inside a signature id, the error-rate
+  scopes and refusal, the undated anchor vs a named window vs `as_of`) and
+  `test_logs_gold_questions.py` (+2: error rate per service equals a recount of the plan; an
+  undated question on the gold engine, whose latest day is far before the real clock, answers the
+  latest served day and says so, while "yesterday" is `source_unavailable` and `bounded`). Two
+  existing expectations changed by decision: "Top errors for svc-api" and "Errors for svc-api
+  yesterday vs today" now resolve to level ERROR and FATAL.
+- `tests/unit/test_index_name_grammar.py` (+4): a numeric service suffix becomes `deployment_id` with
+  and without a service vocabulary and with a deployment prefix before the service; short digit
+  runs stay in the service; the rule is off by default (synthetic names).
+- `tests/contract/test_answer_stream.py` (+2, streaming and not): a loopback fake generator replies
+  with a schema-violating answer; the stream ends with `done`, the evidence is returned with an
+  abstaining answer, and one warning names `citations (list_type)` and the stop reason without the
+  reply text (mocked provider over loopback HTTP).
+- `tests/contract/test_logs_planner_context.py` (new, 6; scripted planner, no model call): "what are
+  issues that need my attention" plans `log_top` with ERROR and FATAL in cascade and llm modes
+  without a planner call; a phrasing the rules do not know reaches the planner in a cascade, whose
+  payload carries the pack (arms, kinds, library entries incl. `process.crashed`, served days,
+  vocabularies, all ten intents with input schemas, few-shot) and whose choice is compiled like a
+  tool call; the pack is within its bound (about 11.7k characters on the gold set) and holds no
+  API key value, key variable name, endpoint or line text; a tight bound cuts lists in order and
+  names the cuts; a free scope from the planner is still refused (`intent_required`); a
+  deployment few-shot file replaces the profile set and an invalid one is a `ConfigError` at load.
+- UI: vitest 65 passed (+3 in `ui/src/test/keys.test.tsx`: Enter submits, Shift+Enter keeps the
+  newline default, `isComposing`/keyCode 229 never submit; a Logs shortcut runs on Enter; the
+  Patterns filter fields reload on Enter like the Reload button). Built with `npm ci` and
+  `npm run build` in a copy under the external workspace; the rebuilt static bundle is committed.
+  No browser run of this change.
+- Full suite after all fixes: `not external` 2442 passed, 99 skipped, 0 failed (project venv, the
+  `regex` pattern engine; google-re2 is not installed there, so RE2-only tests skip). Fresh
+  `[dev]`-only install of the `git archive` of the branch head in an isolated venv (non-editable;
+  the package imported from site-packages): 1814 passed, 563 skipped, 0 failed, 0 errors. ruff clean.

@@ -1073,6 +1073,7 @@ class BudgetsConfig(StrictModel):
 REDACTOR_NAMES = (
     "email", "ipv4", "ipv6", "bearer_token", "jwt", "api_key", "aws_key", "url_credentials", "query_values", "uuid", "request_id", "hex_secret",
     "llm_text", "content", "query", "tracking_id", "record_payload", "pg_row",
+    "phone", "long_numeric_id", "person_name", "record_list", "product_prose",
 )
 FIELD_NAME = r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
 
@@ -1116,8 +1117,25 @@ class PrivacyConfig(StrictModel):
     # entity fields: names, ids, addresses, contact data), minus ``record_fields_allow``.
     record_fields: list[str] | None = None
     record_fields_allow: list[str] = Field(default_factory=list)
+    # ``person_name``: JSON/key=value keys whose values are person names (``None``: name, firstName,
+    # lastName, fullName, displayName, userName, author and their snake_case forms; case-insensitive).
+    person_name_fields: list[str] | None = None
+    # ``record_list``: JSON keys whose array-of-objects value is a list of business-entity records
+    # (``None``: records, rows, items, results, entities, customers, accounts, companies, ...).
+    record_list_fields: list[str] | None = None
+    # ``product_prose``: product or technology names (an allow-list: they stay visible) whose
+    # following free text is masked to the end of the line; required when ``product_prose`` is on.
+    prose_products: list[str] = Field(default_factory=list, max_length=200)
 
-    @field_validator("record_fields", "record_fields_allow")
+    @field_validator("prose_products")
+    @classmethod
+    def product_names(cls, value):
+        for name in value:
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9 ._+#-]{0,62}[A-Za-z0-9])?", name):
+                raise ValueError(f"prose product {name!r} must be a name of letters, digits, spaces and . _ + # - (starting and ending with a letter or digit)")
+        return value
+
+    @field_validator("record_fields", "record_fields_allow", "person_name_fields", "record_list_fields")
     @classmethod
     def field_names(cls, value):
         for name in value or []:
@@ -1134,6 +1152,9 @@ class PrivacyConfig(StrictModel):
             "actions": self.actions,
             "record_fields": self.record_fields is not None,
             "record_fields_allow": self.record_fields_allow,
+            "person_name_fields": self.person_name_fields is not None,
+            "record_list_fields": self.record_list_fields is not None,
+            "prose_products": self.prose_products,
         }
         if self.engine == "legacy":
             used = sorted(k for k, v in safe_only.items() if v)
@@ -1150,6 +1171,11 @@ class PrivacyConfig(StrictModel):
             raise ValueError(f"privacy.actions names redactors that are not enabled: {unused}")
         if self.record_fields == []:
             raise ValueError("privacy.record_fields cannot be empty (omit it for the built-in list)")
+        for key in ("person_name_fields", "record_list_fields"):
+            if getattr(self, key) == []:
+                raise ValueError(f"privacy.{key} cannot be empty (omit it for the built-in list)")
+        if ("product_prose" in self.redactors) != bool(self.prose_products):
+            raise ValueError("privacy.prose_products and the product_prose redactor go together: list the product names when product_prose is enabled, and enable it when names are listed")
         if not (self.redactors or self.custom or self.patterns or self.redact_emails):
             raise ValueError("privacy.engine: safe needs at least one redactor (redactors, custom, patterns or redact_emails)")
         from ..extraction.patterns.engine import validate_regex
@@ -1166,7 +1192,7 @@ class PrivacyConfig(StrictModel):
         data = self.model_dump(mode="json", exclude={"trace_masking"})
         defaults = {
             "engine": "legacy", "redactors": [], "custom": [], "regex_engine": "re2", "regex_timeout_ms": 100, "hash_key_env": None,
-            "actions": {}, "record_fields": None, "record_fields_allow": [],
+            "actions": {}, "record_fields": None, "record_fields_allow": [], "person_name_fields": None, "record_list_fields": None, "prose_products": [],
         }
         for key, default in defaults.items():
             if data.get(key) == default:
@@ -1640,6 +1666,8 @@ def _resolve_paths(config: Config, base: Path) -> Config:
         config.learning.patterns.stop_file = (base / config.learning.patterns.stop_file.expanduser()).resolve()
     if config.serving.answers.ledger is not None:
         config.serving.answers.ledger = (base / config.serving.answers.ledger.expanduser()).resolve()
+    if config.serving.ui.theme is not None:  # relative to the config file, like every other path
+        config.serving.ui.theme = (base / config.serving.ui.theme.expanduser()).resolve()
     if config.learning.extraction is not None:
         for name in ("spend_ledger", "reply_cache", "stop_file"):
             value = getattr(config.learning.extraction, name)
@@ -1649,6 +1677,9 @@ def _resolve_paths(config: Config, base: Path) -> Config:
         config.logs.partitions.path = (base / config.logs.partitions.path.expanduser()).resolve()
         if config.logs.partitions.raw.path is not None:
             config.logs.partitions.raw.path = (base / config.logs.partitions.raw.path.expanduser()).resolve()
+        if config.logs.intents.few_shot_file is not None:
+            config.logs.intents.few_shot_file = (base / config.logs.intents.few_shot_file.expanduser()).resolve()
+            config.logs.intents.examples()  # read and validated at load (ConfigError naming the file)
     embedder = config.models.roles.embedder
     if embedder is not None and embedder.precomputed is not None:
         embedder.precomputed.vectors = (base / embedder.precomputed.vectors.expanduser()).resolve()
@@ -1687,8 +1718,10 @@ def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
     add((data.get("learning") or {}).get("extraction"), "reply_cache", "learning.extraction.reply_cache")
     add((data.get("learning") or {}).get("extraction"), "stop_file", "learning.extraction.stop_file")
     add((data.get("serving") or {}).get("answers"), "ledger", "serving.answers.ledger")
+    add((data.get("serving") or {}).get("ui"), "theme", "serving.ui.theme")
     add((data.get("logs") or {}).get("partitions"), "path", "logs.partitions.path")
     add(((data.get("logs") or {}).get("partitions") or {}).get("raw"), "path", "logs.partitions.raw.path")
+    add(((data.get("logs") or {}).get("intents") or {}), "few_shot_file", "logs.intents.few_shot_file")
     embedder = ((data.get("models") or {}).get("roles") or {}).get("embedder")
     precomputed = embedder.get("precomputed") if isinstance(embedder, dict) else None
     add(precomputed, "vectors", "models.roles.embedder.precomputed.vectors")

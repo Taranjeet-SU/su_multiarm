@@ -239,6 +239,56 @@ def test_auto_on_the_regex_engine_still_waits_for_a_human(tmp_path):
     assert not (library / "learned.yaml").exists()
 
 
+LOGIN_RE = r"^user login rejected on (?P<node>\S+) for (?P<account>\S+) account$"
+
+
+def login_lines() -> list:
+    """Bodies that carry the line's own host and tenant values (one in another letter case)."""
+    out = []
+    for i in range(4):
+        tenant = "tenant-alpha" if i % 2 else "tenant-beta"
+        shown = tenant.upper() if i == 0 else tenant
+        out.append(line(80 + i, "warn", f"user login rejected on node-alpha-01 for {shown} account", tenant=tenant))
+    return out
+
+
+def login_script(regex: str):
+    def script(payload):
+        if payload["template"].startswith("user login"):
+            return reply(payload, regex=regex, issue_name="login rejected", issue_category="authentication", fields=[])
+        return by_template(payload)
+
+    return script
+
+
+@pytest.mark.parametrize("promotion", ["manual", "auto"])
+def test_stored_examples_are_pseudonymised_like_egress(tmp_path, kind, promotion):
+    """Real-run fix: ``examples.positive`` of learned and proposed entries (and the decision's copy)
+    kept tenant and host values. They are pseudonymised like the prompt text: case-insensitive and
+    on token boundaries."""
+    report, _, library = run(tmp_path, engine=kind, promotion=promotion, lines=learning_lines() + login_lines(), script=login_script(LOGIN_RE))
+    stored = [*rows(library / "proposed.yaml"), *rows(library / "learned.yaml")]
+    login = next(r for r in stored if r["regex"] == LOGIN_RE)
+    texts = [*login["examples"]["positive"], *(t for d in rows(library / "decisions.yaml") for t in d.get("examples", []))]
+    assert login["examples"]["positive"] and all("host-1" in t for t in login["examples"]["positive"])
+    joined = "\n".join(texts).casefold()
+    assert "node-alpha-01" not in joined and "tenant-alpha" not in joined and "tenant-beta" not in joined
+    assert all(r["examples"]["positive"] for r in stored)  # the library still loads: examples match
+    load_library(library, select_engine(kind))
+
+
+def test_examples_that_stop_matching_after_pseudonymisation_are_dropped_and_counted(tmp_path, kind):
+    """A regex narrower than the aliases (``node-[a-z]+-[0-9]+`` does not match ``host-1``): those
+    examples are left out (counted in provenance), never written with the real value; with no
+    positive example left the entry is not written."""
+    narrow = r"^user login rejected on (?P<node>node-[a-z]+-[0-9]+) for (?P<account>\S+) account$"
+    report, _, library = run(tmp_path, engine=kind, promotion="manual", lines=learning_lines() + login_lines(), script=login_script(narrow))
+    stored = [*rows(library / "proposed.yaml"), *rows(library / "learned.yaml")]
+    assert not any(r["regex"] == narrow for r in stored)
+    assert any(c.outcome == "rejected" and c.reason == "no positive example matches after pseudonymisation" for c in report.clusters)
+    assert "node-alpha-01" not in (library / "proposed.yaml").read_text()
+
+
 def test_propose_mode_never_promotes(tmp_path, kind):
     report, _, library = run(tmp_path, engine=kind, promotion="auto", mode="propose")
     assert report.policy == "manual" and report.written()["learned"] == [] and len(rows(library / "proposed.yaml")) == 2

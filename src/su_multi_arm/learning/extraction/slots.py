@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from pydantic import ValidationError
+
 from ...core.errors import BudgetExhausted
 from ...extraction.patterns.library import PatternEntry
 from ...ingestion.accounting import FieldValue, parse_value
@@ -319,6 +321,12 @@ def write_entry(entry: PatternEntry, gate: Any, ctx: TierContext, target: str | 
         return "exists"
     from pathlib import Path
 
+    from ..patterns.egress import pseudonymise_examples
+
+    written, unwritable = pseudonymise_examples(entry, ctx.pseudo, ctx.compiled.library, ctx.compiled.engine)
+    if written is None:
+        return f"not_written: {unwritable}"
+    entry = written
     result = submit(Path(ctx.ref.path), entry, gate, policy=ctx.ref.promotion, library=ctx.compiled.library, target_pattern_id=target, actor=ACTOR, now=ctx.now)
     if result.action in {"learned", "proposed"}:
         ctx.compiled = ctx.load()  # the next gate sees the new entry (novelty, priority)
@@ -408,7 +416,12 @@ def _one_cluster(cluster: Cluster, members: list[Head], ctx: TierContext) -> tup
             row["detail"] = "; ".join(problems[:5])
             return all_members("gate_failed")
         cited = members[:k]
-        entry = labelled_entry(synthesis.entry, reply, cluster, cited, model, reply_sha, ctx.now)
+        try:
+            entry = labelled_entry(synthesis.entry, reply, cluster, cited, model, reply_sha, ctx.now)
+        except ValidationError as exc:  # e.g. the renamed groups push the regex past MAX_REGEX_CHARS
+            too_long = any(e.get("type") == "string_too_long" and "regex" in e.get("loc", ()) for e in exc.errors())
+            row["detail"] = "regex_too_long" if too_long else f"not a valid library entry: {exc.errors()[0].get('msg')}"
+            return all_members("gate_failed")
         labelled = {label.field: label.type for label in reply.labels}
         positives = [h.id for h in cited]
         target = None

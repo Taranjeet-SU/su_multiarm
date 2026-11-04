@@ -72,6 +72,97 @@ def test_fatal_tenants_ranked(gold):
     out = tool(engine, "log_top", by="tenant", level=["fatal"], window="yesterday")
     assert [(r["tenant"], r["lines"]) for r in out.rows] == [("t01", 2), ("t03", 2)]
     assert "FATAL-level lines" in out.rendering
+    # the parsed rows miss svc-legacy's unparsed FATAL lines: bounded, never exact
+    assert out.status == "bounded" and out.exactness == "bounded" and "exact." not in out.rendering
+
+
+# --- level questions against the source's own counts (real-run fix) ------------------------------
+
+
+def source_fatal(day) -> dict[tuple[str, str], int]:
+    """Source-counted FATAL lines per (service, tenant): every FATAL event, parsed or not."""
+    return dict(Counter((e.service, e.tenant) for e in select(EVENTS, days=[day], level="FATAL")))
+
+
+def unparsed_fatal(day) -> dict[tuple[str, str], int]:
+    return dict(Counter((e.service, e.tenant) for e in select(EVENTS, days=[day], level="FATAL", status="unparsed")))
+
+
+@pytest.mark.parametrize("by", ["service", "tenant", "signature"])
+def test_fatal_with_unparsed_source_lines_is_bounded_with_source_counts(gold, by):
+    engine, _ = gold
+    day = AS_OF - timedelta(days=1)
+    out = tool(engine, "log_top", by=by, level=["fatal"], window="yesterday")
+    rows = {(r["service"], r["tenant"]): r for r in out.source_counts}
+    assert {k: r["lines_source"] for k, r in rows.items()} == source_fatal(day)
+    assert {k: r["lines_unparsed"] for k, r in rows.items() if r["lines_unparsed"]} == unparsed_fatal(day)
+    assert rows[("svc-legacy", "t02")]["basis"] == "token_match" and rows[("svc-legacy", "t02")]["source_exactness"] == "approximate"
+    assert rows[("svc-auth", "t01")]["basis"] == "level_field" and rows[("svc-auth", "t01")]["source_exactness"] == "exact"
+    assert out.status == "bounded" and out.exactness == "bounded"
+    assert "svc-legacy t02: 2 lines containing 'fatal' (token_match, approximate), 2 unparsed" in out.rendering
+    assert "parse coverage below 100%" in out.rendering and not out.rendering.endswith("exact.")
+
+
+def test_no_parsed_fatal_but_source_counts_is_never_none_exact(gold):
+    """D8: every FATAL line of the day is unparsed (svc-legacy t01): the old answer was "No
+    FATAL-level lines ... exact"."""
+    engine, _ = gold
+    day = day_of(SPEC, 8)
+    out = tool(engine, "log_top", by="service", level=["fatal"], start=day.isoformat(), end=day.isoformat())
+    assert out.rows == [] and out.status == "bounded" and out.exactness == "bounded"
+    assert out.rendering.startswith("No FATAL-level lines in the parsed rows for index date 2026-03-08")
+    assert "svc-legacy t01: 1 lines containing 'fatal' (token_match, approximate), 1 unparsed" in out.rendering
+    assert out.rendering.endswith("bounded.") and "exact" not in out.rendering.replace("approximate", "")
+    assert [(r["service"], r["tenant"], r["lines_source"], r["lines_answered"]) for r in out.source_counts] == [("svc-legacy", "t01", 1, 0)]
+
+
+def test_fully_parsed_levels_stay_exact_with_their_source_counts(gold):
+    engine, _ = gold
+    day = AS_OF - timedelta(days=1)
+    out = tool(engine, "log_top", by="service", level=["error"], window="yesterday")
+    assert out.status == "answered" and out.exactness == "exact" and "source counts" not in out.rendering
+    expected = Counter((e.service, e.tenant) for e in select(EVENTS, days=[day], level="ERROR"))
+    assert {(r["service"], r["tenant"]): r["lines_source"] for r in out.source_counts} == dict(expected)
+    assert all(r["lines_answered"] == r["lines_source"] and r["lines_unparsed"] == 0 for r in out.source_counts)
+    warn = tool(engine, "log_top", by="service", level=["warn"], window="yesterday")  # no WARN count query
+    assert warn.source_counts == [] and any("no single-level source count query for WARN" in n for n in warn.notes)
+
+
+def test_tenants_from_counts_report_the_unparsed_share(gold):
+    engine, _ = gold
+    out = tool(engine, "log_tenants", service="svc-legacy", level="fatal", window="yesterday")
+    assert sorted((r["tenant"], r["lines"]) for r in out.rows) == [("t02", 2), ("t04", 1)]
+    assert [(r["tenant"], r["lines_unparsed"]) for r in out.source_counts] == [("t02", 2), ("t04", 1)]
+    assert "2 unparsed" in out.rendering and out.status == "answered"  # the rows are the source counts
+
+
+def test_trend_and_compare_by_level_are_bounded_too(gold):
+    engine, _ = gold
+    trend = tool(engine, "log_trend", level=["fatal"], window="last 3 days")
+    assert trend.status == "bounded" and sum(r["lines_unparsed"] for r in trend.source_counts) == 4
+    compare = tool(engine, "log_compare", periods=[day_of(SPEC, 8).isoformat(), day_of(SPEC, 9).isoformat()], level=["fatal"])
+    assert compare.status == "bounded" and "source counts" in compare.rendering
+
+
+def test_source_counts_equal_a_pinned_aggregate_and_free_scopes_stay_guarded(gold):
+    """Same numbers everywhere: the source counts of a level answer equal the pinned ``unit_day``
+    aggregate a client may run itself; a kind-less scope over the same field is still refused."""
+    engine, _ = gold
+    day = (AS_OF - timedelta(days=1)).isoformat()
+    out = tool(engine, "log_top", by="service", level=["fatal"], window="yesterday")
+    scope = {
+        "predicates": [
+            {"field": "kind", "op": "eq", "value": "unit_day"},
+            {"field": "date", "op": "date_interval", "lower": day, "upper": AS_OF.isoformat(), "granularity": "day"},
+            {"field": "count_fatal", "op": "range", "lower": 1},
+        ],
+        "group_by": ["service", "tenant"],
+        "measure": {"kind": "sum", "field": "count_fatal"},
+    }
+    result = engine.call_tool("aggregate", {"scope": scope}).result.output.result
+    assert {(g.key["service"], g.key["tenant"]): int(g.value) for g in result.groups} == {(r["service"], r["tenant"]): r["lines_source"] for r in out.source_counts}
+    free = engine.call_tool("aggregate", {"scope": {"group_by": ["service"], "measure": {"kind": "sum", "field": "count_fatal"}}}).result.output.result
+    assert free.exactness == "bounded" and free.unsupported[0].reason == "intent_required"
 
 
 def test_top_exception_classes(gold):
@@ -233,3 +324,33 @@ def test_coverage_equals_a_recount(gold):
         noise = sum(1 for e in service_events if e.status == "noise")
         assert row["lines_parsed"] == parsed and row["lines_noise"] == noise and row["lines_pulled"] == len(service_events)
         assert row["deterministic_coverage"] == round((parsed + noise) / len(service_events), 4)
+
+
+# --- error rate and the undated anchor (real-run fixes) -------------------------------------------
+
+
+def test_error_rate_ranks_services_by_failing_share_with_source_counts(gold):
+    engine, _ = gold
+    day = AS_OF - timedelta(days=1)
+    out = tool(engine, "log_top", by="service", metric="error_rate", window="yesterday")
+    events = select(EVENTS, days=[day])
+    # the parse sees a level for every line except the token-only service's raw (unparsed) FATAL lines
+    failing = Counter(e.service for e in events if e.level in {"ERROR", "FATAL"} and not e.values.get("raw"))
+    total = Counter(e.service for e in events)
+    expected = sorted(((s, n, total[s]) for s, n in failing.items()), key=lambda t: (-round(t[1] / t[2], 4), -t[1], t[0]))
+    assert [(r["service"], r["lines"], r["lines_total"]) for r in out.rows] == expected
+    assert all(r["error_rate"] == round(r["lines"] / r["lines_total"], 4) for r in out.rows)
+    assert out.rendering.startswith("Top ") and "by error rate (ERROR, FATAL lines / all lines)" in out.rendering
+    assert {r["level"] for r in out.source_counts} == {"ERROR", "FATAL"} and out.status == "bounded"  # svc-legacy's unparsed FATAL
+
+
+def test_an_undated_question_reads_the_latest_served_day_and_says_so(gold):
+    """Today (the real clock) has no composed data in the gold set: an undated question is answered
+    for the latest served day, stated in the rendering, not "no lines today, exact"."""
+    engine, _ = gold
+    out = engine.call_tool("log_top", {"by": "service", "level": ["error"]}).result.output
+    assert out.window["start"] == out.window["end"] == AS_OF.isoformat() == out.window["latest_available_day"]
+    assert out.rows and f"latest available day: {AS_OF.isoformat()}" in out.rendering
+    named = engine.call_tool("log_top", {"by": "service", "level": ["error"], "window": "yesterday"}).result.output
+    assert named.rows == [] and named.status == "bounded" and named.source_unavailable  # not composed yet: never "none, exact"
+    assert "source_unavailable" in named.rendering and not named.rendering.endswith("exact.")

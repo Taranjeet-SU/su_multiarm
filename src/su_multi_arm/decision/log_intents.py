@@ -75,6 +75,9 @@ class LogTopInput(LogWindow):
     top_n: int = Field(default=10, ge=1, le=100)
     extraction: Literal["any", "deterministic"] = "any"
     owner: Literal["any", "reviewed"] = "any"
+    # ``error_rate``: lines at ``level`` (default ERROR and FATAL) over all lines of the group, by
+    # service or tenant (deterministic rows: every pulled head counted once)
+    metric: Literal["lines", "error_rate"] = "lines"
 
 
 class LogNewInput(LogWindow):
@@ -168,12 +171,16 @@ class CompileContext(StrictModel):
     today: date
     default_window: str = "today"
     count_queries: dict[str, list[str]] = Field(default_factory=dict)  # name -> levels (lower case)
+    # The latest served day with data, set only when ``today`` has no composed data yet: a question
+    # without any date (no window, start/end or as_of) is anchored on it instead of on an empty today.
+    latest_day: date | None = None
 
 
 class Window(StrictModel):
     start: date
     end: date  # exclusive
     label: str
+    latest_anchor: date | None = None  # the default window was anchored on the latest served day
 
     def days(self) -> list[date]:
         return [self.start + timedelta(days=i) for i in range((self.end - self.start).days)]
@@ -197,6 +204,12 @@ def resolve_window(args: Any, ctx: CompileContext) -> Window:
     anchor = getattr(args, "as_of", None) or ctx.today
     if getattr(args, "start", None) is not None:
         return Window(start=args.start, end=args.end + timedelta(days=1), label=f"{args.start.isoformat()} to {args.end.isoformat()}")
+    undated = getattr(args, "window", None) is None and getattr(args, "as_of", None) is None
+    if undated and ctx.latest_day is not None:
+        # no date in the question and today not composed: the default window on the latest served
+        # day (stated in the rendering), never "no lines today" for a day that has no data yet
+        window = resolve_window(LogWindow(window=ctx.default_window, as_of=ctx.latest_day), ctx.model_copy(update={"latest_day": None}))
+        return window.model_copy(update={"latest_anchor": ctx.latest_day})
     text = getattr(args, "window", None) or ctx.default_window
     try:
         found = parse_window(text, anchor)
@@ -262,6 +275,15 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
             if args.level and set(lv.casefold() for lv in args.level) & {"error", "fatal"}:
                 preds.append(Predicate(field="status_class", op="eq", value="5xx"))
             out.scopes["main"] = ScopeSpec(predicates=preds, group_by=["endpoint"], measure=_sum(), order="desc", top_n=args.top_n)
+        elif args.metric == "error_rate":
+            if args.by not in {"service", "tenant"}:
+                out.refusal = "error_rate ranks services or tenants (by: service or tenant)"
+                return out
+            levels = args.level or list(FAILURE_LEVELS)
+            base = [_kind("log_day"), *common, _deterministic()]
+            out.scopes["main"] = ScopeSpec(predicates=[*base, *_in("level", levels)], group_by=[args.by], measure=_sum())
+            out.scopes["total"] = ScopeSpec(predicates=base, group_by=[args.by], measure=_sum())
+            out.notes.append("error rate = lines at " + ", ".join(lv.upper() for lv in levels) + " / all lines of the group (deterministic rows)")
         else:
             field = {"service": "service", "tenant": "tenant", "signature": "signature_id"}[args.by]
             preds = [_kind("log_day"), *common, *_in("level", args.level)]
@@ -419,7 +441,14 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
 
 # --- deterministic detection (rules) ---------------------------------------------------------------
 
-_LEVEL_WORDS = {"fatal": "fatal", "fatals": "fatal", "error": "error", "errors": "error", "warn": "warn", "warning": "warn", "warnings": "warn", "critical": "fatal"}
+FAILURE_LEVELS = ("error", "fatal")
+# A named level is that level; a word for failure in general ("errors", "failing", "issues",
+# "problems", "broken" ...) is ERROR and FATAL (owner decision, real-run vocabulary).
+_LEVEL_WORDS: dict[str, tuple[str, ...]] = {
+    "fatal": ("fatal",), "fatals": ("fatal",), "critical": ("fatal",), "error": ("error",),
+    "warn": ("warn",), "warning": ("warn",), "warnings": ("warn",),
+    **{w: FAILURE_LEVELS for w in ("errors", "failing", "fails", "failed", "failure", "failures", "issue", "issues", "problem", "problems", "broken", "breaking")},
+}  # fmt: skip
 _HOUR = re.compile(r"\baround\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
 
 
@@ -455,7 +484,11 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
     services = _known(q, values("service"))
     tenants = _known(q, values("tenant"))
     signatures = _known(q, values("signature_id"))
-    levels = sorted({_LEVEL_WORDS[w] for w in re.findall(r"[a-z]+", low) if w in _LEVEL_WORDS})
+    # level words outside the named values ("connect_failed" names a signature, not a failure level)
+    words = low
+    for value in sorted({*services, *tenants, *signatures}, key=len, reverse=True):
+        words = words.replace(value.casefold(), " ")
+    levels = sorted({lv for w in re.findall(r"[a-z]+", words) if w in _LEVEL_WORDS for lv in _LEVEL_WORDS[w]})
     window = _window_text(q, as_of)
     base: dict[str, Any] = {"as_of": as_of.isoformat()} if as_of else {}
 
@@ -513,5 +546,17 @@ def detect(question: str, *, as_of: date | None, values: Callable[[str], list[st
         else:
             by = "signature"
         top = re.search(r"\btop\s+(\d{1,3})\b", low)
-        return call("log_top", window=window, by=by, level=levels or None, service=services or None, tenant=tenants[0] if len(tenants) == 1 else None, top_n=int(top.group(1)) if top else None)
+        rate = bool(re.search(r"\b(?:error|failure|fail)\s+rates?\b|\brates?\s+of\s+(?:errors|failures)\b", low))
+        if rate and by not in {"service", "tenant"}:
+            by = "service"
+        return call(
+            "log_top",
+            window=window,
+            by=by,
+            level=None if rate and levels in ([], ["error"], list(FAILURE_LEVELS)) else (levels or None),  # "error rate": ERROR and FATAL
+            service=services or None,
+            tenant=tenants[0] if len(tenants) == 1 else None,
+            top_n=int(top.group(1)) if top else None,
+            metric="error_rate" if rate else None,
+        )
     return None

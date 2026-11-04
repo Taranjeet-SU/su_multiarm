@@ -134,6 +134,9 @@ class Then(StrictModel):
     field_from_group: str = Field(pattern=GROUP_NAME)
 
 
+MAX_REGEX_CHARS = 4096  # the longest regex a library entry accepts
+
+
 class PatternEntry(StrictModel):
     id: str = Field(pattern=ENTRY_ID)
     kind: PatternKind
@@ -142,7 +145,7 @@ class PatternEntry(StrictModel):
     # ``field`` selects chunk fields; any other key selects on a line attribute (a format group of
     # the same name, else document metadata). ``"*"`` matches anything, including a missing value.
     applies_to: dict[str, str | list[str]] = Field(default_factory=dict)
-    regex: str = Field(min_length=1, max_length=4096)
+    regex: str = Field(min_length=1, max_length=MAX_REGEX_CHARS)
     fields: dict[str, FieldDecl] = Field(default_factory=dict)
     entities: list[EntityGroup] = Field(default_factory=list)
     relations: list[RelationTemplate] = Field(default_factory=list)

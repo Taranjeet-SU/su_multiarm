@@ -1,14 +1,14 @@
 {
   "name": "su-multi-arm-ui",
   "version": "2.0.0a3",
-  "content_sha256": "c7f75125548162825e2cad9b84570d138ff8395fc23fcb787a7d8f7a7cd0f37a",
+  "content_sha256": "531651b511b5f464958626713223d96c236a6d4d846657bc26bbbd20de390462",
   "files": {
-    "assets/GraphCanvas-D_2kK3-j.js": "533603d21bbc6c8594521ac4deaeb4f0bf93fea2b87a6eb66f0571529a43660e",
-    "assets/GraphView-BJsiHc7a.js": "fa0a3739f7bee0079b41c8a6d896400330a4698522331a83fe8344a91953676b",
-    "assets/MiniGraph-DdWP-t7P.js": "a57db19cc394856cf53e9ead178dd697570203c3d030e3bdc99fbc4d9f51c6ab",
-    "assets/index-CsD_Pzy-.js": "d41a6454de269ba647bd6fbf53ebf51b5c5b18c3df8da61d76b68f1d9a00e4fe",
+    "assets/GraphCanvas-CP0gmQu1.js": "39397780c8aa1e4e726e46f58f5f7ad7ddd8b3fd81880e7eb565cffd9dfd5171",
+    "assets/GraphView-186BbPT-.js": "962b34d0a1a95bedd6214a68e6390f2b474b001a1b3d79979eb572016d9b3042",
+    "assets/MiniGraph-DYQgg6_o.js": "71b4c374e13d2d8d9b662e4534cb3e13b3732712e8ff754044c71b41dc19c497",
+    "assets/index-C-i1TZuw.js": "e9ea9c8c5374e972a501390177cf3f16a61eb170a2cebc817d8afed9a2a2b5fa",
     "assets/index-DtYfqwQx.css": "7d9a03ae53e0e6791b79c50c0aab2eb2f97bcf68415f32acbd4f2732f181f065",
-    "index.html": "bf2862c157e3bbb5f61b46693e08ef9062a06a792ea1af4c544274ee6a85b3c4",
+    "index.html": "6cbf4fc0145fc732ee48374526143776320e553b0d8ae487d1c5cf4a589eba4d",
     "theme.css": "cd22ca2d14bfe8cd24841427b0d1c8ec913c4335b207459b73e442cf1a0a6467"
   }
 }

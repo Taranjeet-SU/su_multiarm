@@ -10,6 +10,7 @@ import { AggregateCard } from "../components/AggregateCard";
 import { LogResult } from "../components/LogResult";
 import { ErrorBanner, JsonBlock, Text } from "../components/common";
 import { useApp } from "../context";
+import { submitOnEnter } from "../lib/keys";
 import { formFields, initialValues, toArgs, type FormField } from "../lib/schemaForm";
 import { displayText } from "../lib/text";
 import { timeFieldsOf } from "./AskView";
@@ -80,6 +81,7 @@ function Shortcut({ tool, presets, schema }: { tool: string; presets: Record<str
   useEffect(() => setValues(initialValues(fields, presets)), [fields, presets]);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (busy) return; // Enter while a call runs: the same as the disabled Run button
     setError(null);
     setBusy(true);
     try {
@@ -116,7 +118,7 @@ function Shortcut({ tool, presets, schema }: { tool: string; presets: Record<str
                 <option value="false">false</option>
               </select>
             ) : (
-              <input value={values[f.name] ?? ""} onChange={(e) => setValues({ ...values, [f.name]: e.target.value })} placeholder={f.kind === "string_list" ? "a, b" : f.kind === "json" ? "JSON" : ""} maxLength={2000} />
+              <input value={values[f.name] ?? ""} onChange={(e) => setValues({ ...values, [f.name]: e.target.value })} onKeyDown={submitOnEnter} placeholder={f.kind === "string_list" ? "a, b" : f.kind === "json" ? "JSON" : ""} maxLength={2000} />
             )}
           </label>
         ))}

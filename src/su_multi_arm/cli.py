@@ -236,6 +236,8 @@ def _main():
         warnings.simplefilter("always")
         config = load_config(args.config)
     try:
+        if args.command == "doctor":
+            check_ui_theme(config)
         engine = Engine(config)
     except ConfigError as exc:
         if args.command != "doctor":
@@ -660,6 +662,17 @@ def _assembled_lines(args, config, compiled) -> tuple[list, int, dict]:
     return out, stats.fragments, {"enabled": True, "rules": list(multiline.continuation), **stats.as_dict()}
 
 
+def check_ui_theme(config) -> None:
+    """``serving.ui.theme`` (resolved relative to the config file) must exist and be a valid theme:
+    the same check ``serve`` makes at start-up, so ``config validate`` and ``doctor`` catch it first
+    (``ConfigError`` naming the problem)."""
+    if config.serving.ui.theme is None:
+        return
+    from .serving.ui_theme import load_theme
+
+    load_theme(config.serving.ui.theme)
+
+
 def _config_command(args) -> str:
     """``config upgrade|validate|schema``; never constructs an engine or touches an index."""
     import warnings
@@ -688,6 +701,7 @@ def _config_command(args) -> str:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         config = load_config_v2(args.config)
+    check_ui_theme(config)
     return json.dumps(
         {
             "config": "valid",

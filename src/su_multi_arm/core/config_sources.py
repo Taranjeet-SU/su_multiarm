@@ -111,6 +111,9 @@ class IndexNameConfig(StrictModel):
       the default) or between the prefix fields and the service (``before_service``). ``after_env``
       is env-anchored and needs no list: the deployment is whatever lies between the last prefix
       field (matched by its vocabulary) and the service (matched by its vocabulary).
+    - ``service_suffix: numeric`` reads a trailing digit run (at least ``service_suffix_min_digits``)
+      after the service as the ``deployment_id`` attribute (``ml-service-1658254295-2026.03.01`` is
+      service ``ml-service``, deployment id ``1658254295``).
     - ``prefix_fields`` (default ``tenant``, ``env``) and ``service`` are the segments. A segment
       with a vocabulary takes the **longest** vocabulary entry that fits (``query-gateway`` wins
       over ``gateway``); a segment without one is exactly one separator-free token, so service
@@ -132,6 +135,11 @@ class IndexNameConfig(StrictModel):
     prefix_fields: list[str] = Field(default_factory=lambda: ["tenant", "env"])
     # Keys: ``service`` or a prefix field. Values are literal lower-case names (``_`` allowed).
     vocabularies: dict[str, list[str]] = Field(default_factory=dict)
+    # ``numeric``: a trailing run of at least ``service_suffix_min_digits`` digits after the service
+    # (``ml-service-1658254295``) is a deployment id, not part of the service: service ``ml-service``,
+    # attribute ``deployment_id`` ``1658254295`` (``none`` when the name has no such suffix).
+    service_suffix: Literal["none", "numeric"] = "none"
+    service_suffix_min_digits: int = Field(default=6, ge=1, le=32)
 
     @field_validator("date_format")
     @classmethod

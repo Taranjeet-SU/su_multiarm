@@ -179,8 +179,9 @@ copy by hand. With the UI behind a LAN forwarder, put the forwarder's host name 
 
 ### Theming the UI
 
-`serving.ui.theme` names a JSON theme file; without it the neutral default is used. The server
-validates the file at start-up (an invalid theme refuses the start) and serves it as
+`serving.ui.theme` names a JSON theme file (a relative path is relative to the config file, like
+every other path); without it the neutral default is used. `config validate` and `doctor` check
+that it exists and is valid; the server also validates the file at start-up (an invalid theme refuses the start) and serves it as
 `/ui/theme.css` (CSS custom properties only) and `/ui/theme-logo.svg`, so the strict CSP still
 holds. Keep your branding in the deployment's configuration directory, not in this repository.
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -203,6 +203,22 @@ class LogsServingConfig(StrictModel):
     allow_adhoc_scopes: bool = False
 
 
+class FewShotExample(StrictModel):
+    """One planner example: a question and the typed intent call it should plan (the arguments are
+    validated against the intent's input model)."""
+
+    question: str = Field(min_length=1, max_length=300)
+    intent: str = Field(min_length=1, max_length=32)
+    args: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def typed(self):
+        from ..decision.log_intents import LogIntentCall
+
+        LogIntentCall.model_validate({"intent": self.intent, "args": self.args})  # kept as written
+        return self
+
+
 class LogIntentsConfig(StrictModel):
     """The typed log intents and tools (addendum A2 §4.1.5). ``enabled`` makes every decision agent
     route recognised log questions through one typed intent step, and refuses free structured scopes
@@ -210,6 +226,37 @@ class LogIntentsConfig(StrictModel):
 
     enabled: bool = False
     default_window: str = Field(default="today", min_length=1, max_length=64)
+    # The logs planner context pack (``decision/log_context.py``): what the ``llm`` planner (alone or
+    # as the cascade's fallback stage) sees besides the question: what each arm stores, a capped
+    # pattern-library summary, the served dates, field vocabularies, the intents as typed tools and
+    # the few-shot examples. ``planner_context_max_chars`` bounds its JSON size.
+    planner_context: bool = True
+    # cascade under the logs profile: when the rules find no log intent, the llm stage plans (the
+    # rules/classifier stages before it are skipped) instead of a generic rules retrieval plan
+    cascade_to_planner: bool = True
+    planner_context_max_chars: int = Field(default=24_000, ge=2_000, le=200_000)
+    # Few-shot examples (question -> intent call). The profile ships a synthetic default set;
+    # ``few_shot_file`` (YAML list of {question, intent, args}, relative to the config file) replaces it.
+    few_shot: list[FewShotExample] = Field(default_factory=list, max_length=50)
+    few_shot_file: Path | None = None
+
+    def examples(self) -> list[FewShotExample]:
+        """The few-shot examples: the file's when ``few_shot_file`` is set (read and validated
+        here; ``ConfigError`` naming the file otherwise), else ``few_shot``."""
+        if self.few_shot_file is None:
+            return list(self.few_shot)
+        import yaml
+        from pydantic import TypeAdapter, ValidationError
+
+        from .errors import ConfigError
+
+        try:
+            data = yaml.safe_load(self.few_shot_file.read_text(encoding="utf-8")) or []
+            return TypeAdapter(list[FewShotExample]).validate_python(data)[:50]
+        except OSError as exc:
+            raise ConfigError(f"cannot read the few-shot file: {exc.strerror}", "logs.intents.few_shot_file") from exc
+        except (ValidationError, yaml.YAMLError) as exc:
+            raise ConfigError(f"invalid few-shot file: {exc}", "logs.intents.few_shot_file") from exc
 
 
 class RetentionConfig(StrictModel):

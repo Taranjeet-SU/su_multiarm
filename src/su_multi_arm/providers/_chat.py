@@ -16,6 +16,7 @@ still metered with the reported usage.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Callable, ClassVar
 
 import httpx
@@ -33,6 +34,7 @@ from .base import (
     ProviderLimitIgnored,
     ProviderSchemaTooComplex,
     RoleSpec,
+    SchemaViolation,
     StrictSchemaError,
     T,
     Usage,
@@ -97,6 +99,7 @@ class HttpChatProvider:
             raise CapabilityMismatch("; ".join(f"{key}: {message}" for key, message in problems))
         self.http = HttpCall(transport)
         self._prompt_fallback: dict[str, dict[str, str]] = {}  # schema name -> {from, reason} of a recorded switch to prompt mode
+        self._last = threading.local()  # the stop reason of this thread's last call (for SchemaViolation)
 
     # --- public API ----------------------------------------------------------------------------
 
@@ -116,7 +119,14 @@ class HttpChatProvider:
 
     def complete_json(self, system: str, payload: Any, schema: type[T], budget: CallMeter, ctx: CallContext) -> tuple[T, Usage]:
         raw, usage = self.complete_json_raw(system, payload, schema, budget, ctx)
-        return validate_reply(schema, raw, ctx.stage), usage
+        return self._validated(schema, raw, ctx), usage
+
+    def _validated(self, schema: type[T], raw: str, ctx: CallContext) -> T:
+        try:
+            return validate_reply(schema, raw, ctx.stage)
+        except SchemaViolation as error:
+            error.stop_reason = getattr(self._last, "stop_reason", None)  # this thread's last call
+            raise
 
     def complete_json_raw(self, system: str, payload: Any, schema: type[BaseModel], budget: CallMeter, ctx: CallContext) -> tuple[str, Usage]:
         return self._schema_exchange(system, user_content(payload), schema, budget, ctx)
@@ -172,7 +182,7 @@ class HttpChatProvider:
         self, system: str, payload: Any, schema: type[T], budget: CallMeter, ctx: CallContext, on_delta: Callable[[str], None]
     ) -> tuple[T, Usage]:
         raw, usage = self._schema_exchange(system, user_content(payload), schema, budget, ctx, on_delta=self._require_streaming(on_delta, ctx))
-        return validate_reply(schema, raw, ctx.stage), usage
+        return self._validated(schema, raw, ctx), usage
 
     def complete_text_stream(self, system: str, payload: Any, budget: CallMeter, ctx: CallContext, on_delta: Callable[[str], None]) -> tuple[str, Usage]:
         return self._exchange(system, user_content(payload), None, "text", budget, ctx, on_delta=self._require_streaming(on_delta, ctx))
@@ -213,6 +223,7 @@ class HttpChatProvider:
                 call.extra["stream"] = True
                 data = self.http.post_stream(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage, consumer=consumer)
             text = self._parse(data, mode, ctx, call, body)
+            self._last.stop_reason = call.extra.get("stop_reason")
             if call.usage.reported and call.usage.output_tokens > self.role.max_tokens:
                 raise ProviderLimitIgnored(
                     f"reply used {call.usage.output_tokens} output tokens, more than max_tokens {self.role.max_tokens} "
