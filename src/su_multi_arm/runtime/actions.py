@@ -19,7 +19,7 @@ from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
 
-from ..core.errors import AccessDenied
+from ..core.errors import AccessDenied, failure_category
 from ..models import StrictModel
 from .acl import Principal
 
@@ -39,7 +39,9 @@ class ActionResult(StrictModel):
     status: ActionStatus
     outputs: dict[str, Any] = Field(default_factory=dict)
     audit_id: str | None = None
-    error: str | None = None
+    error: str | None = None  # detail for in-process callers; serving surfaces send category/reason only
+    category: str | None = None  # failed: ``core.errors.failure_category`` (e.g. ``write_conflict``)
+    reason: str | None = None  # failed: the category's machine-readable reason (e.g. ``held``)
 
 
 class AuditRecord(StrictModel):
@@ -164,7 +166,8 @@ class ActionRunner:
             return ActionResult(status="denied", audit_id=record.id, error=str(exc))
         except Exception as exc:  # noqa: BLE001 - every failure is recorded, never hidden
             self.audit.finalise(record.model_copy(update={"finished": self.clock(), "status": "failed", "error": str(exc)}))
-            return ActionResult(status="failed", audit_id=record.id, error=f"{type(exc).__name__}: {exc}")
+            category, reason = failure_category(exc)
+            return ActionResult(status="failed", audit_id=record.id, error=f"{type(exc).__name__}: {exc}", category=category, reason=reason)
         self.audit.finalise(
             record.model_copy(
                 update={"finished": self.clock(), "status": "applied", "generation_after": self.current_generation()}

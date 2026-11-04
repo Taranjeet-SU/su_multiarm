@@ -18,6 +18,8 @@ from typing import Any, Callable, Iterator
 
 from ...core.errors import BackendError
 from ...core.types import GenerationId
+from ...ingestion.lease import stale_base
+from ...ingestion.release import ANY
 from . import _cypher as q
 from .graph import Neo4jGraph
 
@@ -155,11 +157,19 @@ class Neo4jBackend:
         if not run(q.GENERATION_STATE, g=self.gen_key(gen)):
             raise BackendError(KIND, "generation", f"unknown generation {gen.prefix()}")
 
-    def activate_generation(self, gen: GenerationId) -> None:
+    def activate_generation(self, gen: GenerationId, expected: str | None = ANY) -> None:
         """Point ``<namespace>|<dataset>`` at ``gen`` in one statement; refused (pointer unchanged) when the
-        generation has no committed load."""
+        generation has no committed load. With ``expected`` it is a compare-and-set: refused with
+        ``WriteConflict(stale_base)`` (transaction rolled back) when the pointer names anything else."""
+        params = {"g": self.gen_key(gen), "pointer": self.pointer_key(gen.dataset), "generation": gen.generation, "now": self.clock()}
         with self.transaction("activate", write=True) as run:
-            rows = run(q.POINTER_ACTIVATE, g=self.gen_key(gen), pointer=self.pointer_key(gen.dataset), generation=gen.generation, now=self.clock())
+            if expected is ANY:
+                rows = run(q.POINTER_ACTIVATE, **params)
+            else:
+                rows = run(q.POINTER_ACTIVATE_IF, expected=expected, **params)
+                if not rows and run(q.GENERATION_LOADED, g=params["g"])[0]["loaded"]:
+                    pointer = run(q.POINTER_READ, pointer=params["pointer"])
+                    raise stale_base(KIND, pointer[0]["generation"] if pointer else None, expected)  # raised inside: rolled back
         if not rows:
             raise BackendError(KIND, "activate", f"generation {gen.prefix()} has no committed load; pointer unchanged")
 

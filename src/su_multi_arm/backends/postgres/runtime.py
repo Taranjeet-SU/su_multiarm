@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...core.errors import BackendError
 from ...core.types import CacheEntry, LedgerEntry, RawReply, SessionRecord
+from .._sessions import lost, next_record
 from ..memory import CACHE_KEY
 from ._db import KIND
 
@@ -121,17 +122,20 @@ class PostgresSessions:
             row = cur.fetchone()
         return None if row is None else SessionRecord.model_validate_json(row[0])
 
-    def touch(self, session_id: str, now: float, record: SessionRecord | None = None) -> None:
+    def touch(self, session_id: str, now: float, record: SessionRecord | None = None, expected_version: int | None = None) -> None:
         with self._b.tx("touch") as cur:
             cur.execute(f"SELECT data FROM {self._b.table('sessions')} WHERE id = %s FOR UPDATE", (session_id,))
             row = cur.fetchone()
             if row is None:
                 raise BackendError(KIND, "touch", f"unknown session {session_id}")
-            updated = (record or SessionRecord.model_validate_json(row[0])).model_copy(update={"last_seen_at": now})
+            # ``FOR UPDATE`` holds the row until commit; the ``data`` guard keeps the write a CAS anyway.
+            updated = next_record(session_id, SessionRecord.model_validate_json(row[0]), now, record, expected_version)
             cur.execute(
-                f"UPDATE {self._b.table('sessions')} SET data = %s, last_seen_at = %s WHERE id = %s",
-                (updated.model_dump_json(), now, session_id),
+                f"UPDATE {self._b.table('sessions')} SET data = %s, last_seen_at = %s WHERE id = %s AND data = %s",
+                (updated.model_dump_json(), now, session_id, row[0]),
             )
+            if cur.rowcount != 1:
+                raise lost(session_id, expected_version)
 
     def expire(self, now: float, ttl_seconds: float) -> int:
         with self._b.tx("expire") as cur:

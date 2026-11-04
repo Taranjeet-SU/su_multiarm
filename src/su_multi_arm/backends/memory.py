@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 from collections import Counter
 from typing import Any, Callable, Sequence
@@ -47,6 +48,7 @@ from ..core.types import (
     TraversalSpec,
     UnsupportedConstraint,
 )
+from ._sessions import next_record
 from ._scope import MAX_MATCHED_DEFAULT, RECORD_KEYS, check_matched, document_values, matches, record_violations, scope_result, unsupported_reason, validated_hops  # noqa: F401
 
 KIND = "memory"
@@ -98,6 +100,7 @@ class _State:
         self.status: dict[str, str] = {}
         self.raw: dict[str, RawReply] = {}
         self.sessions: dict[str, SessionRecord] = {}
+        self.session_lock = threading.Lock()
         self.max_matched = MAX_MATCHED_DEFAULT  # same typed cap as every records adapter
         self.protected: set[str] = set()
         self.stats: Counter[str] = Counter()
@@ -494,11 +497,12 @@ class MemorySessions(_Facet):
     def get(self, session_id: str) -> SessionRecord | None:
         return self._s.sessions.get(session_id)
 
-    def touch(self, session_id: str, now: float, record: SessionRecord | None = None) -> None:
-        current = self._s.sessions.get(session_id)
-        if current is None:
-            raise BackendError(KIND, "touch", f"unknown session {session_id}")
-        self._s.sessions[session_id] = (record or current).model_copy(update={"last_seen_at": now})
+    def touch(self, session_id: str, now: float, record: SessionRecord | None = None, expected_version: int | None = None) -> None:
+        with self._s.session_lock:
+            current = self._s.sessions.get(session_id)
+            if current is None:
+                raise BackendError(KIND, "touch", f"unknown session {session_id}")
+            self._s.sessions[session_id] = next_record(session_id, current, now, record, expected_version)
 
     def expire(self, now: float, ttl_seconds: float) -> int:
         doomed = [k for k, s in self._s.sessions.items() if s.last_seen_at + ttl_seconds <= now]

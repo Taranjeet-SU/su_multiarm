@@ -813,3 +813,157 @@ is not added to the `mkdocs.yml` nav (owned by the docs agent).
 Tests: `not external` 762 passed + 1 failed → 766 passed (3 new, 1 fixed; working tree includes the docs
 agent's capability-table tests); external 100 passed / 17 skipped; ruff clean; Config unchanged.
 Follow-ups: add `LEXICAL_AGREEMENT.md` to the docs nav; hosted Anthropic/OpenAI remain mocked.
+### 2026-11-04 — 2.0.0a2 slice S: sessions, sqlite lexical, config/CLI, HTTP auth, test suite, unimplemented keys — DONE
+Branch `worktree-agent-a1faeba6a919e4dad`, base `95bb183`, commit `06868bd`. Fixed QA-05, 07, 10, 11, 12,
+14, 16 (`docs/plans/reviews/qa_2.0.0a1.md`) and completeness-review risk R3; their 7 strict xfails
+(9 params) removed and passing.
+Done: (1) `SessionStore.touch(..., expected_version)` CAS on the new `SessionRecord.version` in memory,
+sqlite, sqlalchemy, postgres and mongodb (`backends/_sessions.py`; SQL stores update `WHERE data =
+<raw row read>`, Mongo filters on the raw `data`, memory holds a lock); `SessionConflict`;
+`SessionManager.update` (64 in-process lock stripes, 50 bounded CAS attempts with jitter); turns
+merged into the freshest record; `SessionTurns.reserve/release` hold the clipped request limits on
+`SessionRecord.reservations` (expiry = deadline + 300 s); engine `_begin` reserves and releases on
+failure. (2) Lexical arm `query_terms` and sqlite `tokens` keep the spelling (FTS5 folds); sqlite graph
+keeps casefolded entity tokens. (3) `core.config.rebase_paths` + `upgrade_text(source_dir,
+target_dir)`; CLI `--debug`, `_report` (exit 1/2/3); `validate_config` aggregates every pydantic error
+into `ConfigError.diagnostics`. (4) `BearerTokenResolver` case-insensitive scheme. (5) Engine defers
+`missing_secret` diagnostics of decision/review components of non-default `(pipeline, mode)` pairs,
+re-checks on first use (`MissingSecret`), `Engine.missing_keys()` in `doctor`. (6) `tests/service_probe.py`
+gates the OpenSearch/Elasticsearch external tests (skip when unset and unreachable, fail when
+configured). (7) `models.roles.judge`, `models.roles.cache_gate`, `extraction.ontology` removed from the
+schema and refused with "not implemented in this release"; `pipeline.arms.cache` refused at validation.
+Configured-but-unused keys found (name-based walk of every Config field, `tests/unit/test_config_cli_a2.py`):
+`models.roles.judge`, `models.roles.cache_gate`, `extraction.ontology` (now refused),
+`pipeline.arms.cache` (was refused only at engine construction; now at validation) and
+`pipeline.decision.artifact.manifest.features` (classifier manifest metadata; allowlisted, see follow-ups).
+Deviations: (a) frozen §3.5 contract amended (`touch` gains `expected_version`; plan changelog row
+added). (b) A CAS loss is re-applied to the fresh record up to 50 times; this is optimistic-concurrency
+control, not a retry-until-pass of a check: the budget check runs again on every attempt and a turn
+that no longer fits is refused. (c) A session-budget hold is the whole clipped request limit, so
+concurrent turns of one session are refused while earlier holds are live unless per-request limits
+are below the session limits (documented in CONFIGURATION). (d) `pipeline.arms.cache` stays in the
+schema (the downgrade path references it) but fails validation. (e) A missing deferred key surfaces
+as `MissingSecret` (ProviderError, HTTP 502), consistent with other provider credential failures.
+(f) `config upgrade` without `--output` (stdout) does not rebase paths.
+Tests: `pytest -q -m 'not external'` 766 passed + 20 xfailed (base) → 824 passed + 12 xfailed;
+`pytest -q` with every extra installed and no services: 27 failed + 46 errors → 823 passed, 115
+skipped, 0 errors (before the 4 service-probe tests); ruff clean; schema regenerated. Real service: kit
+`check_session` with CAS passed on PostgreSQL and SQLAlchemy-on-PostgreSQL (throwaway stack started by
+another run; random prefixes). `scripts/lexical_agreement.py` sqlite-only output byte-identical before/after.
+Follow-ups: MongoDB session CAS against a real server (its conformance fixture drops a shared
+database name, so it was not run while another agent used the stack); classifier
+`manifest.features` has no consumer (check against the injected runtime with the Phase 2 classifier
+row); session record growth (R4) and binder eviction are untouched; MCP/HTTP mapping of
+`SessionConflict` (exhausted CAS attempts) falls to the generic 422 path; the other agents' QA xfail
+removals in `tests/qa/test_qa_2_0_0a1.py` will touch the same file (trivial merge).
+
+### 2026-11-04 — 2.0.0a2/D decision agent, typed scope, request filters, answer contract, generation — DONE
+Branch `worktree-agent-ac35389efbcc8cb3a`, base `95bb183`, commit `0158c13`. Fixes QA-01, 02, 03, 04,
+08, 09, 13, 15 from `reviews/qa_2.0.0a1.md`. Done: `decision/qualifiers.py` (candidates: observed
+listable/enum values verbatim in the question, calendar expressions, quoted phrases) run by
+`DecisionAgent.decide`/`CascadeAgent.decide` on every agent-compiled `StructuredStep`; unapplied
+candidates → `UnsupportedConstraint(qualifier_not_applied)` on `StructuredStep.unapplied` and the
+decision; the engine bounds that step's aggregate. `values.py::check_request_filters` (coercion
+table, `FilterCheck`), applied in `Engine._retrieve` and `aggregate_in`. Engine pre-pass gets
+`structured_targets()`. `generation/statements.py` + `AnswerContract` rule 5
+(`answer_text_without_exact_scope`), absence needs an empty exact scope, `empty_answer` rule,
+`on_violation: strip`, `contract: stripped`, `Violation.action`. `contract.answer_schema` (enum ids,
+narrative-only kinds without aggregate evidence) sent when `JsonModel.enforces_schema()`; generator
+prompt tightened (neutral). Aggregates/trace steps carry `predicates`; trace event
+`structured_scope` with `Sensitive` values. `strict_schema` raises `StrictSchemaError` (allowlist of
+keywords, typeless const, mixed/root anyOf, free-form mappings); `LlmPlan` = flat `LlmStep` +
+`LlmFilter` pairs (mapping filters still accepted); `pipeline/validate.py::role_schemas`,
+`strict_schema_problems`, diagnostic `schema_not_strict`, `probe_report[...]["strict_schemas"]`.
+Deviations/interpretations: (1) QA-13 fixed by making the schema strict-expressible (preferred), so
+`test_qa13_*` now asserts a native OpenAI planner validates and plans (rewritten, renamed);
+validation still rejects a native role whose sent schema is not strict (unit test via
+monkeypatched `role_schemas`). (2) QA-15 test asserts the typed `StrictSchemaError` instead of a
+`None` return; the old unit assertion `strict_schema(Open) is None` became `pytest.raises`. (3) An
+invalid request filter is applied as given (never dropped/widened) and reported; a typed
+`aggregate` request with one abstains in the decision (ScopeCompiler), a plain search returns its
+(usually empty) hits flagged. Undeclared filters under `unknown_fields: allow` are untyped string
+equality **and** reported (`field_not_filterable`), since their aggregate cannot be exact. (4)
+Qualifier check skips caller-typed aggregates/scopes; a structured step on a question without an
+aggregate operator is flagged as a whole (covers the QA-01 "nexus threshold" example); free-text
+topic words of aggregate questions are not `llm` candidates (documented limitation). (5) QA-08
+claim stripping applies under the default `abstain_with_reason` only when the answer text contains no
+statement; unknown ids still abstain (the enum prevents them under native output). (6)
+`test_qa04_*` question changed to "List every pending LedgerOne record." because with QA-03 fixed
+"ticket" is not a structured target in that schema (the contract assertion is unchanged; the text
+check abstains with or without the intent). (7) Added `empty_answer` after the paid rerun showed one
+empty answer passing. (8) The nine-probe harness test and `test_answer_contract.py` now expect the
+extra `answer_text_without_exact_scope` violation (same edge cases). Config change: `on_violation`
+literal (+`strip`); schema regenerated with `core.schema.write_all`.
+Tests: `not external` 766 passed / 20 xfailed → 846 passed / 9 xfailed; ruff clean. Paid QA-08
+(gpt-4o-mini, via `~/su_mutliarm_tests/qa` spend guard): 25 questions 24/25 → 0/25 abstained (1
+empty answer, now rejected offline); `test_qa08_*` passed (xfail removed); spend $0.3425, cumulative
+OpenAI $0.8641.
+Follow-ups: count-value matching (a stated number vs the aggregate value) is not checked; Anthropic
+native with the enum schema untested (key invalid); detector precision on more real output; QA-05,
+06, 07, 10, 11, 12, 14 belong to the parallel slices.
+
+### 2026-11-04 — 2.0.0a2/W write path: leases, fencing, incremental embeddings, ingest budget — DONE
+Branch `worktree-agent-afb94827b31c0dc78` (base `95bb183`), commit `4fd530a`. Done: (1) R1 — `ingestion/lease.py`
+(owner token, heartbeat every ttl/4, lost after a whole ttl without renewal, owner-only renew/release,
+`Lease.check` renews synchronously before activation); leases on the file (non-blocking `flock`; was a
+blocking wait), memory, PostgreSQL (advisory lock, `pg_locks` heartbeat), SQLAlchemy and MongoDB
+(conditional row/document writes), Elasticsearch (`if_seq_no`/`if_primary_term`; release only by owner).
+`activate(manifest, expected=...)` compare-and-set on every registry; secondary pointers CAS on what they
+named before (Neo4j `POINTER_ACTIVATE_IF`, OpenSearch/ES `must_exist` fence on the expected docs index);
+compensation only while the pointer still names the failed generation. Typed `WriteConflict(reason)`
+(`core/errors.py`, a `BackendError`) and `IngestConflict` (`IngestError` + `WriteConflict`, failure
+category `write_conflict:<reason>`). (2) R2 — ledger-backed embedding reuse keyed by
+`(recipe sha, sha256(exact input))`, streamed per `batch_size` window, manifest `embedded`,
+`reused_embeddings`, `incremental`; `ingest_delta` docstring/CONFIGURATION/outputs state what is
+incremental. (3) QA-06 — `budgets.ingest` (`ingestion/budget.py`, `IngestMeter`/`RoleMeter`), embedder
+`pricing_key`, price check at construction; v1 `max_llm_calls` → also `budgets.ingest.max_llm_calls`
+when set explicitly. Schema regenerated; ARCHITECTURE, CONFIGURATION, VALIDATION updated.
+Deviations: (a) `budgets.ingest.max_llm_calls` defaults to 10000 (a finite fail-closed cap; the plan
+names `ingestion: {max_usd}` — the task's `budgets.ingest` shape was used); (b) the FileGenerationRegistry
+lock no longer waits (typed refusal, as every other registry); (c) `activate()` without `expected`
+keeps the unconditional switch for direct registry use/tests (`release.ANY`); the write path always
+passes `expected`; (d) `extras.GenerationPointer.activate_generation` gained an optional `expected`;
+injected pointers without it are switched after a read-and-compare (§3.5 changelog item); (e) the
+embedder `pricing_key` is excluded from the index fingerprint so existing generations stay valid;
+(f) the corpus (documents + chunks) is still loaded in memory on upsert; only vectors are streamed.
+Tests replaced: the ES unit `test_registry_lock_conflicts_are_typed_and_stale_locks_expire` →
+`test_registry_lease_conflicts_are_typed_and_stale_leases_expire` + non-owner release test (same held
+/ stale-takeover edges, plus legacy lock documents); `test_budget_exhaustion_is_a_stage_failure_under_partial`
+now sets `budgets.ingest.max_llm_calls`; two contract monkeypatches accept `expected`.
+Tests: `not external` 766 passed / 20 xfailed → **797 passed / 19 xfailed** (QA-06 xfail removed);
+external (throwaway postgres, mongo, elasticsearch, opensearch, neo4j; `rm -sf` afterwards):
+conformance + multi-backend engine **98 passed, 16 skipped, 0 failed**; ruff clean.
+Follow-ups: HTTP mapping of `WriteConflict` to 409 (serving owner); GC of `embedding:` ledger entries;
+streaming the corpus on upsert and real delta for graph/communities/reports (Phase 2 ingestion row);
+multi-host writer contention test; OpenSearch registry (still none) would reuse the ES lease code.
+
+### 2026-11-04 — 2.0.0a2 release-review fixes (B1–B6 + cheap non-blocking) — DONE (Anthropic smoke BLOCKED: HTTP 429)
+Branch `v2/phase-0`, after `70dca3f` (review committed as `docs: 2.0.0a2 release review`). Done:
+B1 `decision/qualifiers.py` `field` qualifiers (filterable field named next to a typed value; comparisons;
+bare boolean fields; a year on an integer field is not also a time qualifier); B2 `extraction/base.py`
+`A1_RECIPE_KEYS` keeps `ontology: None` in the extractor recipe, golden test
+`tests/unit/test_index_fingerprint_golden.py` (8 examples, values computed from `public-main`), a1-built
+index opened under a2 via CLI; B3 `**_` on `activate` monkeypatches (neo4j engine, multi-backend engine,
+graph seams); B4 `pythonpath = ["."]`, plus ES/OpenSearch conformance modules skip without their extra
+unless the URL is set (found by the fresh-venv bare run); B5 `core.errors.failure_category`/`FAILURE_STATUS`,
+HTTP 409 typed body for `WriteConflict`/`IngestConflict`/`SessionConflict`, action route answers with the
+failure category's status and `result.category/reason` (exception text only in the audit record; N9 for
+actions), MCP typed messages; B6 `2.0.0a2` everywhere, `CHANGELOG.md`, VALIDATION status header + "2.0.0a2
+release evidence". Non-blocking: N1 detector exclusions (singular-unit labels, product-version names, head
+nouns, singular "the only", "complete list of <non-unit>"), N2 `answer_number_mismatch`, N4
+`value_not_observed` for unobserved filter values on listable fields, N5 `require_ingest_cap` for hosted
+embedders, N8 key-file path removed from `.claude/agents/*` (and redacted in the committed review).
+Deviations: (a) N5 is enforced at engine construction (WritePath), not in `validate_config`, so v1/v2
+configs still load and `config validate/upgrade` work; (b) failed actions other than conflicts also map
+to non-200 statuses (422/429/502/503/500), not only 409; `ActionResult` gained `category`/`reason`
+(additive) and keeps `error` detail for in-process callers; (c) N2 accepts the aggregate's denominator
+only after "of" ("12 of 36"); (d) one existing harness test text changed from "Three" to "Two" (it stated
+a number different from its aggregate, which N2 now refuses); (e) "hosted" = `openai`, or
+`openai_compatible` with a non-loopback host.
+Tests: `not external` 934 passed / 1 skipped → **1018 passed**; fresh venv bare `pytest -q` 1007 passed,
+131 skipped, 0 errors; external (five containers) **108 passed, 18 skipped, 0 failed**; ruff clean;
+schema regenerated (no drift).
+Anthropic smoke: first call (extraction, native tool_use + cache_control) → HTTP 429; stopped, no retry;
+$0.00 spent (ledger). `$defs`, streaming and cache-token reporting remain unverified on the real API.
+Follow-ups: rerun the Anthropic smoke when the key has quota; N3 (time-range intersection), N6, N7
+(server-time lease expiry), N10; measure the detector abstain rate on a larger narrative set.

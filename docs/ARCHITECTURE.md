@@ -202,7 +202,16 @@ a measure is never substituted by `count`. Agents (`rules`, `classifier`, `llm`,
 `base.py`: `attempt` plans or raises a categorised `DecisionFailure`; `decide` applies the fail
 policy and records outcome, policy, failure category and `decision_fallback` in the trace.
 `raw_all_arms` is the only fail-open outcome and always carries one unsupported constraint per
-aggregate intent. The `llm` agent calls `providers.JsonModel` through `providers.RunBudgetMeter`,
+aggregate intent. After a successful `attempt`, `decide` runs `qualifiers.py` on every structured step
+the agent compiled from the question (not on caller-typed aggregates): question qualifiers (observed
+field values, calendar expressions, quoted phrases, and since 2.0.0a2 a filterable field named next
+to a value of its type such as `priority 3`) that no predicate or request filter expresses are
+attached to the step as `qualifier_not_applied` constraints, and a structured step on a question
+without an aggregate operator is flagged as a whole; the engine then reports that step's aggregate as
+`bounded`. The engine runs the pre-pass with `Capabilities.structured_targets()` on every surface,
+and validates request filters against `MetadataSchema` first (`values.py::check_request_filters`:
+unambiguous coercion, otherwise the filter is applied as given, reported, and every aggregate under
+it is `bounded`). The `llm` agent calls `providers.JsonModel` through `providers.RunBudgetMeter`,
 which reserves the call, the input estimate and the `max_tokens` ceiling (and USD when priced)
 before the request and commits the reported usage afterwards; the `classifier` agent verifies its ONNX artifact's sha256 at
 `validate()` and needs an injected runtime (nothing executable comes from configuration).
@@ -210,7 +219,9 @@ before the request and commits the reported usage afterwards; the `classifier` a
 `providers/` (plan §3.6) holds the `ChatProvider` protocol (`complete_json`, `complete_json_raw`,
 `complete_text`) and its implementations `anthropic` (Messages API; native structured output as one
 forced tool; `cache_control` on system and tool blocks), `openai` (Chat Completions; native = strict
-`json_schema`; passive caching read from usage), `openai_compatible` (local servers; request hints
+`json_schema`; passive caching read from usage; `base.strict_schema` converts a schema to strict
+form or raises `StrictSchemaError` listing every refused construct, and config validation and
+`doctor --probe` run it on the schemas each native OpenAI role sends), `openai_compatible` (local servers; request hints
 only as the role declares) and `none`; `JsonModel` is the stage-facing facade and `Embedder` the
 embedding facade (`hash`, `sentence_transformers`, `openai`, `openai_compatible`).
 `providers/capabilities.py` is the per-`(provider, model-pattern)` registry (native structured output
@@ -234,8 +245,16 @@ policy and every selected record carries its selection reasons.
 Phase 2; 2.0.0a1 rejects a configured guard at validation rather than skip it): citations must exist; `count`/`exhaustive_list`/`absence` claims need an exact (for absence,
 exhaustive) `ScopeResult` (a result with a dropped predicate is `bounded`, never exact); an aggregate intent without an exact scope forbids count and list claims
 and guarantees a non-empty `unsupported_constraints` (engine-injected; the generator's `Answer`
-model has no such field); factual answers need citations. Violations abstain with the rules recorded
-or raise, per configuration. `pipeline/review.py::ReviewStage` is the bounded review loop with the
+model has no such field); factual answers need citations and text. `generation/statements.py` finds
+count, exhaustive-list and absence statements in the answer text itself (deterministic,
+English-scoped) and each needs a matching typed claim backed by an exact scope
+(`answer_text_without_exact_scope`); a backed count statement must state the cited aggregate's value
+(`answer_number_mismatch`, 2.0.0a2). Violations abstain with the rules recorded, strip (an unbacked
+non-narrative claim on an answer whose text states no aggregate is always stripped rather than
+abstained; `on_violation: strip` also removes unbacked sentences; `contract: stripped`) or raise, per
+configuration. With native structured output the engine sends a per-request `Answer` schema whose
+cited ids are an enum of the supplied evidence ids and whose claim kinds are narrative-only unless
+aggregate evidence was supplied (`contract.answer_schema`). `pipeline/review.py::ReviewStage` is the bounded review loop with the
 stop reasons listed in CONFIGURATION.md; it re-plans only through the decision agent and merges new
 hits through `selection`.
 
@@ -243,7 +262,7 @@ hits through `selection`.
 
 ```text
 SearchRequest{pipeline?, mode?} --choose (request.pipelines/modes allowlists)--> PipelineRuntime
-  session_id? --SessionTurns.open/clip/prepare--> RunContext(generation pinned, principal, budget, trace)
+  session_id? --SessionTurns.open/reserve/prepare--> RunContext(generation pinned, principal, budget, trace)
   -> intent pre-pass (Capabilities.id_patterns from exact_id) -> decision agent of the chosen mode
   -> arms of the pipeline (exact_id hits marked pinned) -> selection (pins first) -> packing
   -> review (mode's agent) -> generation -> AnswerContract -> unknown ids appended to unsupported_constraints
@@ -261,9 +280,14 @@ provider pairs, no model calls). Named pipelines may only read index projections
 builds — those of the default pipeline — so ingestion is unchanged.
 
 `runtime/turns.py::SessionTurns` drives `runtime/session.py::SessionManager` over the configured
-`SessionStore` facet (sqlite, memory, mongodb): principal binding, per-session budget (request
-limits clipped to the remainder; exhausted refuses), generation-switch re-validation of episodic
-IDs, optional `exclude_shown`, and turn/usage recording (`SessionRecord.usage`). Memory never enters
+`SessionStore` facet (sqlite, memory, mongodb, postgres, sqlalchemy): principal binding,
+per-session budget (request limits clipped to the remainder and held on the record for the turn;
+exhausted refuses), generation-switch re-validation of episodic IDs, optional `exclude_shown`, and
+turn/usage recording (`SessionRecord.usage`). Every session write goes through
+`SessionManager.update`: a compare-and-set on `SessionRecord.version` (`SessionStore.touch(...,
+expected_version)`, atomic in every store; `SessionConflict` on a lost race, after which the change
+is re-applied to the fresh record), serialised per session within a process by lock stripes, so
+concurrent turns are merged and racing requests cannot exceed `budgets.session`. Memory never enters
 the generator payload; the contract's evidence-id rule makes a remembered id uncitable.
 `runtime/builtin_tools.py` registers the read-only `search`, `get_document`, `list_values`,
 `aggregate` tools on a `ToolRegistry`; the engine implements their `EngineOperations` (ACL-scoped
@@ -295,7 +319,8 @@ state/
     vectors.faiss              # only when Faiss is selected
 ```
 
-One writer holds an advisory filesystem lock. Builds occur in a new generation. Every projection is
+One writer holds the write lease (a non-blocking `flock` on `.write.lock`; a second writer is
+refused with `WriteConflict`, see "Writers" below). Builds occur in a new generation. Every projection is
 written and validated (row counts against the catalog, sampled round-trips, `refresh` visible), and
 then `CURRENT` is atomically replaced. Readers pin one generation, including multi-hop answers. A
 failed build removes its staged generation from every backend it reached, records a failure manifest
@@ -347,10 +372,63 @@ flowchart LR
   refuses (`GenerationInUse`, before deleting anything) the `CURRENT` generation, one named by any
   secondary pointer, or one protected on the first holder; later errors are reported, never ignored.
 
-Upserts currently rebuild chunk/vector/graph/community projections for the complete canonical corpus.
-Unchanged chunk extractions are reused from the ledger; embeddings are recomputed. Delete/replace rebuilds derived
-state so stale facts and communities cannot remain active. This favors an understandable correctness
-baseline over high-volume incremental throughput. Old snapshots and external generations persist
+### Writers: leases, fencing and compare-and-set activation (2.0.0a2)
+
+Every generation registry implements a **write lease** (`ingestion/lease.py`): an owner token per
+acquisition, renewed by a heartbeat thread every `ttl/4` while the build runs (default `ttl` 120 s),
+so a lease expires only after four missed renewals. A live lease of another writer is a typed
+`WriteConflict(held)` (a `BackendError`), never a wait. Renewal and release are conditional on the
+owner token, so a writer whose lease was taken over can neither extend nor delete the new holder's
+lease.
+
+| Registry | Lease | Takeover | Pointer compare-and-set |
+|---|---|---|---|
+| sqlite (`FileGenerationRegistry`) | non-blocking `flock` on `.write.lock` per lease (excludes threads and processes) | none needed: the kernel drops it with the holder | compare under the lease, then atomic rename |
+| memory | `{owner, expires_at}` on the backend clock | after `expires_at` | under the registry lock |
+| PostgreSQL | session advisory lock on a dedicated connection; heartbeat checks `pg_locks` for that session | none needed: dropped with the session | `UPDATE … WHERE value = expected` / `INSERT … ON CONFLICT DO NOTHING` |
+| SQLAlchemy | `write_lock` row `{owner, expires_at}`; takeover/renew/release `WHERE value = <row read>` | after `expires_at` | as PostgreSQL |
+| MongoDB | `write_lock` document; owner-filtered `update_one`/`delete_one` | `find_one_and_update` on `expires_at <= now` | `update_one({generation: expected})` / `insert_one` |
+| Elasticsearch | `lock:<dataset>` document; `_create`, then `if_seq_no`/`if_primary_term` writes | conditional overwrite after `expires_at` | aliases must name `expected`; the `_aliases` request removes the expected docs index with `must_exist` |
+| OpenSearch / Neo4j (secondary pointers) | — (covered by the catalog registry's lease) | — | OpenSearch as Elasticsearch; Neo4j `MERGE` + lock-taking `SET` then `WHERE p.generation = $expected`, rolled back otherwise |
+
+The write path takes the lease before it reads `CURRENT`, records the generation it starts from,
+renews synchronously right before activation (`Lease.check`) and switches every pointer as a
+compare-and-set: secondaries on what they named just before, the authoritative `CURRENT` on the
+starting generation; compensation also moves a pointer back only while it still names the failed
+generation. A writer whose lease was lost, or whose base is no longer `CURRENT`, fails with
+`IngestConflict` (an `IngestError` and a `WriteConflict`, failure category
+`write_conflict:<lost|stale_base>`), its staged generation is removed and `CURRENT` is untouched, so
+two concurrent writers can never activate one after the other on the same base and lose the first
+one's documents. Limits: moving an alias that names nothing (a first release) cannot be made
+conditional on Elasticsearch/OpenSearch, and an injected `GenerationPointer` without an `expected`
+parameter is switched after a read-and-compare; in both cases the catalog lease alone excludes a
+second writer.
+
+### Incremental embeddings and the ingestion budget (2.0.0a2)
+
+Embedding inputs are streamed in `models.roles.embedder.batch_size` windows. Each chunk's exact
+input (`"{title}\n{field}: {text}"`) and the embedding recipe (provider, model, revision, dimension,
+endpoint of hosted models, document prefix, L2 normalisation, input template) key a vector stored in
+the ledger (`embedding:<recipe>:<sha256(input)>`, little-endian float32); an unchanged input is
+reused byte-for-byte, a changed title, field text or recipe is embedded again. Only the current
+window and the sampled validation vectors are held in memory (the corpus documents and chunks still
+are). A stored vector of the wrong shape fails the build (`projection:vector`), it is never silently
+re-embedded. The manifest reports `embedded` and `reused_embeddings`. LLM calls, embedding requests
+and USD of a build are limited by `budgets.ingest` (`ingestion/budget.py`): reservations before every
+call, commits with reported usage, exhaustion as a `budget` stage failure under the extraction
+policy. A hosted embedder on the dense arm needs an explicit `budgets.ingest.max_usd` or
+`max_embedding_calls` (`require_ingest_cap`, refused at construction). The extractor's recipe hash
+keeps the keys 2.0.0a1 hashed (`extraction.base.A1_RECIPE_KEYS`), so removing a config key does not
+change an index fingerprint; `tests/unit/test_index_fingerprint_golden.py` pins the 2.0.0a1
+fingerprint of every shipped example. Write and session conflicts reach HTTP as 409 and MCP as typed
+tool errors (`core.errors.failure_category`), never with backend text.
+
+What an upsert (`ingest` without `--replace`, the `ingest_delta` action) does today is recorded in
+the manifest's `incremental` entry: embeddings and extraction outputs of unchanged chunks are
+reused; the catalog, lexical, records, vector rows, graph, communities and **community reports** of
+the new generation are rebuilt from the whole canonical corpus (read into memory), so report calls
+recur on every upsert. Delete/replace rebuilds derived state so stale facts and communities cannot
+remain active. The embedding entries in the ledger are not garbage-collected yet. Old snapshots and external generations persist
 until an operator removes them. Do not delete a snapshot while readers might still use it.
 
 A changed model/dimension/prefix/revision, chunk recipe, extraction setting, privacy rule, community

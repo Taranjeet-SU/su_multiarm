@@ -22,6 +22,8 @@ from typing import Any, Callable
 
 from ...core.errors import BackendError
 from ...core.types import GenerationId
+from ...ingestion.lease import stale_base
+from ...ingestion.release import ANY
 from .._lucene_common import (
     DYNAMIC_TEMPLATES,
     INDEX_KINDS,
@@ -242,13 +244,27 @@ class OpenSearchBackend:
             raise BackendError(self.kind, "active_generation", f"docs alias points at {len(generations)} generations")
         return generations.pop()
 
-    def activate(self, gen: GenerationId) -> None:
+    def activate(self, gen: GenerationId, expected: str | None = ANY) -> None:
         """Atomically point the dataset aliases at this generation's indices (release step only).
 
         Every alias switch is one ``_aliases`` request with explicit ``remove`` + ``add`` actions, so
         readers of the alias never observe an empty or doubled alias; the previous generation's
-        indices are left in place until ``delete_generation``.
+        indices are left in place until ``delete_generation``. With ``expected`` (compare-and-set on
+        what the pointer named before) the docs alias must name ``expected`` (or nothing), and the
+        request removes the expected generation's docs index from the docs alias with
+        ``must_exist``: if another writer switched the alias after the check, that action fails and
+        the whole request (applied atomically or not at all) changes nothing. Moving an alias that
+        names nothing cannot be made conditional on the server; there the write lease alone
+        excludes a second writer.
         """
+        conditional = expected is not ANY
+        if conditional:
+            actual = self.active_generation(gen.dataset)
+            if actual != expected:
+                raise stale_base(self.kind, actual, expected)
+        fence = None
+        if conditional and expected is not None and expected != gen.generation:
+            fence = self.index(gen.model_copy(update={"generation": expected}), "docs")
         actions = []
         for index_kind in INDEX_KINDS:
             alias = self.alias(gen.dataset, index_kind)
@@ -259,17 +275,25 @@ class OpenSearchBackend:
                 if index_kind == "records" and "unknown generation" in str(exc):
                     continue  # a generation without records leaves the records alias untouched
                 raise
-            for current in self.alias_indices(alias, "activate"):
-                if current != name:
-                    actions.append({"remove": {"index": current, "alias": alias}})
+            if index_kind == "docs" and fence is not None:
+                actions.append({"remove": {"index": fence, "alias": alias, "must_exist": True}})
+            else:
+                for current in self.alias_indices(alias, "activate"):
+                    if current != name:
+                        actions.append({"remove": {"index": current, "alias": alias}})
             actions.append({"add": {"index": name, "alias": alias}})
-        self.call("activate", "POST", "/_aliases", body={"actions": actions})
+        try:
+            self.call("activate", "POST", "/_aliases", body={"actions": actions})
+        except BackendError as exc:
+            if fence is not None and "HTTP 404" in str(exc):
+                raise stale_base(self.kind, self.active_generation(gen.dataset), expected) from exc
+            raise
 
     # ``extras.GenerationPointer``: the dataset aliases are this backend's own pointer when it holds
     # derived projections of a generation whose authoritative ``CURRENT`` lives on another backend.
 
-    def activate_generation(self, gen: GenerationId) -> None:
-        self.activate(gen)
+    def activate_generation(self, gen: GenerationId, expected: str | None = ANY) -> None:
+        self.activate(gen, expected)
 
     def deactivate_generation(self, gen: GenerationId) -> None:
         """Remove the dataset aliases only where they still point at ``gen`` (rollback of a failed

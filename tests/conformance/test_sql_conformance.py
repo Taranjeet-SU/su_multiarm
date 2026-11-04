@@ -177,3 +177,19 @@ def test_unusable_urls_and_unreachable_servers_are_typed_errors(tmp_path):
     long_chunk = kit.Chunk(id="c" * 600, document_id="x", field="b", start=0, end=1, text="y")
     with pytest.raises(BackendError, match="longer than 512"):
         SqlBackend(f"sqlite:///{tmp_path / 'ok.db'}").catalog.put_documents(kit.GEN, [kit.Document(id="x", dataset="c")], [long_chunk])
+
+
+def test_write_lease_fencing_and_compare_and_set(sql_factory):
+    """Risk R1 on every tested dialect: owner-token lease row, takeover only after expiry,
+    release/renewal by a non-owner refused, activation as compare-and-set."""
+    from .lease_kit import check_compare_and_set, check_lease
+
+    backend = sql_factory()
+    clock = sql_factory.clock
+
+    def advance(seconds):
+        clock["now"] += seconds
+
+    check_lease(backend.generation_registry, advance, backend.generation_registry().lock_ttl_seconds)
+    manifests = [{"dataset": "conformance", "generation": g.generation, "index_format": 3, "fingerprint": g.fingerprint} for g in (kit.GEN, kit.GEN2, kit.GEN.model_copy(update={"generation": "c" * 32}))]
+    check_compare_and_set(sql_factory().generation_registry(), manifests)

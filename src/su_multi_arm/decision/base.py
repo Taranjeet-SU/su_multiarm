@@ -66,6 +66,9 @@ class StructuredStep(StrictModel):
 
     arm: Literal["structured"]
     scope: ScopeSpec
+    # Question qualifiers this scope does not express (``decision/qualifiers.py``); the engine
+    # reports the step's aggregate as ``bounded`` with these attached.
+    unapplied: list[UnsupportedConstraint] = Field(default_factory=list)
 
 
 PlanStep = Annotated[Union[RetrievalStep, StructuredStep], Field(discriminator="arm")]
@@ -269,6 +272,40 @@ class DecisionAgent:
     def attempt(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision:
         raise NotImplementedError
 
+    def check_qualifiers(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities, decision: Decision) -> Decision:
+        """Qualifier coverage of every agent-compiled structured step (QA-01, ``qualifiers.py``).
+        Unapplied qualifiers are attached to the step and the decision; nothing is re-planned."""
+        if decision.outcome != "decided" or decision.plan is None or not decision.plan.structured_steps():
+            return decision
+        if request.aggregate is not None or request.scope is not None:
+            return decision  # the caller typed the operation: its scope is the caller's filters
+        from .qualifiers import NO_OPERATOR, qualifier_candidates, unapplied
+        from .values import ValueResolver
+
+        schema = capabilities.metadata_schema
+        backends = getattr(self.deps, "backends", None) or {}
+        resolver = ValueResolver(schema, backends.get("records"), ctx.generation, ctx.constraints())
+        candidates = qualifier_candidates(request.query, schema, resolver, intents)
+        known = {(u.constraint_text, u.reason) for u in decision.unsupported}
+        added: list[UnsupportedConstraint] = []
+        steps: list[RetrievalStep | StructuredStep] = []
+        for step in decision.plan.steps:
+            if isinstance(step, StructuredStep):
+                missing = unapplied(candidates, step.scope, request.filters, schema)
+                if not intents.aggregate():
+                    missing.append(NO_OPERATOR)
+                if missing:
+                    step = step.model_copy(update={"unapplied": [*step.unapplied, *missing]})
+                    for item in missing:
+                        if (item.constraint_text, item.reason) not in known:
+                            known.add((item.constraint_text, item.reason))
+                            added.append(item)
+            steps.append(step)
+        if not added:
+            return decision.model_copy(update={"plan": Plan(steps=steps)})
+        ctx.trace.event("qualifiers_not_applied", count=len(added), reasons=sorted({u.reason for u in added}))
+        return decision.model_copy(update={"plan": Plan(steps=steps), "unsupported": [*decision.unsupported, *added]})
+
     def decide(
         self, ctx: RunContext, request: DecisionRequest, intents: Intents | None, capabilities: Capabilities
     ) -> Decision:
@@ -277,6 +314,7 @@ class DecisionAgent:
         with ctx.trace.span("decision", agent=self.name, policy=on_failure) as span:
             try:
                 decision = self.attempt(ctx, request, intents, capabilities)
+                decision = self.check_qualifiers(ctx, request, intents, capabilities, decision)
             except DecisionFailure as failure:
                 span.event("decision_failed", category=failure.category, message=str(failure))
                 if on_failure == "raw_all_arms":

@@ -11,6 +11,7 @@ document is implemented unless a "current state" note says so. The package name 
 | 2026-11-03 | 1 | Initial draft from owner requirements, four historical inventories, current source at `36d2394`, shared notes §4–14 and §22–25. |
 | 2026-11-03 | 2 | Round-1 review (`docs/plans/reviews/v2_plan_review_r1.md`, verdict REVISE). All eight blocking findings resolved; 18 non-blocking findings addressed (none rejected). Phase 0 and Phase 1 re-scoped and re-estimated (contracts frozen in Phase 0; five arms, ingestion write path, review stage, answer contract, metadata schema, `doctor --probe`/CLI v2 added as rows); lexical acceptance replaced by per-engine conformance plus an agreement report; decision fail-policy table with defaults; `MetadataSchema` contract; grounding offset map, endpoint containment and `partial` policy defined; safe classifier-artifact contract; `ReviewStage` component; reproducible grounding acceptance; private-evaluation numbers removed; storage selectors, action/audit types, deferred-items list added. Totals re-computed (§4.1). |
 | 2026-11-03 | 3 | Phase 0 S2 kernel landed (`e4f2ff1`) and reviewed (`docs/plans/reviews/p0_s2_kernel_review.md`, REVISE → fixed in `v2/p0-s2-fix`). Frozen-contract text amended to match the code: §3.1a adds `MetadataSchema.unknown_fields`; §3.5 adds `Catalog.get_chunks`, `LedgerStore.get_raw`, `LexicalIndex.search -> PageResult[ScoredChunk]`, `VectorIndex` namespaces, the `Scope` (eligibility pushdown) vs `ScopeSpec` (typed query) split, per-capability adapter facets and per-`(adapter, capability)` status in the matrix; §5 narrows the N6 round-trip guarantee to the v1-effective subset and requires lossy upgrades to be reported. No other section changed. |
+| 2026-11-04 | 3 (amend) | 2.0.0a2 serving/config slice (QA-05): §3.5 `SessionStore.touch` gains `expected_version` (atomic compare-and-set on the new `SessionRecord.version`; `SessionConflict` on a lost race) and `SessionRecord` gains `version` and `reservations` (per-turn session-budget holds). Implemented on all five session stores; conformance kit `check_session` covers it. No other contract changed. |
 
 ## Review response (round 1)
 
@@ -385,7 +386,7 @@ class GraphStore(Protocol):   upsert(gen, entities, relations, memberships); tra
                               # Path carries edges with provenance, edge_kind and support; templated queries only; flag memberships
 class CacheStore(Protocol):   get(key) -> CacheEntry | None; put(key, value, ttl); invalidate(prefix) -> int   # key starts with GenerationId.prefix()
 class LedgerStore(Protocol):  append(job_id, entry); replay(job_id); mark(job_id, status); put_raw(key, raw_reply, valid); get_raw(key) -> RawReply | None
-class SessionStore(Protocol): create(record); get(session_id); touch(session_id, now, record=None); expire(now, ttl_seconds) -> int
+class SessionStore(Protocol): create(record); get(session_id); touch(session_id, now, record=None, expected_version=None); expire(now, ttl_seconds) -> int  # expected_version: atomic CAS on SessionRecord.version, SessionConflict on mismatch (2.0.0a2)
 ```
 
 Because the protocols share method names (`get`, `upsert`, `search`, `refresh`), an adapter exposes

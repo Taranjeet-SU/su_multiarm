@@ -54,7 +54,14 @@ class GenerationPointer(Protocol):
     """A backend that keeps its **own** persisted active-generation pointer next to the authoritative
     ``CURRENT`` of the catalog's generation registry (neo4j: one pointer node per dataset). The write
     path moves it just before the authoritative switch and moves it back if that switch fails; a
-    failed load never reaches it. Adapters still never read it on the request path."""
+    failed load never reaches it. Adapters still never read it on the request path.
+
+    Since 2.0.0a2 the built-in pointers (neo4j, OpenSearch/Elasticsearch aliases) also accept
+    ``activate_generation(gen, expected=<generation or None>)``, a compare-and-set that raises
+    ``WriteConflict(stale_base)`` and leaves the pointer unchanged when it names anything else. The
+    write path passes ``expected`` only when the adapter's signature has it; an injected pointer
+    without it is switched after a read-and-compare (not atomic; the write lease still excludes a
+    second writer)."""
 
     def activate_generation(self, gen: GenerationId) -> None: ...
 

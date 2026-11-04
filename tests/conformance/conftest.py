@@ -1,23 +1,25 @@
 """Conformance kit fixtures: every adapter on the contracts, built fresh per test.
 
 The in-memory fake and the sqlite adapter run on every push. The OpenSearch and Elasticsearch adapters
-run only under ``-m external`` against the throwaway stack in ``tests/services/``
+(marked ``external``) run against the throwaway stack in ``tests/services/``
 (``SU_TEST_OPENSEARCH_URL`` default ``http://127.0.0.1:19200``, ``SU_TEST_ELASTICSEARCH_URL`` default
-``http://127.0.0.1:19201``); each test uses its own index prefix and removes it afterwards.
+``http://127.0.0.1:19201``); each test uses its own index prefix and removes it afterwards. Under a
+plain ``pytest -q`` they skip with the reason when the variable is unset and the default stack does
+not answer (``tests/service_probe.py``, QA-16); a configured server that does not answer fails.
 """
 
 from __future__ import annotations
 
-import os
 import secrets
 
 import pytest
 
+from service_probe import require_search_service, service_url
 from su_multi_arm.backends.memory import MemoryBackend
 from su_multi_arm.backends.sqlite import SqliteBackend
 
-OPENSEARCH_URL = os.environ.get("SU_TEST_OPENSEARCH_URL", "http://127.0.0.1:19200")
-ELASTICSEARCH_URL = os.environ.get("SU_TEST_ELASTICSEARCH_URL", "http://127.0.0.1:19201")
+OPENSEARCH_URL = service_url("opensearch")
+ELASTICSEARCH_URL = service_url("elasticsearch")
 ADAPTERS = [
     "memory",
     "sqlite",
@@ -43,6 +45,8 @@ def elasticsearch_backend(prefix: str, knn_method: str = "exact", **kwargs):
 
 @pytest.fixture(params=ADAPTERS)
 def adapter_factory(request, tmp_path):
+    if request.param.startswith(("opensearch", "elasticsearch")):
+        require_search_service(request.param.split("_")[0])
     clock = {"now": 100.0}
     counter = {"n": 0}
     prefix = f"su_test_{secrets.token_hex(4)}"

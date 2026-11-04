@@ -29,6 +29,7 @@ from .base import (
     RoleSpec,
     SchemaViolation,
     Usage,
+    StrictSchemaError,
     strict_schema,
     tokens,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "check_role",
     "embedding_provider",
     "lookup",
+    "StrictSchemaError",
     "strict_schema",
     "supports_native",
     "tokens",

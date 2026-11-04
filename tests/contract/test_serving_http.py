@@ -73,6 +73,18 @@ def test_default_resolver_is_bearer_when_a_token_is_configured(monkeypatch, fake
         BearerTokenResolver("")
 
 
+@pytest.mark.parametrize("header", ["Bearer s3cret", "bearer s3cret", "BEARER s3cret", "BeArEr s3cret"])
+def test_bearer_scheme_is_case_insensitive(header):
+    """QA-12, RFC 9110 §11.1: the scheme is case-insensitive; the token is not."""
+    assert BearerTokenResolver("s3cret").resolve({"authorization": header}).id == "bearer"
+
+
+@pytest.mark.parametrize("header", ["", "Bearer", "Bearer ", "Bearer S3CRET", "Bearer s3cret2", "Basic s3cret", "Bearers3cret", "Token s3cret"])
+def test_bearer_resolver_refuses_wrong_scheme_or_token(header):
+    with pytest.raises(Unauthenticated):
+        BearerTokenResolver("s3cret").resolve({"authorization": header})
+
+
 def test_custom_resolver_scopes_and_acl(fake):
     engine = make_engine(fake.role(), acl=StaticPolicy(field="project", attribute="tenant"))
     client = TestClient(create_app(engine=engine, principal_resolver=HeaderResolver()))
@@ -272,3 +284,58 @@ def test_dependency_failures_map_to_5xx_not_422(fake, monkeypatch):
             response = client.post(route, json=REQUEST)
             assert response.status_code == status, (type(error).__name__, route, response.status_code)
             assert "private" not in response.text
+
+
+# --- conflicts (2.0.0a2 review B5) ---------------------------------------------------------------
+
+
+def test_write_conflict_on_ingest_delta_is_a_typed_409(fake):
+    engine = make_engine(fake.role(), actions={"allow": ["ingest_delta"]}, serving={"actions": {"allow": ["ingest_delta"]}})
+    client = TestClient(create_app(engine=engine, principal_resolver=HeaderResolver()))
+    admin = {"x-test-user": "admin"}
+    registry = engine.write_path.registry
+    assert registry.lease_acquire("another-writer", 60)  # a live lease held by another writer
+    doc = {**DOCS[0].model_dump(mode="json"), "id": "r9", "title": "new"}
+    response = client.post("/v2/actions/ingest_delta", json={"idempotency_key": "w1", "args": {"documents": [doc]}}, headers=admin)
+    assert response.status_code == 409
+    result = response.json()["result"]
+    assert result["status"] == "failed" and result["category"] == "write_conflict" and result["reason"] == "held"
+    assert result["error"] == "write_conflict" and "lock" not in response.text and "Conflict:" not in response.text
+    audit = [r for r in engine.audit.records() if r.idempotency_key == "w1"]
+    assert audit and audit[0].status == "failed" and audit[0].error  # the detail stays in the audit record
+    registry.lease_release("another-writer")
+    applied = client.post("/v2/actions/ingest_delta", json={"idempotency_key": "w2", "args": {"documents": [doc]}}, headers=admin)
+    assert applied.status_code == 200 and applied.json()["result"]["status"] == "applied"
+    invalid = client.post("/v2/actions/ingest_delta", json={"idempotency_key": "w3", "args": {}}, headers=admin)
+    assert invalid.status_code == 422 and invalid.json()["result"]["category"] == "invalid_request"
+    assert "ingest_delta needs" not in invalid.text
+
+
+@pytest.mark.parametrize("kind", ["write", "session"])
+def test_conflicts_on_read_routes_are_409_without_backend_text(fake, monkeypatch, kind):
+    from su_multi_arm.core.errors import SessionConflict, WriteConflict
+
+    engine = make_engine(fake.role())
+    client = TestClient(create_app(engine=engine, principal_resolver=HeaderResolver()))
+
+    def conflict(*args, **kwargs):
+        if kind == "write":
+            raise WriteConflict("elasticsearch", "lock", "private-host:9200 lease row", "held")
+        raise SessionConflict("session s-1 version 7 != 8 on private-host")
+
+    monkeypatch.setattr(engine, "search", conflict)
+    response = client.post("/v2/search", json=REQUEST, headers={"x-test-user": "admin"})
+    assert response.status_code == 409 and "private-host" not in response.text
+    expected = {"error": "write_conflict", "reason": "held"} if kind == "write" else {"error": "session_conflict", "reason": "cas_attempts_exhausted"}
+    assert response.json()["detail"] == expected
+
+
+def test_mcp_conflict_messages_are_typed():
+    from su_multi_arm.core.errors import SessionConflict, WriteConflict
+    from su_multi_arm.ingestion.write import IngestConflict
+    from su_multi_arm.serving.mcp import safe_message
+
+    conflict = WriteConflict("pg", "lock", "private-host detail", "lost")
+    assert safe_message(conflict) == "write_conflict: lost"
+    assert safe_message(IngestConflict({"category": "write_conflict:lost", "message": "private-host"}, conflict)) == "write_conflict: lost"
+    assert safe_message(SessionConflict("private-host")) == "session_conflict: cas_attempts_exhausted"

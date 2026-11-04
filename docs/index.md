@@ -13,7 +13,7 @@ merges their results, an optional review stage asks for what is missing, and an 
 refuses counts, exhaustive lists or absence claims that the evidence cannot back. Everything is
 declared in one YAML file; nothing is imported by name from configuration.
 
-!!! warning "Alpha (`2.0.0a1`)"
+!!! warning "Alpha (`2.0.0a2`)"
     Interfaces may still change. Relevance on real corpora has not been measured for v2 yet — see
     [Validation and honest status](#validation-and-honest-status).
 

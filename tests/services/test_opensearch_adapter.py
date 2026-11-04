@@ -6,29 +6,29 @@ rescore agreeing with exact search, and the records scan cap. Uses the stack in 
 
 from __future__ import annotations
 
-import os
 import secrets
 
 import numpy as np
 import pytest
 
+from service_probe import require_search_service
 from su_multi_arm.core.errors import BackendError
 from su_multi_arm.core.types import LexicalQuery, Predicate, Scope, ScopeSpec
 from su_multi_arm.testing import backend_conformance as kit
 
 pytestmark = pytest.mark.external
-URL = os.environ.get("SU_TEST_OPENSEARCH_URL", "http://127.0.0.1:19200")
 
 
 @pytest.fixture
 def backend():
     from su_multi_arm.backends.opensearch import OpenSearchBackend
 
+    url = require_search_service("opensearch")  # skip with the reason when unset and unreachable
     prefix = f"su_test_{secrets.token_hex(4)}"
     made = []
 
     def make(**kwargs):
-        made.append(OpenSearchBackend(URL, index_prefix=prefix, **kwargs))
+        made.append(OpenSearchBackend(url, index_prefix=prefix, **kwargs))
         return made[-1]
 
     yield make

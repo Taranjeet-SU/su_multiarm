@@ -282,7 +282,8 @@ def test_strict_never_absorbs_budget_or_provider_failures():
 def test_budget_exhaustion_is_a_stage_failure_under_partial():
     model = FakeModel(GOOD)
     cfg = llm_config("partial")
-    cfg = cfg.model_copy(update={"budgets": cfg.budgets.model_copy(update={"max_llm_calls": 2})})
+    ingest = cfg.budgets.ingest.model_copy(update={"max_llm_calls": 2})  # the whole-build cap, not the per-request one (QA-06)
+    cfg = cfg.model_copy(update={"budgets": cfg.budgets.model_copy(update={"ingest": ingest})})
     path, _ = write_path(cfg, extractor_model=model)
     manifest = path.ingest(documents(), allow_partial=True)
     assert "budget" in manifest["coverage"]["stages"]["extraction"]["reason"] and manifest["llm_calls"] and len(manifest["llm_calls"]) == 2

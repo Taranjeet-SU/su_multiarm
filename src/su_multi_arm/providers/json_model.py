@@ -55,6 +55,12 @@ class JsonModel:
     def text(self, system: str, payload: Any, budget: CallMeter, stage: str) -> str:
         return self.provider.complete_text(system, payload, budget, CallContext(stage))[0]
 
+    def enforces_schema(self) -> bool:
+        """The provider enforces the reply schema on the wire (native structured output: OpenAI
+        strict json_schema, Anthropic forced tool use), so enum restrictions in it bind the model."""
+        mode = getattr(self.provider, "structured_mode", None)
+        return callable(mode) and str(mode()).startswith("native:")
+
     def streams(self) -> bool:
         """The role declares ``capabilities.streaming`` (never for ``provider: none``)."""
         return self.provider.name != "none" and bool(getattr(self.provider.role, "streaming", False))

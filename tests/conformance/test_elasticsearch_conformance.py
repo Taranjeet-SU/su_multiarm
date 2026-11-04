@@ -21,6 +21,8 @@ from su_multi_arm.core.errors import BackendError
 from su_multi_arm.testing import backend_conformance as kit
 
 pytestmark = pytest.mark.external
+if not os.environ.get("SU_TEST_ELASTICSEARCH_URL"):
+    pytest.importorskip("elasticsearch")  # without the extra and without a configured server: skip; set: fail
 
 URL = os.environ.get("SU_TEST_ELASTICSEARCH_URL") or "http://127.0.0.1:19201"
 DECLARED = {"catalog", "lexical", "vector", "records"}
@@ -134,3 +136,39 @@ def test_exact_vector_scores_match_the_memory_fake(es_factory):
         results.append(adapter.vector.search(kit.GEN, query, kit.Scope(exclude_ids=["d2"]), 3))
     assert [h.chunk_id for h in results[0]] == [h.chunk_id for h in results[1]]
     assert all(abs(a.score - b.score) < 1e-5 for a, b in zip(*results))
+
+
+def test_write_lease_fencing_and_alias_compare_and_set(es_factory):
+    """Risk R1 on a real server: the lease document is created, renewed, taken over (only after
+    expiry) and deleted with ``if_seq_no``/``if_primary_term`` and only by its owner; activation
+    switches the aliases only from the expected generation (``must_exist`` removes)."""
+    from .lease_kit import check_compare_and_set, check_lease
+
+    backend = es_factory()
+    clock = es_factory.clock
+
+    def advance(seconds):
+        clock["now"] += seconds
+
+    check_lease(lambda: es_factory().generation_registry(), advance, backend.generation_registry().lock_ttl)
+    gen3 = kit.GEN.model_copy(update={"generation": "c" * 32})
+    for gen in (kit.GEN, kit.GEN2, gen3):
+        kit.seed(backend, gen)
+    manifests = [{"dataset": "conformance", "generation": g.generation, "index_format": 3, "fingerprint": g.fingerprint} for g in (kit.GEN, kit.GEN2, gen3)]
+    check_compare_and_set(backend.generation_registry(), manifests)
+    assert backend.active_generation("conformance") == kit.GEN2.generation
+
+
+def test_a_concurrent_alias_switch_fails_the_whole_request(es_factory, monkeypatch):
+    from su_multi_arm.core.errors import WriteConflict
+
+    backend = es_factory()
+    gen3 = kit.GEN.model_copy(update={"generation": "c" * 32})
+    for gen in (kit.GEN, kit.GEN2, gen3):
+        kit.seed(backend, gen)
+    backend.activate(kit.GEN2)
+    monkeypatch.setattr(backend, "active_generation", lambda dataset: kit.GEN.generation)  # stale read
+    with pytest.raises(WriteConflict):
+        backend.activate(gen3, expected=kit.GEN.generation)
+    monkeypatch.undo()
+    assert backend.active_generation("conformance") == kit.GEN2.generation

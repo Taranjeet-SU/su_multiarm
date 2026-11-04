@@ -569,6 +569,15 @@ class Turn(StrictModel):
     query_text: str | None = None
 
 
+class SessionReservation(StrictModel):
+    """Session budget held by one in-flight turn (``budgets.session``): the turn's clipped request
+    limits per kind, taken atomically at turn start and replaced by the actual usage at turn end. A
+    reservation whose turn never finished stops counting at ``expires_at``."""
+
+    amounts: dict[str, float] = Field(default_factory=dict)
+    expires_at: float
+
+
 class SessionRecord(StrictModel):
     id: str = Field(min_length=1)
     principal_id: str = Field(min_length=1)
@@ -581,3 +590,8 @@ class SessionRecord(StrictModel):
     # Cumulative usage of every turn (``Budget`` kinds: calls, input/output tokens, usd) for the
     # per-session budget (``budgets.session``).
     usage: dict[str, float] = Field(default_factory=dict)
+    # In-flight turns' session-budget holds, keyed by a random per-turn key.
+    reservations: dict[str, SessionReservation] = Field(default_factory=dict)
+    # Optimistic-concurrency version: every store write bumps it; ``SessionStore.touch`` with
+    # ``expected_version`` is a compare-and-set (``SessionConflict`` when another writer won).
+    version: int = Field(default=0, ge=0)

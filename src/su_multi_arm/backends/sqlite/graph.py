@@ -12,7 +12,7 @@ from ...core.errors import BackendError
 from .._scope import validated_hops
 from ...core.types import Entity, GenerationId, Membership, Occurrence, Path, PathEdge, Provenance, Relation, Scope, Span, TraversalSpec
 from ._db import KIND, dumps, placeholders, scope_sql
-from .search import tokens
+from ...providers import tokens  # casefolded entity-name tokens (the graph arm folds the same way)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .adapter import SqliteBackend

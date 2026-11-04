@@ -23,7 +23,19 @@ MAX_TERMS = 128
 
 
 def tokens(text: str) -> list[str]:
-    return re.findall(r"\w+", text.casefold())
+    """Query terms, **not** case-folded here (QA-07). Every term is passed to FTS5 as a quoted string,
+    which FTS5 re-tokenises with the same ``unicode61`` tokenizer the text was indexed with, so case
+    and diacritic folding is exactly the index's. ``str.casefold`` would fold beyond ``unicode61``
+    (``ß``->``ss``, ``ﬁ``->``fi``) and the query could never match its own indexed word."""
+    return re.findall(r"\w+", text)
+
+
+def _distinct(terms: list[str]) -> list[str]:
+    """Drop repeated terms (``str.lower`` only: it keeps ``ß`` and ligatures, like ``unicode61``)."""
+    seen: dict[str, str] = {}
+    for term in terms:
+        seen.setdefault(term.lower(), term)
+    return list(seen.values())
 
 
 def _quoted(term: str) -> str:
@@ -32,7 +44,7 @@ def _quoted(term: str) -> str:
 
 def fts_expression(query: LexicalQuery) -> str | None:
     """Fixed FTS5 templates; every user term is quoted, never interpreted as syntax."""
-    terms = list(dict.fromkeys(tokens(query.text)))[:MAX_TERMS]
+    terms = _distinct(tokens(query.text))[:MAX_TERMS]
     if query.kind == "phrase":
         return _quoted(" ".join(terms)) if terms else None
     if not terms:

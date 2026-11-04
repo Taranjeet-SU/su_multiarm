@@ -285,7 +285,7 @@ MAPPING: tuple[tuple[str, str], ...] = (
     ("community.strategy / min_documents / seed / prompt", "communities.*"),
     ("chunk_size / chunk_overlap / field_order", "ingestion.chunking.size / overlap / field_order"),
     ("input_mapping", "ingestion.input_mapping"),
-    ("max_llm_calls", "budgets.max_llm_calls"),
+    ("max_llm_calls", "budgets.max_llm_calls (per request) + budgets.ingest.max_llm_calls (whole build; v1 applied one cap to both)"),
     ("privacy", "privacy"),
 )
 # v1 ``per_arm`` is the v2 default ``reciprocal_rank`` (plan §3.9); ``rrf`` keeps its own formula.
@@ -507,7 +507,13 @@ def upgrade(v1: Config, present_keys: set[str] | None = None, *, strict: bool = 
             "chunking": {"size": v1.chunk_size, "overlap": v1.chunk_overlap, "field_order": v1.field_order},
             "input_mapping": None if v1.input_mapping is None else v1.input_mapping.model_dump(),
         },
-        "budgets": {"max_llm_calls": v1.max_llm_calls},
+        # v1 used one ``max_llm_calls`` both per request and as the cap of a whole ingestion build.
+        # v2 separates them (QA-06): an explicitly set v1 value becomes both caps (the build keeps the
+        # limit the operator chose); an unset one leaves the v2 ingest default.
+        "budgets": {
+            "max_llm_calls": v1.max_llm_calls,
+            **({"ingest": {"max_llm_calls": v1.max_llm_calls}} if "max_llm_calls" in v1.model_fields_set else {}),
+        },
         "privacy": v1.privacy.model_dump(),
     }
     config = validate_config(data)
@@ -535,9 +541,13 @@ def upgrade_mapping(data: dict[str, Any], *, strict: bool = False) -> UpgradeRes
     return upgrade(v1, present_keys=set(data), strict=strict)
 
 
-def upgrade_text(text: str, *, strict: bool = False) -> tuple[str, UpgradeResult]:
+def upgrade_text(
+    text: str, *, strict: bool = False, source_dir: Path | None = None, target_dir: Path | None = None
+) -> tuple[str, UpgradeResult]:
     """YAML in, YAML out (what ``config upgrade`` writes). Lossy settings are written as WARNING
-    comments at the top of the file (or refused with ``strict=True``)."""
+    comments at the top of the file (or refused with ``strict=True``). With ``source_dir`` and
+    ``target_dir`` (the directories of the v1 file and of the output file), relative paths are
+    rebased so the written file names the same state, prompts and tables (QA-10)."""
     data = yaml.safe_load(text) or {}
     if not isinstance(data, dict):
         raise ConfigError("configuration must be a mapping", "<root>")
@@ -545,6 +555,12 @@ def upgrade_text(text: str, *, strict: bool = False) -> tuple[str, UpgradeResult
         raise ConfigError("only schema_version 1 configs can be upgraded", "schema_version")
     result = upgrade_mapping(data, strict=strict)
     header = "# Upgraded from schema_version 1 by `su-multi-arm config upgrade`.\n"
+    if source_dir is not None and target_dir is not None:
+        from ..core.config import rebase_paths
+
+        rebased = rebase_paths(result.data, source_dir, target_dir)
+        if rebased:
+            header += f"# Relative paths rebased to this file's directory: {', '.join(rebased)}\n"
     if result.warnings:
         header += "".join(f"# WARNING: {w}\n" for w in result.warnings)
     return header + yaml.safe_dump(result.data, sort_keys=False, allow_unicode=True), result
@@ -607,7 +623,7 @@ def downgrade(v2: "ConfigV2") -> Config:
         chunk_size=v2.ingestion.chunking.size,
         chunk_overlap=v2.ingestion.chunking.overlap,
         field_order=list(v2.ingestion.chunking.field_order),
-        embedding=EmbeddingConfig(**roles.embedder.model_dump()),
+        embedding=EmbeddingConfig(**roles.embedder.model_dump(exclude={"pricing_key"})),
         extraction=ExtractionConfig(
             providers=["tags" if e == "gazetteer" else e for e in v2.extraction.extractors],
             grounding=GroundingConfig(**v2.extraction.grounding.model_dump()),

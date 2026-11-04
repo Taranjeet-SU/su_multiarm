@@ -53,10 +53,19 @@ extraction or embedding model does.
 
 ### Model providers and the capability registry
 
-Chat roles (`models.roles.planner|reviewer|extractor|generator|community|judge|cache_gate`) take
+Chat roles (`models.roles.planner|reviewer|extractor|generator|community`) take
 `provider: anthropic | openai | openai_compatible` (a role that is not configured is `none`: a stage
 that needs it fails with a typed error). API keys are read only from the environment variable named
 by `api_key_env` (required for `anthropic` and `openai`); no key is ever stored in a config.
+`models.roles.judge` and `models.roles.cache_gate` are refused with "not implemented in this release"
+until the evaluation harness (Phase 4) and the cache arm (Phase 2) consume them.
+
+A key is required at engine construction only when ingest or the default pipeline's own decision
+mode needs it. The key of a role used only by a named (non-default) pipeline or a non-default
+request mode, such as an `openai` planner of a `planned` pipeline, is checked when a request first
+selects that pipeline/mode: unset, the request fails with `MissingSecret` before any work (HTTP 502);
+`ingest` and requests on other pipelines run without it. `doctor` lists every unset key under
+`missing_keys` (`{"pipeline:<name>": {"<role>": ["<VAR>"]}, "ingest": {...}}`).
 
 Each role declares what it relies on under `capabilities`, and validation checks the declaration
 against the per-`(provider, model-pattern)` registry in `su_multi_arm/providers/capabilities.py`:
@@ -74,9 +83,19 @@ provider reports and claims no control. `reasoning_effort` is accepted only for 
 reasoning models (`o1*`, `o3*`, `o4-mini*`, `gpt-5*`) and for `openai_compatible` (sent as
 `reasoning_effort`). `openai` always uses `max_completion_tokens`; `anthropic` always uses
 `max_tokens`; `max_tokens_parameter` applies to `openai_compatible` servers. An undeclared
-capability fails validation with the key path; nothing is downgraded at run time (a strict OpenAI
-call with a schema that contains free-form mappings, such as the planner's `filters`, fails before
-any request — declare `json_schema` for that role).
+capability fails validation with the key path; nothing is downgraded at run time. For OpenAI
+`native` (strict `json_schema`) roles, validation and `doctor --probe` also convert every schema the
+role sends (planner `LlmPlan`, generator `Answer`, reviewer `Review`, extractor `Extraction`,
+community `CommunityReport`) to strict form and reject the role when one is not strict-expressible.
+Strict form refuses (typed `StrictSchemaError`, before any request) every keyword outside the
+supported set (`type`, `properties`, `required`, `additionalProperties: false`, `items`, `enum`,
+`const` with a sibling `type`, `anyOf`, `$ref`, `$defs`, `description`, `pattern`, `format`,
+`minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+`multipleOf`, `minItems`, `maxItems`; `title`/`default` are dropped): so `oneOf`, `allOf`,
+`discriminator`, `uniqueItems`, a typeless `const`, an `anyOf` mixed with other constraining keywords
+or at the root, and free-form mappings are refused — declare `json_schema` for such a role. Every
+schema the package sends is strict-expressible as of 2.0.0a2 (the planner's step filters are a list of
+`{field, value}` pairs and a step is one flat object rather than a discriminated union).
 
 Every call is strict: one HTTP request, no automatic retry, no repair call. 401/403, 429, 5xx,
 timeouts, connection errors, non-JSON bodies, truncation (`max_tokens`/`length`), refusals and a
@@ -113,11 +132,11 @@ models:
       api_key_env: OPENAI_API_KEY
       max_tokens: 2048
       capabilities: {structured_output: native, prompt_caching: passive}
-    planner:                            # LlmPlan has free-form filters: not strict-expressible
+    planner:                            # LlmPlan is strict-expressible since 2.0.0a2
       provider: openai
       model: gpt-4.1-mini
       api_key_env: OPENAI_API_KEY
-      capabilities: {structured_output: json_schema}
+      capabilities: {structured_output: native}
 ```
 
 Local OpenAI-compatible server (Ollama `/v1`, vLLM, llama.cpp server, LM Studio):
@@ -170,7 +189,7 @@ names its own backend. In this release the engine wires these kinds on the froze
 
 | Kind | Capabilities | Notes |
 |---|---|---|
-| `sqlite` (local default) | all eight | `path` (state directory), `vector_engine: numpy|faiss`, `timeout_seconds`. Per generation: `snapshots/<gen>/catalog.sqlite` (documents, chunks, FTS5 `unicode61`, typed field rows for scope pushdown, records, mentions, relations with provenance and occurrences, memberships, communities) plus `vectors.npy`/`chunk_ids.json` (and `vectors.faiss`); `runtime.sqlite` holds the cache, the ingestion ledger with raw model replies and sessions. `CURRENT` and `manifest.json` are owned by the generation registry, never read by the adapter. |
+| `sqlite` (local default) | all eight | `path` (state directory), `vector_engine: numpy|faiss`, `timeout_seconds`. Per generation: `snapshots/<gen>/catalog.sqlite` (documents, chunks, FTS5 `unicode61` — the query is tokenised and case-folded by the same tokenizer as the text, so `Straße` and `ﬁle` match their own words but not `strasse`/`file`, typed field rows for scope pushdown, records, mentions, relations with provenance and occurrences, memberships, communities) plus `vectors.npy`/`chunk_ids.json` (and `vectors.faiss`); `runtime.sqlite` holds the cache, the ingestion ledger with raw model replies and sessions. `CURRENT` and `manifest.json` are owned by the generation registry, never read by the adapter. |
 | `memory` | all eight | In-process fake for tests and contract suites; not persistent. |
 | `postgres` (extra `postgres`, psycopg 3; pgvector for vectors) | `catalog`, `lexical`, `vector`, `records`, `cache`, `ledger`, `session` | `dsn_env` (environment variable holding the DSN; never the DSN itself), `table_prefix`, `text_search_config` (default `english`), `vector` (`index: exact\|hnsw`, `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `min_filter_recall`, default 0.95), `timeout_seconds` (connect timeout and `statement_timeout`). **One schema per generation**, `<prefix>_<dataset>_<generation>` when that fits PostgreSQL's 63-byte identifier limit and the dataset is a lowercase identifier, otherwise `<prefix>_g<sha256(dataset/generation)[:20]>`; it holds documents, chunks, typed field rows (native `double precision` and `timestamptz` columns), records, the FTS table and the pgvector tables, and `delete_generation` is one `DROP SCHEMA ... CASCADE`. Schema `<prefix>` holds `generations` (dataset, generation, schema name, text-search configuration, metadata schema), `meta` (the `CURRENT` pointer row, replaced by a single-row upsert only by `activate`; failed builds write `failure:<gen>` and never touch it; manifests), `cache`, `ledger`, `jobs`, `raw_replies`, `sessions`. The write lock is a session-level `pg_try_advisory_lock` (held = typed error, never a wait). Typed scope, ACL predicates and id allow/deny lists compile to bound-parameter `EXISTS` subqueries; temporal values compare as UTC instants (naive = UTC, dates by calendar day); `values` is `SELECT DISTINCT` under `max_values_cardinality` (10000; more is a typed error). Lexical: title and body `tsvector`s built with the generation's recorded configuration (`analyzer_id` `pg_ts_<config>`); terms = any term, `phrase` = `phraseto_tsquery` per column, `boolean` = terms plus `must` phrases minus `must_not` phrases; every user token is a bound parameter, never tsquery syntax; scores are `2*ts_rank_cd(title)+ts_rank_cd(body)`, **not BM25**; stop words never match and stemming conflates inflections (FTS5 differs). Vector: L2-normalised, inner product = cosine; **exact** by default (scope in the `WHERE` clause, order `(distance, chunk_id)`); `vector.index: hnsw` builds a partial HNSW index per namespace at `refresh` and then measures recall@10 of the forced index path against exact search (unfiltered and with an allow-list filter); below `min_filter_recall` the refresh fails with a typed error so that build never activates; HNSW searches use `hnsw.iterative_scan = strict_order` (pgvector >= 0.8). Up to 2000 dimensions with HNSW, 16000 exact. `graph` is `planned`. |
 | `sqlalchemy` (extra `sql`, SQLAlchemy 2 + driver) | `catalog`, `records`, `cache`, `ledger`, `session` | `url_env` (environment variable holding the SQLAlchemy URL, e.g. `sqlite:///state/rel.db` or `postgresql+psycopg://...`), `table_prefix`, `timeout_seconds`. SQLAlchemy Core only (portable types, delete+insert instead of dialect upserts). Per generation: tables `<prefix>_<token>_{docs,chunks,dfields,records,rfields}` with `token = sha256(dataset/generation)[:12]` (the readable name does not fit the 63/64-byte identifier limits; `<prefix>_generations` maps it); runtime tables `<prefix>_{generations,meta,cache,ledger,jobs,raw_replies,sessions}`; `CURRENT` pointer row replaced in one transaction only by `activate`; write lock = lease row (held = typed error; a lease older than 600 s is taken over). Temporal values are stored as UTC epoch seconds (no portable timezone-aware type). Ids are limited to 512 characters (typed error beyond). **Tested dialects: SQLite and PostgreSQL** (the conformance kit runs on both); any other dialect builds and `ping()` reports `dialect_tested: false` — MySQL/MariaDB in particular compare text with the column collation (usually case-insensitive), which would change `eq`. `lexical` and `vector` are dialect-specific and `planned`; configuration naming them is rejected. |
@@ -338,7 +357,55 @@ projection left for cleanup; `status` lists them.
 No policy drops a unit silently or turns a rejected relation into a fact. Provider or budget failures
 are never quarantined under `strict` or `quarantine`. Validated extraction outputs and every raw
 model reply (valid or not) are kept in the ledger, so an unchanged chunk is reused across builds
-without inference (`reused_extractions` in the manifest).
+without inference (`reused_extractions` in the manifest). Embeddings are reused the same way: a
+chunk whose exact embedded input (title, field name and text) and embedding recipe (provider, model,
+revision, dimensions, endpoint, `document_prefix`, normalisation) were embedded before is not sent
+to the embedder again (`embedded` / `reused_embeddings` in the manifest). A title change re-embeds
+that document's chunks; a recipe change re-embeds everything. The manifest's `incremental` entry
+states what is still rebuilt on an upsert (catalog, lexical, records, vector rows, graph,
+communities and community reports).
+
+#### Ingestion budget (`budgets.ingest`)
+
+```yaml
+budgets:
+  max_llm_calls: 12            # per request (search/answer), never applied to ingestion
+  price_table: prices.yaml     # required for any max_usd
+  ingest:                      # one whole build (ingest, upsert, the ingest_delta action)
+    max_llm_calls: 10000       # extraction + community-report calls; null = no cap
+    max_embedding_calls: null  # embedding provider requests (one per batch_size window with a new input)
+    max_usd: null              # LLM + embedding spend of the build
+```
+
+Every LLM call on the write path reserves one call, its input estimate, the `max_tokens` ceiling and
+(when priced) the USD of that estimate before it is sent, and commits the provider-reported usage
+afterwards; an embedding request reserves one call and the USD of a chars/4 input estimate. Local
+embedders (`hash`, `sentence_transformers`) cost nothing; a hosted embedder is priced by
+`models.roles.embedder.pricing_key` (default: its model id). With `ingest.max_usd` set, every role
+that can spend on the write path (the LLM extractor, the community role, a hosted embedder) must be
+priced in the table — otherwise engine construction fails with `ConfigError`. Exhaustion stops the
+stage with category `budget` (the build fails under `strict`/`quarantine`; under `partial` the stage
+is `incomplete` and needs `--allow-partial`); nothing is downgraded or retried. The manifest's
+`budget` entry reports the limits, LLM calls, embedding calls, committed USD and any exhaustion.
+
+**A hosted embedder needs an explicit cap (2.0.0a2).** When the dense arm is enabled and the
+embedder bills per call (`provider: openai`, or `openai_compatible` on a host other than
+`localhost`/`127.0.0.1`/`::1`), engine construction fails with `ConfigError` (`budgets.ingest`)
+unless `budgets.ingest.max_usd` (with `budgets.price_table`) or `budgets.ingest.max_embedding_calls`
+is set. There is no implicit default cap.
+
+**Upgrade from v1.** v1 had one `max_llm_calls`, used both per request and as the cap of a whole
+build. `config upgrade` maps it to `budgets.max_llm_calls`; when the v1 file sets it explicitly it is
+also written to `budgets.ingest.max_llm_calls` (the build keeps the cap the operator chose); an unset
+v1 value leaves the v2 ingest default (10000).
+
+#### Concurrent writers
+
+One build at a time holds a dataset's write lease; a second `ingest` is refused immediately with
+`WriteConflict` (`write lock is held by another writer`) and should be retried after the first one
+finishes. A build whose lease was lost (its process stalled past the lease expiry and another writer
+took over) or whose starting generation is no longer `CURRENT` fails with `IngestConflict`
+(failure category `write_conflict:lost|stale_base`) and never activates; retry it.
 
 ## Input mapping and redaction
 
@@ -445,6 +512,25 @@ header values are rejected. MCP uses the structured argument. No-context calls r
 Explicit request filters cannot be overridden by the planner. Planner step filters must name a
 `metadata_schema` field marked `filterable` (or `id`/`source`/`dataset`/`kind`) and only narrow the request.
 
+Request filters are validated against `metadata_schema` before anything executes (search, answer,
+stream, the `aggregate` tool, HTTP and MCP alike):
+
+| Filter | Outcome |
+|---|---|
+| declared field, valid value | applied as typed equality |
+| unambiguous coercion: `"3"` on an `integer` field, `"2.5"` on `number`, `"true"`/`"false"` on `boolean`, an integer on a `string`/`id` field | coerced, applied, recorded in `trace.request_filters.coercions` (field and kind only) |
+| type mismatch (`"high"` on an integer, `true` on an integer), value outside an `enum` | `UnsupportedConstraint` (`type_mismatch` / `value_not_observed`) |
+| a `string`/`id` value on a `listable` field under its `max_catalog_cardinality` that no record holds (a typo, or the wrong case on a case-sensitive field) | applied as given, but reported as `UnsupportedConstraint` (`value_not_observed`); the aggregate is `bounded`, so a zero count or an absence claim on it is refused (2.0.0a2) |
+| `datetime`/`date` value that does not parse, or lacks an offset under `require_offset` | `UnsupportedConstraint` (`unparseable_bound` / `timezone_missing`); a valid one is pushed down as given |
+| undeclared field, `unknown_fields: allow` (default) | applied as **untyped string equality**, listed in `trace.request_filters.untyped`, and reported as `UnsupportedConstraint` (`field_not_filterable`) |
+| undeclared field, `unknown_fields: reject` | `UnsupportedConstraint` (`field_not_filterable`) |
+
+An invalid filter is never dropped (the scope never silently widens): it is applied as given, so it
+usually matches nothing, and every aggregate computed under it is reported `bounded` with the
+constraint attached (a typed `aggregate` request with such a filter abstains in the decision). An
+invalid filter therefore never yields an exact zero, and the answer contract refuses a count or
+absence answer built on it.
+
 A structured aggregate request:
 
 ```json
@@ -462,7 +548,8 @@ the same way, and `eq`/`in`/`range`/`date_interval` compare instants, never text
 compares calendar dates: a datetime bound (or value) is truncated to its UTC date, so `day >=
 2024-03-06T15:00:00+00:00` means `day >= 2024-03-06`. An unparseable bound is reported as
 `unparseable_bound`, a naive bound on a `require_offset` field as `timezone_missing`; neither is ever
-applied. The intent grammar of the `rules` decision agent fires `total`, `list`, `absence`,
+applied. The intent pre-pass (run by the engine for every decision agent and every surface, with the
+deployment's targets since 2.0.0a2) fires `total`, `list`, `absence`,
 `earliest` and `latest` only next to a structured target (the canonical unit, a declared field name
 or a `time_basis` label); "all the steps", "the latest release notes" or "every time the service
 restarts" are ordinary retrieval questions. Explicit count phrases ("how many", "number of") always
@@ -470,8 +557,11 @@ count as aggregate intent.
 
 Supported operations: `count`, `group_count`, `first_seen`, executed by the `structured` arm as a typed
 `ScopeSpec` through the `RecordStore`. The aggregate carries `value`, `missing_or_invalid`,
-`document_ids`, `exactness` (always `exact` on sqlite/memory), `denominator` (the eligible population
-after filters and ACL), `zero_match` and `unsupported` constraints. Fields must be declared in
+`document_ids`, `exactness` (`exact` on sqlite/memory unless the engine bounds it: an unapplied
+question qualifier or an invalid request filter makes it `bounded`), `denominator` (the eligible
+population after filters and ACL), `zero_match`, `unsupported` constraints, `filters` (the typed
+request and step filters) and `predicates` (the compiled scope predicates actually counted; the same
+list is in `trace.steps[].predicates`, and the exported trace masks their values). Fields must be declared in
 `metadata_schema` (`id`, `source`, `dataset`, `kind` are always available). Missing/invalid timestamps
 are counted; valid timestamp values need an explicit timezone. A natural-language keyword does not
 secretly filter records. Unsupported filters/count scopes need clarification in the application.
@@ -516,12 +606,12 @@ the `su_multi_arm.components` group; nothing else can name code), `backends` (na
 `communities`), `metadata_schema` (typed fields: `string|integer|number|boolean|datetime|date|enum|id`,
 with `filterable`, `listable`, `groupable`, `sortable`, `nullable`, `enum_values`, `time_basis`,
 `timezone_policy`, `casefold_match`, `max_catalog_cardinality`), `models.roles` (`planner`,
-`reviewer`, `extractor`, `generator`, `community`, `judge`, `cache_gate`, `embedder`, `reranker`;
+`reviewer`, `extractor`, `generator`, `community`, `embedder`, `reranker`;
 each chat role declares `capabilities.structured_output` and `prompt_caching`, and an optional
 `pricing_key`), `pipeline` (`decision`, `arms`, `selection`, `review`, `guards`, `generation`,
 `concurrency`), `extraction`, `communities`, `ingestion` (`chunking`, `input_mapping`), `sessions`,
 `budgets` (`max_llm_calls`, token limits, `max_usd` with an operator-supplied `price_table`,
-`deadline_seconds`), `privacy` (adds `trace_masking`), `request` (context keys and canonical fields)
+`deadline_seconds`, the whole-build `ingest` limits), `privacy` (adds `trace_masking`), `request` (context keys and canonical fields)
 and `serving`.
 
 Validation is static and fails closed with the dotted key path: unknown keys; an arm or storage slot
@@ -553,11 +643,15 @@ The mapping is the table in `compat/config_v1.py::MAPPING` (the v1 built-in supp
 `graph` backend; `routing.mode raw|planned|agentic` → `pipeline.decision {kind: rules|llm}` plus
 `pipeline.review.enabled`; `fusion.strategy rrf` → `selection.ordering reciprocal_rank`;
 `extraction.providers tags` → `extractors gazetteer`; `arms.sql_fields` → `metadata_schema.fields` of
-type `string` with a warning to declare real types; `max_llm_calls` → `budgets.max_llm_calls`).
+type `string` with a warning to declare real types; `max_llm_calls` → `budgets.max_llm_calls`, and also `budgets.ingest.max_llm_calls` when set explicitly).
 Loading a v1 file with the v2 loader emits one warning listing the applied mappings. Settings v2
 cannot carry (a `provider: none` model block with non-default fields, an `evidence_char_budget` for
 a stage without a model) are reported as `lossy_upgrade` warnings — never dropped silently — and
-`config upgrade --strict` refuses them. The upgrade is
+`config upgrade --strict` refuses them. Paths in a config are relative to the YAML file, so
+`config upgrade --output` rewrites every relative path (`backends.<sqlite>.path`, `prompt_file`,
+`alias_map`, `price_table`) for the output file's directory and lists them in a header comment;
+absolute and `~` paths are kept. Printed to stdout (no `--output`) the paths stay as written, so save
+that output next to the v1 file. The upgrade is
 deterministic, and `compat.config_v1.downgrade(upgrade(v1))` reproduces the v1 `index_fingerprint()`,
 so an upgraded config can still open its existing v1 generation (checked for every shipped example).
 
@@ -575,7 +669,28 @@ a declared numeric field named in the question and is never answered with a reco
 through a strict per-arm step schema (only a `structured` step carries a scope), sees observed values
 only for listable fields under `max_catalog_cardinality`, and every step is validated (enabled arm,
 filterable field, no override of request filters, values resolved through the schema and
-`RecordStore.exists`). `classifier` is interface-only: it maps a question to one non-structured arm,
+`RecordStore.exists`).
+
+Qualifier coverage (every agent, 2.0.0a2): a structured step an agent compiled from the question must
+account for every qualifier in it. Candidates are found deterministically (English): an observed value
+of a listable filterable field or an enum value that occurs verbatim in the question, a calendar
+expression (a year, an ISO date, a month with a day or year, a quarter, `yesterday`/`today`,
+`last|this|past|previous <unit>`), a quoted phrase, and a filterable field named next to a value of
+its type (2.0.0a2: `priority 3`, `version 2.1`, `severity high`, `priority is 3`, `priority above 2`;
+a number for `integer`/`number`, `true`/`false`/`yes`/`no` for `boolean`, a word for `string`/`id`,
+an enum value for `enum`; a `boolean` field named alone, "escalated tickets", counts too). A field
+qualifier is applied by a predicate or request filter that constrains that field to that value (a
+comparison word or a bare boolean field: any predicate on the field). A candidate is applied when a predicate or a
+request filter on a field holding that value constrains it to that value (a calendar expression: any
+predicate on a declared `datetime`/`date` field; a quoted phrase: a predicate value equal to it). A
+structured step on a question without any aggregate operator is flagged as a whole. Every unapplied
+candidate is an `UnsupportedConstraint` with reason `qualifier_not_applied`, the step's aggregate is
+reported `bounded`, and the answer contract then refuses count, exhaustive-list and absence claims on
+it. Nothing is re-planned. Caller-typed scopes (`aggregate` in the request) are the caller's and are
+not checked. Limitation: free-text topic words of an aggregate question ("how many CloudTax tickets
+mention rounding") are not candidates for `llm` (the `rules` agent refuses residual words itself).
+
+`classifier` is interface-only: it maps a question to one non-structured arm,
 never produces a scope, ships without weights and defaults off; it accepts only an ONNX `artifact`
 pinned by `sha256` with a `manifest` (`features`, `labels` = arm names, `threshold`) or a plugin
 `component`, and an inference runtime must be injected through the Python API. `cascade` runs
@@ -607,15 +722,48 @@ Stop reasons are `sufficient`, `no_actionable_gap`, `repeated_query`, `hop_limit
 decision agent with the same filters, ACL and pinned generation, and a re-plan that is not
 `decided` (including `raw_all_arms`) stops the loop. New hits merge with one vote per record per arm.
 
-`pipeline.generation.contract.on_violation` (`abstain_with_reason` default, `fail`) governs the
-answer contract: every citation must be supplied evidence; `count`, `exhaustive_list` and `absence`
-claims need an aggregate evidence whose `ScopeResult` is exact (absence also exhaustive); under an
-aggregate intent with no exact scope the answer may not carry a count or exhaustive-list claim and
-`unsupported_constraints` is non-empty; a factual answer needs citations. `unsupported_constraints`
-is populated by the engine from the decision and the scope results — the generator cannot set it.
-`AnswerResult` keeps the v1 fields and adds `unsupported_constraints`, `coverage` (from the pinned
-generation's manifest under `quarantine`/`partial`), `violations` and `contract` (`passed` |
-`abstained`); `SearchResult` adds `unsupported_constraints`. Both traces carry `decision` (agent,
+`pipeline.generation.contract.on_violation` (`abstain_with_reason` default, `strip`, `fail`) governs
+the answer contract: every citation must be supplied evidence; `count`, `exhaustive_list` and
+`absence` claims need an aggregate evidence whose `ScopeResult` is exact (absence also exhaustive and
+empty: a zero count, an empty list); under an aggregate intent with no exact scope the answer may not
+carry a count or exhaustive-list claim and `unsupported_constraints` is non-empty; a factual answer
+needs citations and non-empty text.
+
+The **answer text** is checked too (2.0.0a2). A deterministic, English-only detector finds count
+statements (a number followed within three content words by a unit noun — the canonical unit, the
+generic record words, common record nouns such as tickets/cases/issues, and the nouns after "how
+many"/"number of"/"list all" in the question — or "a total of N"), exhaustive-list statements
+("complete/full list", "these are all the <units>", "the only <units>", "no other <units>"; under a
+`list` intent also "are as follows" and an enumeration of two or more items) and absence statements
+("there are no <units>", "no <units> were found", "none of the <units>", "zero <units>"). Numbers that
+are part of identifiers, versions, dates, times, decimals or percentages, numbers separated from the
+unit by a function word ("2 decimal places for invoices"), and number-and-unit phrases quoted verbatim
+from a supplied passage are not statements. Every statement needs a typed claim of the same kind (an
+absence statement may use a `count` claim) backed by an exact scope; otherwise the violation is
+`answer_text_without_exact_scope`. A backed count statement must also state the value of the exact
+aggregate its count claim cites (a scalar value, a group count, or the population after "of" as in
+"12 of 36 records"); a different number is `answer_number_mismatch`. Precision exclusions: a number
+other than one directly before a singular unit is a label ("a 404 error"); a number right after a
+product-like capitalised name is a version ("Windows 10 users"); a unit followed by a head noun it
+modifies is not the counted population ("there is no error message"); "the only <unit>" needs a
+plural unit; "complete list of <noun>" needs `<noun>` to be a unit. Answers in other languages are
+checked on their typed claims only.
+
+Violation handling: `abstain_with_reason` returns `insufficient_evidence: true` with the violated
+rules. One exception keeps narrative answers usable with small models: when the answer text states no
+count, list or absence, a non-narrative claim the rules reject is **stripped** from `claims` (its
+citations too unless still used) and the narrative answer is returned with `contract: stripped` and the
+violation recorded with `action: strip`. `strip` additionally removes the sentences that carry an
+unbacked statement (abstaining when nothing remains). `fail` raises on any violation. Unknown evidence
+ids, missing citations and an empty answer always abstain. With native structured output the generator
+schema is narrowed per request: cited ids are an enum of the supplied evidence ids, and non-narrative
+claim kinds are offered only when aggregate evidence was supplied.
+
+`unsupported_constraints` is populated by the engine from the decision, the request-filter validation
+and the scope results — the generator cannot set it. `AnswerResult` keeps the v1 fields and adds
+`unsupported_constraints`, `coverage` (from the pinned generation's manifest under
+`quarantine`/`partial`), `violations` (`rule`, `detail`, `action`) and `contract` (`passed` |
+`stripped` | `abstained`); `SearchResult` adds `unsupported_constraints`. Both traces carry `decision` (agent,
 outcome, policy, failure category, `decision_fallback`), `selection` (effective policy), `reasons`
 per record, `model_calls` and, for answers, `review` rounds, `evidence` packing and `contract`.
 
@@ -652,7 +800,15 @@ own artifact/component; `cascade` is only the pipeline's own cascade. Traces rec
 `mode`.
 
 Validation runs every check and reports **all** problems at once (`ConfigError.diagnostics`, path of
-the first in `ConfigError.path`): backend kinds available; every `storage` slot names a backend that
+the first in `ConfigError.path`). Schema-level problems (unknown keys, wrong types, values out of
+range, unimplemented keys) are aggregated the same way, one `Diagnostic` per pydantic error with its
+key path. The CLI prints one `error: ...` line (for configuration errors one indented
+`<path>: <message>` line per problem) and exits 2 for an invalid configuration, 3 when the index is
+not ready and 1 for any other failure; `--debug` shows the Python traceback instead.
+Keys for features that do not exist in this release are refused rather than accepted and never read:
+`extraction.ontology` (Phase 3), `models.roles.judge` (Phase 4), `models.roles.cache_gate` and
+`pipeline.arms.cache` (Phase 2), `sessions.memory.semantic`, and non-empty `guards`. The semantic
+checks are: backend kinds available; every `storage` slot names a backend that
 serves it; every arm of every pipeline names a backend whose adapter serves the arm's capability;
 model roles a pipeline uses are configured; guards, tools, actions and plugin components exist in a
 registry; named pipelines use the `dense`/`lexical`/`graph`/`community` backends of the default
@@ -688,6 +844,18 @@ contract violation. `budgets.session` limits the sum of all turns (calls, tokens
 `price_table`); each request's limits are clipped to what is left and an exhausted session refuses
 the turn with `BudgetExhausted` before anything runs. `sessions.memory.semantic` is rejected.
 
+Concurrent turns on one session (HTTP and MCP serve concurrently) are safe. Every session write is
+a compare-and-set on a `version` in the stored record (all five session stores: memory, sqlite,
+mongodb, postgres, sqlalchemy); a turn's usage and its turn entry are merged into the freshest record,
+never written from the snapshot read at turn start. With `budgets.session` set, the clip is also a
+**hold**: the turn's clipped request limits are reserved on the session record in the same
+compare-and-set, so racing turns see each other's holds and together never exceed the session
+budget. At turn end the hold is replaced by the actual usage. A hold of a turn that never finished
+(a stream that was never read, a killed worker) stops counting after the request deadline plus 300 s.
+Because a hold is the whole clipped request limit, set per-request `max_*` limits below the session
+limits if turns of one session should run in parallel; otherwise later turns are refused with
+`BudgetExhausted` while earlier ones run.
+
 ### Tools and actions (`tools`, `actions`)
 
 ```yaml
@@ -710,7 +878,7 @@ names in `actions.allow` are registered (anything else is `denied`), HTTP/MCP ad
 `serving.actions.allow` and the principal's `actions` scope, and every call — denials included — is
 audited on `storage.ledger` (job `audit:<dataset>`) with a `started` record written before execution
 and the final status after it; a repeated `idempotency_key` in the window is `skipped_duplicate`.
-Built-ins: `ingest_delta` (`{documents: [...], delete_ids: [...]}` through the single write path)
+Built-ins: `ingest_delta` (`{documents: [...], delete_ids: [...]}` through the single write path; it is an upsert into a new generation: embeddings and extractions of unchanged chunks are reused, every other projection incl. graph, communities and community reports is rebuilt — see the manifest `incremental` entry; outputs add `embedded`/`reused_embeddings`)
 and `invalidate_cache` (the active generation's cache entries). `promote_generation` /
 `rollback_generation` arrive with release ops (Phase 2).
 
@@ -743,8 +911,9 @@ or alias map is a validation error.
 `su-multi-arm --config c.yaml doctor --probe` constructs the engine (every validation above), calls
 `probe()` on every backend (sqlite: runtime database and SQLite version; memory: in-process;
 mongodb, postgres, sqlalchemy, neo4j: server ping and version; opensearch, elasticsearch: server identity) and reports each chat role's
-declared capabilities next to its registry entry. It makes **no model calls** (`model_calls: 0`)
-and exits non-zero when a backend probe fails.
+declared capabilities next to its registry entry and, per role, `strict_schemas`: `ok` or the
+strict-form problems of the schemas a native OpenAI role sends (a problem fails the probe). It makes
+**no model calls** (`model_calls: 0`) and exits non-zero when a backend probe fails.
 
 ## Serving
 
@@ -786,11 +955,18 @@ compatibility router):
 
 Headers: `X-Session-Id` binds search/answer/tool calls to a stored session of the principal (404
 unknown/expired, 403 another principal's); `X-Record-Context` (JSON) must agree with the body.
-Failures: 401, 403, 404, 422 (request rejected or invalid), 429 budget exhausted, 499 run cancelled,
+Failures: 401, 403, 404, 409 conflict (`{"detail": {"error": "write_conflict", "reason": "held" |
+"lost" | "stale_base" | "not_owner"}}` when another writer holds or took the dataset's write lease, or
+`{"error": "session_conflict", "reason": "cas_attempts_exhausted"}`), 422 (request rejected or
+invalid), 429 budget exhausted, 499 run cancelled,
 502 model provider failure, 503 backend failure, generation disagreement or no usable index
 (nothing ingested, v1-built generation, recipe fingerprint mismatch), 504 deadline. Every failure
 other than a request-shaped 422 gets a generic message: provider, source and config text never
-reaches the client. The SSE `error` event uses the category `unavailable` for the 503 cases.
+reaches the client. The SSE `error` event uses the category `unavailable` for the 503 cases. A
+failed action (`POST /v2/actions/{name}`) answers with its category's status (409 conflict, 422
+invalid arguments, 429 budget, 502 provider, 503 backend, 500 otherwise) and `result.category` /
+`result.reason`; the exception text stays in the audit record. MCP tools report the same conflicts
+as `write_conflict: <reason>` / `session_conflict: cas_attempts_exhausted` tool errors.
 
 **Streaming.** `/v2/answer/stream` (and `Engine.answer_stream` in Python) emits, in order:
 `decision` → `arm_result`… → `review_round`… → `evidence` → `token`… → `contract` → `done`
@@ -808,7 +984,8 @@ closed and the session turn records the usage spent so far.
 **Authentication** is a `PrincipalResolver` hook (`su_multi_arm.serving.auth`). Built in: no auth on
 loopback (principal `anonymous` with `search`/`answer`/`tools`), or one bearer token read from the
 variable in `serving.http.token_env` (`auth: bearer_env`) or `serve --token-env` (principal `bearer`
-with `search`/`answer`/`tools`/`actions`). The CLI requires a token when binding outside localhost;
+with `search`/`answer`/`tools`/`actions`). The scheme is case-insensitive (`Bearer`, `bearer`; RFC
+9110 §11.1); the token is compared exactly, in constant time. The CLI requires a token when binding outside localhost;
 deploy TLS and per-user controls in front. OAuth2/OIDC, mTLS or per-client API keys stay outside the
 core: implement `resolve(headers) -> Principal` (raise `Unauthenticated` to refuse) and pass it as
 `create_app(engine=..., principal_resolver=...)` or `create_mcp(engine=..., principal_resolver=...)`;

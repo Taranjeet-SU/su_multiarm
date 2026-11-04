@@ -64,6 +64,11 @@ class ExtractionResult:
     calls: int = 0
 
 
+# Recipe keys earlier releases hashed that the config no longer carries, with the value they always
+# had then. Kept in the extractor recipe so existing indexes keep their fingerprint.
+A1_RECIPE_KEYS: dict[str, Any] = {"ontology": None}
+
+
 class BuiltinExtractor:
     name = "builtin"
     kind = "extractor"
@@ -92,6 +97,10 @@ class BuiltinExtractor:
 
     def recipe_fingerprint(self) -> str | None:
         data = self.cfg.model_dump(mode="json")
+        # 2.0.0a1 hashed ``ontology`` (always ``None`` when unused). 2.0.0a2 refuses the key, so it
+        # is pinned here: a removed key must not change the index fingerprint (a2 review B2).
+        for key, value in A1_RECIPE_KEYS.items():
+            data.setdefault(key, value)
         data["prompt_sha"] = self.prompt_sha()
         data["model"] = getattr(getattr(self.model, "config", None), "model", None)
         return recipe_fingerprint(self.name, data)

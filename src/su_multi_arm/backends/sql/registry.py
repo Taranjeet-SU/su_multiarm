@@ -2,9 +2,13 @@
 
 Mirrors ``ingestion/release.py::FileGenerationRegistry`` on ``<prefix>_meta``: the ``CURRENT`` row is
 the pointer, replaced inside one transaction (delete + insert, atomic for readers) and only by
-``activate``; ``record_failure`` writes ``failure:<generation>`` and never touches the pointer.
-``lock()`` inserts a ``write_lock`` lease row (primary-key conflict = held, a typed error, never a
-wait); a lease older than ``lock_ttl_seconds`` is treated as abandoned and taken over.
+``activate``; with ``expected`` the switch is a compare-and-set (``UPDATE ... WHERE value =
+expected``, or an ``INSERT`` that conflicts when a pointer already exists). ``record_failure``
+writes ``failure:<generation>`` and never touches the pointer. ``lock()`` takes the write lease
+(``ingestion/lease.py``): a ``write_lock`` row holding ``{owner, expires_at}``; a primary-key
+conflict with a live lease is a typed ``WriteConflict(held)``, never a wait. Takeover of an expired
+lease, renewal and release are conditional on the row's exact previous value, so only the owner
+renews or deletes it.
 """
 
 from __future__ import annotations
@@ -16,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Iterator
 import sqlalchemy as sa
 
 from ...core.errors import BackendError
+from ...ingestion.lease import LEASE_TTL_SECONDS, hold, stale_base
+from ...ingestion.release import ANY
 from ._db import KIND
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -25,7 +31,7 @@ HEX32 = set("0123456789abcdef")
 
 
 class SqlGenerationRegistry:
-    def __init__(self, backend: SqlBackend, lock_ttl_seconds: float = 600.0):
+    def __init__(self, backend: SqlBackend, lock_ttl_seconds: float = LEASE_TTL_SECONDS):
         self.backend = backend
         self.lock_ttl_seconds = lock_ttl_seconds
 
@@ -45,29 +51,68 @@ class SqlGenerationRegistry:
             conn.execute(m.delete().where(m.c.key == key))
             conn.execute(m.insert().values(key=key, value=value))
 
-    @contextmanager
-    def lock(self) -> Iterator[None]:
+    @staticmethod
+    def _expires(raw: str, ttl: float) -> float:
+        """Expiry of a stored lease; a row written before owner tokens (``acquired_at`` only)
+        expires ``ttl`` after it was taken; an unreadable row never expires by itself."""
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return float("inf")
+        if "expires_at" in value:
+            return float(value["expires_at"])
+        return float(value.get("acquired_at", float("inf"))) + ttl
+
+    def lease_acquire(self, token: str, ttl: float) -> bool:
         m = self._meta
         now = self.backend.clock()
-        token = json.dumps({"acquired_at": now})
+        lease = json.dumps({"owner": token, "expires_at": now + ttl})
         try:
             with self.backend.tx("lock") as conn:
-                conn.execute(m.insert().values(key="write_lock", value=token))
+                conn.execute(m.insert().values(key="write_lock", value=lease))
+            return True
         except BackendError as exc:
             if not isinstance(exc.__cause__, sa.exc.IntegrityError):
                 raise
-            with self.backend.tx("lock") as conn:
-                row = conn.execute(sa.select(m.c.value).where(m.c.key == "write_lock")).first()
-                if row is None or json.loads(row[0]).get("acquired_at", now) > now - self.lock_ttl_seconds:
-                    raise BackendError(KIND, "lock", "write lock is held by another writer") from None
-                taken = conn.execute(m.update().where(m.c.key == "write_lock", m.c.value == row[0]).values(value=token)).rowcount
-                if taken != 1:  # pragma: no cover - lost a takeover race
-                    raise BackendError(KIND, "lock", "write lock is held by another writer")
+        with self.backend.tx("lock") as conn:
+            row = conn.execute(sa.select(m.c.value).where(m.c.key == "write_lock")).first()
+            if row is None or self._expires(row[0], ttl) > now:
+                return False
+            # stale takeover: only while the row still holds the expired value just read
+            return conn.execute(m.update().where(m.c.key == "write_lock", m.c.value == row[0]).values(value=lease)).rowcount == 1
+
+    def _owned(self, conn: Any, token: str) -> str | None:
+        m = self._meta
+        row = conn.execute(sa.select(m.c.value).where(m.c.key == "write_lock")).first()
+        if row is None:
+            return None
         try:
-            yield
-        finally:
-            with self.backend.tx("unlock") as conn:
-                conn.execute(m.delete().where(m.c.key == "write_lock", m.c.value == token))
+            owner = json.loads(row[0]).get("owner")
+        except ValueError:
+            return None
+        return row[0] if owner == token else None
+
+    def lease_renew(self, token: str, ttl: float) -> bool:
+        m = self._meta
+        with self.backend.tx("renew") as conn:
+            raw = self._owned(conn, token)
+            if raw is None:
+                return False
+            lease = json.dumps({"owner": token, "expires_at": self.backend.clock() + ttl})
+            return conn.execute(m.update().where(m.c.key == "write_lock", m.c.value == raw).values(value=lease)).rowcount == 1
+
+    def lease_release(self, token: str) -> bool:
+        m = self._meta
+        with self.backend.tx("unlock") as conn:
+            raw = self._owned(conn, token)
+            if raw is None:
+                return False
+            return conn.execute(m.delete().where(m.c.key == "write_lock", m.c.value == raw)).rowcount == 1
+
+    @contextmanager
+    def lock(self) -> Iterator[Any]:
+        with hold(self, KIND, ttl=self.lock_ttl_seconds) as lease:
+            yield lease
 
     def current_generation(self) -> str | None:
         generation = self._get("CURRENT")
@@ -93,11 +138,27 @@ class SqlGenerationRegistry:
     def write_manifest(self, manifest: dict[str, Any]) -> None:
         self._put(f"manifest:{manifest['generation']}", json.dumps(manifest, sort_keys=True, default=str), "write_manifest")
 
-    def activate(self, manifest: dict[str, Any]) -> None:
+    def activate(self, manifest: dict[str, Any], *, expected: str | None = ANY) -> None:
         generation = manifest["generation"]
         if self.manifest(generation) is None:
             raise ValueError("cannot activate a generation without a written manifest")
-        self._put("CURRENT", generation, "activate")
+        if expected is ANY:
+            self._put("CURRENT", generation, "activate")
+            return
+        m = self._meta
+        if expected is None:
+            try:
+                with self.backend.tx("activate") as conn:
+                    conn.execute(m.insert().values(key="CURRENT", value=generation))
+                return
+            except BackendError as exc:
+                if not isinstance(exc.__cause__, sa.exc.IntegrityError):
+                    raise
+        else:
+            with self.backend.tx("activate") as conn:
+                if conn.execute(m.update().where(m.c.key == "CURRENT", m.c.value == expected).values(value=generation)).rowcount == 1:
+                    return
+        raise stale_base(KIND, self.current_generation(), expected)
 
     def deactivate(self, generation: str) -> None:
         """Remove the pointer row only while it still names ``generation`` (one statement)."""

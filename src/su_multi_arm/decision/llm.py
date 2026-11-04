@@ -17,10 +17,10 @@ The prompt is neutral: it carries no domain authority rules.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import httpx
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, model_validator
 
 from ..core.component import Dependencies, Diagnostic, Environment
 from ..core.config import ChatRole
@@ -40,22 +40,60 @@ if TYPE_CHECKING:  # pragma: no cover
 from ..profiles.prompts import PLANNER_PROMPT  # noqa: E402  (neutral prompt; profiles may overlay it)
 
 
-class LlmRetrievalStep(StrictModel):
-    arm: Literal["exact_id", "dense", "lexical", "graph", "community"]
-    query: str = Field(min_length=1, max_length=16000)
-    filters: dict[str, JsonScalar] = Field(default_factory=dict)
+class LlmFilter(StrictModel):
+    """One typed ``eq`` filter on a retrieval step (a list of pairs, not a free-form mapping, so the
+    plan schema stays expressible in OpenAI strict mode)."""
+
+    field: str = Field(min_length=1)
+    value: JsonScalar
 
 
-class LlmStructuredStep(StrictModel):
-    arm: Literal["structured"]
-    scope: ScopeDraft
+LLM_ARMS = ("exact_id", "dense", "lexical", "graph", "community", "structured")
 
 
-LlmStep = Annotated[Union[LlmRetrievalStep, LlmStructuredStep], Field(discriminator="arm")]
+class LlmStep(StrictModel):
+    """One planned step. A retrieval arm carries ``query`` (and optional ``filters``); only the
+    ``structured`` arm carries ``scope``. One flat object instead of a discriminated union: strict
+    structured output refuses ``oneOf``/``discriminator`` (QA-15), and the coherence rules below
+    are checked on every reply whatever the wire mode."""
+
+    arm: Literal["exact_id", "dense", "lexical", "graph", "community", "structured"]
+    query: str | None = Field(default=None, max_length=16000)
+    filters: list[LlmFilter] = Field(default_factory=list)
+    scope: ScopeDraft | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mapping_filters(cls, data: Any) -> Any:
+        # Replies recorded before 2.0.0a2 carried ``filters`` as a mapping; the same typed pairs.
+        if isinstance(data, dict) and isinstance(data.get("filters"), dict):
+            data = {**data, "filters": [{"field": k, "value": v} for k, v in data["filters"].items()]}
+        return data
+
+    @model_validator(mode="after")
+    def _coherent(self):
+        if self.arm == "structured":
+            if self.scope is None:
+                raise ValueError("a structured step needs a scope")
+            if self.filters or (self.query or "").strip():
+                raise ValueError("a structured step carries its constraints in scope, not query/filters")
+        else:
+            if self.scope is not None:
+                raise ValueError(f"only the structured arm carries a scope, not {self.arm}")
+            if not (self.query or "").strip():
+                raise ValueError(f"a {self.arm} step needs a non-empty query")
+        names = [f.field for f in self.filters]
+        if len(set(names)) != len(names):
+            raise ValueError("a step filters each field at most once")
+        return self
+
+    def filter_map(self) -> dict[str, JsonScalar]:
+        return {f.field: f.value for f in self.filters}
 
 
 class LlmPlan(StrictModel):
-    """Wire schema the model must satisfy. Validated before any step is accepted."""
+    """Wire schema the model must satisfy. Validated before any step is accepted. Strict-expressible
+    (checked at config validation for native OpenAI planners)."""
 
     steps: list[LlmStep] = Field(min_length=1, max_length=20)
 
@@ -163,7 +201,8 @@ class LlmAgent(DecisionAgent):
         for step in plan.steps:
             if step.arm not in capabilities.arms:
                 raise DecisionFailure("invalid_step", f"planner selected disabled arm {step.arm!r}")
-            if isinstance(step, LlmStructuredStep):
+            if step.arm == "structured":
+                assert step.scope is not None  # LlmStep._coherent
                 if request.aggregate is not None and step.scope.measure is not None and step.scope.measure != request.aggregate:
                     raise DecisionFailure("invalid_step", "planner changed the caller's explicit aggregate")
                 kinds = intents.kinds()
@@ -189,7 +228,7 @@ class LlmAgent(DecisionAgent):
                     scope = compiled.spec
                 steps.append(StructuredStep(arm="structured", scope=compiled.spec))  # type: ignore[arg-type]
             else:
-                steps.append(RetrievalStep(arm=step.arm, query=step.query, filters=self._step_filters(step, request, resolver)))
+                steps.append(RetrievalStep(arm=step.arm, query=step.query or "", filters=self._step_filters(step, request, resolver)))  # type: ignore[arg-type]
         return Decision(
             plan=Plan(steps=steps),
             scope=scope,
@@ -201,10 +240,10 @@ class LlmAgent(DecisionAgent):
         )
 
     @staticmethod
-    def _step_filters(step: LlmRetrievalStep, request: DecisionRequest, resolver: ValueResolver) -> dict[str, JsonScalar]:
+    def _step_filters(step: LlmStep, request: DecisionRequest, resolver: ValueResolver) -> dict[str, JsonScalar]:
         filters: dict[str, JsonScalar] = {}
         unsupported: list[UnsupportedConstraint] = []
-        for field, value in step.filters.items():
+        for field, value in step.filter_map().items():
             if field in request.filters:
                 if request.filters[field] != value:
                     raise DecisionFailure("invalid_step", f"planner cannot override request filter {field!r}")

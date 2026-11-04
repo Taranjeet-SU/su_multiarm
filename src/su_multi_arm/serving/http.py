@@ -17,9 +17,17 @@ tool inputs are the tools' ``input_model``s); responses are the Python results' 
 Headers: ``Authorization`` (``PrincipalResolver``, ``serving/auth.py``), ``X-Session-Id`` (binds
 search/answer/tools to a stored session of the principal), ``X-Record-Context`` (JSON; must agree
 with the body). Errors: 401 unauthenticated, 403 missing scope / foreign session / denied action,
-404 unknown session or tool, 422 rejected or invalid request (generic detail; no provider, source or
+404 unknown session or tool, 409 write conflict (another writer holds or took the dataset's write
+lease, or the pointer moved under a build) or session conflict (a session compare-and-set lost past
+its bounded attempts), 422 rejected or invalid request (generic detail; no provider, source or
 config text reaches the client), 429 budget exhausted, 499 run cancelled, 502 model provider failure,
-503 backend failure / generation disagreement / no usable index, 504 deadline exceeded.
+503 backend failure / generation disagreement / no usable index, 504 deadline exceeded. A 409 body is
+``{"detail": {"error": "write_conflict" | "session_conflict", "reason": ...}}``.
+
+A failed action (``POST /v2/actions/{name}``) answers with the status of its failure category
+(``core.errors.FAILURE_STATUS``: 409 conflict, 422 invalid arguments, 429 budget, 502 provider,
+503 backend, 500 otherwise) and a body whose ``result`` carries ``category`` and ``reason``; the
+exception text stays in the audit record and never reaches the client.
 """
 
 import json
@@ -32,10 +40,14 @@ from ..core.errors import (
     BackendError,
     BudgetExhausted,
     DeadlineExceeded,
+    FAILURE_STATUS,
     GenerationDisagreement,
     IndexNotReady,
     RunCancelled,
+    SessionConflict,
     SessionNotFound,
+    WriteConflict,
+    failure_category,
 )
 from ..models import SearchRequest, StrictModel
 from ..pipeline.spec import RequestRejected
@@ -70,6 +82,9 @@ def http_error(exc: BaseException):
         return HTTPException(status_code=504, detail="deadline exceeded")
     if isinstance(exc, RunCancelled):
         return HTTPException(status_code=499, detail="run cancelled")
+    if isinstance(exc, (WriteConflict, SessionConflict)):  # before BackendError: WriteConflict is one
+        category, reason = failure_category(exc)
+        return HTTPException(status_code=409, detail={"error": category, "reason": reason})
     if isinstance(exc, (BackendError, GenerationDisagreement, IndexNotReady)):
         return HTTPException(status_code=503, detail=UNAVAILABLE)  # dependency/state failure, not the client's
     if isinstance(exc, ProviderError):
@@ -235,8 +250,15 @@ def create_app(
     @app.post("/v2/actions/{name}")
     async def action(name: str, body: ActionBody, who: Principal = Depends(principal)):
         result = await call(engine.run_action, name, body.args, idempotency_key=body.idempotency_key, principal=who, reason=body.reason, surface="http")
-        status = 403 if result.result.status == "denied" else 200
-        return JSONResponse(result.model_dump(mode="json"), status_code=status)
+        body = result.model_dump(mode="json")
+        status = 200
+        if result.result.status == "denied":
+            status = 403
+        elif result.result.status == "failed":
+            category = result.result.category or "failed"
+            status = FAILURE_STATUS.get(category, 500)
+            body["result"]["error"] = category  # the exception text stays in the audit record (N9)
+        return JSONResponse(body, status_code=status)
 
     @app.get("/v2/values/{field}")
     async def values(field: str, limit: int = Query(default=50, ge=1), who: Principal = Depends(scoped("search"))):

@@ -1,21 +1,68 @@
+"""``su-multi-arm`` command line.
+
+Every failure prints one concise ``error: ...`` line to stderr (and, for configuration errors, one
+indented line per problem with its key path) and exits non-zero: 1 for an operation that failed, 2
+for an invalid configuration or command line, 3 when the index is not ready. ``--debug`` re-raises
+the exception with its traceback instead (QA-11).
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .core.config import load_config
-from .core.errors import ConfigError
+from .core.errors import ConfigError, IndexNotReady, SuError
 from .engine import Engine
 from .models import SearchRequest
 from .ingestion.normalize import parse_documents
 
+EXIT_FAILED, EXIT_CONFIG, EXIT_NOT_READY = 1, 2, 3
+
 
 def main():
+    debug = "--debug" in sys.argv[1:]
+    try:
+        _main()
+    except (SuError, ValueError, OSError) as exc:  # pydantic ValidationError is a ValueError
+        if debug:
+            raise
+        raise SystemExit(_report(exc)) from None
+
+
+def _report(exc: BaseException) -> int:
+    """Print the concise error; return the exit code."""
+    from pydantic import ValidationError
+
+    if isinstance(exc, ConfigError):
+        problems = [d for d in exc.diagnostics if getattr(d, "severity", "error") == "error"]
+        if len(problems) > 1:
+            print(f"error: invalid configuration ({len(problems)} problems)", file=sys.stderr)
+            for d in problems:
+                print(f"  {d.path or '<root>'}: {d.message}", file=sys.stderr)
+        else:
+            print(f"error: invalid configuration: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    if isinstance(exc, ValidationError):
+        print(f"error: invalid input ({exc.error_count()} problems)", file=sys.stderr)
+        for error in exc.errors():
+            print(f"  {'.'.join(str(p) for p in error.get('loc', ())) or '<root>'}: {error.get('msg')}", file=sys.stderr)
+        return EXIT_FAILED
+    if isinstance(exc, IndexNotReady):
+        print(f"error: index not ready: {exc}", file=sys.stderr)
+        return EXIT_NOT_READY
+    print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return EXIT_FAILED
+
+
+def _main():
     from . import __version__
 
     parser = argparse.ArgumentParser(prog="su-multi-arm")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--debug", action="store_true", help="show the Python traceback of an error")
     parser.add_argument("--config", required=True, type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
     doctor = commands.add_parser("doctor", help="validate the config and construct the engine")
@@ -106,6 +153,9 @@ def main():
         }
         output["pipelines"] = sorted(engine.pipelines)
         output["default_pipeline"] = config.default_pipeline
+        # Unset API-key variables per pipeline and for ingest. Keys only a non-default pipeline or
+        # mode needs are checked on first use, so they do not stop construction (QA-14).
+        output["missing_keys"] = engine.missing_keys()
         try:
             manifest = engine.manifest()
             output["active_generation"] = manifest["generation"]
@@ -196,10 +246,14 @@ def _config_command(args) -> str:
     if args.config_command == "upgrade":
         from .compat.config_v1 import upgrade_text
 
-        text, _ = upgrade_text(args.config.read_text(), strict=args.strict)
         if args.output:
+            # Paths in the file are relative to the file: rebase them for the output's directory.
+            text, _ = upgrade_text(
+                args.config.read_text(), strict=args.strict, source_dir=args.config.resolve().parent, target_dir=args.output.resolve().parent
+            )
             args.output.write_text(text)
             return json.dumps({"written": str(args.output)})
+        text, _ = upgrade_text(args.config.read_text(), strict=args.strict)
         return text.rstrip("\n")
     if args.config_command == "schema":
         if args.v1:

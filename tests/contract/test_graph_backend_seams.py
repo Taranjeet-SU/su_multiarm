@@ -187,7 +187,7 @@ def test_pointer_moves_only_with_a_successful_activation(monkeypatch):
     assert graph.pointer == {"demo": first["generation"]} and len(graph.moves) == moves
     monkeypatch.undo()
     # the authoritative switch fails after the pointer moved: it is moved back
-    monkeypatch.setattr(path.registry, "activate", lambda manifest: (_ for _ in ()).throw(OSError("injected CURRENT failure")))
+    monkeypatch.setattr(path.registry, "activate", lambda manifest, **_: (_ for _ in ()).throw(OSError("injected CURRENT failure")))
     with pytest.raises(IngestError, match="CURRENT"):
         path.ingest(docs, replace=True)
     assert graph.pointer == {"demo": first["generation"]} and graph.moves[-1] == ("activate", first["generation"])
@@ -201,7 +201,7 @@ def test_first_build_failure_removes_the_pointer(monkeypatch):
     cfg = validate_config(json.loads(json.dumps(BASE)))
     local, graph = MemoryBackend(), PointerGraphBackend()
     path = WritePath(cfg, {"local": local, "graph": graph}, extractor=BuiltinExtractor(cfg.extraction, Dependencies()), embedder=Embedder(cfg.models.roles.embedder))
-    monkeypatch.setattr(path.registry, "activate", lambda manifest: (_ for _ in ()).throw(OSError("injected CURRENT failure")))
+    monkeypatch.setattr(path.registry, "activate", lambda manifest, **_: (_ for _ in ()).throw(OSError("injected CURRENT failure")))
     with pytest.raises(IngestError):
         path.ingest(documents())
     assert graph.pointer == {} and graph.moves[-1][0] == "deactivate"

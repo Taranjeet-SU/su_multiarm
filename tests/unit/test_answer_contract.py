@@ -36,7 +36,7 @@ def test_count_claim_without_exact_scope_abstains_with_reason():
     contract = AnswerContract()
     result = contract.enforce(count_answer(["kb:a"]), evidence_ids=EVIDENCE, aggregates=[], intents=COUNT_Q)
     assert result.contract == "abstained" and result.answer.insufficient_evidence is True and result.answer.claims == []
-    assert {v.rule for v in result.violations} == {"claim_without_exact_scope", "aggregate_intent_without_scope"}
+    assert {v.rule for v in result.violations} == {"claim_without_exact_scope", "aggregate_intent_without_scope", "answer_text_without_exact_scope"}
     assert result.unsupported_constraints and result.unsupported_constraints[0].reason == "aggregate_intent_without_scope"
     assert not any(ch.isdigit() for ch in result.answer.answer)
     approx = contract.enforce(count_answer(["aggregate:2"]), evidence_ids=EVIDENCE, aggregates=[APPROX], intents=COUNT_Q)

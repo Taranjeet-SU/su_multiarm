@@ -2,7 +2,11 @@
 
 Only the actions named in ``actions.allow`` are registered with the engine's ``ActionRunner``; any
 other name is denied (and the denial is audited). Built-ins in this release: ``ingest_delta``
-(upsert/delete documents through the single write path, producing a new generation) and
+(upsert/delete documents through the single write path, producing a new generation; what is
+incremental is recorded in the manifest's ``incremental`` entry: embeddings and extraction outputs
+of unchanged chunks are reused — only new or changed chunks are embedded/extracted — while the
+catalog, lexical, records, vector rows, graph, communities and community reports of the new
+generation are still rebuilt from the whole corpus, which is read into memory) and
 ``invalidate_cache`` (drop the active generation's cache entries). ``promote_generation`` and
 ``rollback_generation`` arrive with the release-ops slice (Phase 2).
 
@@ -87,7 +91,13 @@ def ingest_delta(engine: Any) -> Callable[[ActionRequest], dict[str, Any]]:
     def run(request: ActionRequest) -> dict[str, Any]:
         args = IngestDeltaArgs.model_validate(request.args)
         manifest = engine.ingest(list(args.documents), delete_ids=list(args.delete_ids))  # the new manifest
-        return {"generation": manifest.get("generation"), "status": manifest.get("status"), "documents": manifest.get("documents")}
+        return {
+            "generation": manifest.get("generation"),
+            "status": manifest.get("status"),
+            "documents": manifest.get("documents"),
+            "embedded": manifest.get("embedded"),
+            "reused_embeddings": manifest.get("reused_embeddings"),
+        }
 
     return run
 

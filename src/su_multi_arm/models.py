@@ -195,6 +195,7 @@ UnsupportedReason = Literal[
     "measure_unsupported",
     "not_supported_by_backend",
     "aggregate_intent_without_scope",
+    "qualifier_not_applied",  # a question qualifier the compiled scope does not express (QA-01)
 ]
 
 
@@ -207,7 +208,15 @@ class UnsupportedConstraint(StrictModel):
 
 
 ClaimKind = Literal["narrative", "count", "exhaustive_list", "absence"]
-ContractRule = Literal["unknown_evidence", "claim_without_exact_scope", "aggregate_intent_without_scope", "factual_without_citations"]
+ContractRule = Literal[
+    "unknown_evidence",
+    "claim_without_exact_scope",
+    "aggregate_intent_without_scope",
+    "factual_without_citations",
+    "answer_text_without_exact_scope",  # a count/list/absence statement in the answer text (QA-04)
+    "empty_answer",  # a factual answer whose text is empty (observed in the 2.0.0a2 QA-08 rerun)
+    "answer_number_mismatch",  # the count stated in the text differs from the backing aggregate (N2)
+]
 
 
 class Claim(StrictModel):
@@ -241,6 +250,7 @@ class Coverage(StrictModel):
 class Violation(StrictModel):
     rule: ContractRule
     detail: str
+    action: Literal["abstain", "strip"] = "abstain"  # what the contract did about it (QA-08)
 
 
 class AnswerResult(StrictModel):
@@ -253,4 +263,4 @@ class AnswerResult(StrictModel):
     unsupported_constraints: list[UnsupportedConstraint] = Field(default_factory=list)  # engine-injected only
     coverage: Coverage | None = None
     violations: list[Violation] = Field(default_factory=list)
-    contract: Literal["passed", "abstained"] = "passed"
+    contract: Literal["passed", "stripped", "abstained"] = "passed"  # stripped: unbacked claims/sentences removed

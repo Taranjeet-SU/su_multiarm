@@ -42,6 +42,7 @@
           "default": "abstain_with_reason",
           "enum": [
             "abstain_with_reason",
+            "strip",
             "fail"
           ],
           "title": "On Violation",
@@ -214,6 +215,9 @@
             }
           ],
           "default": null
+        },
+        "ingest": {
+          "$ref": "#/$defs/IngestBudget"
         }
       },
       "title": "BudgetsConfig",
@@ -750,6 +754,18 @@
           "default": "cpu",
           "title": "Device",
           "type": "string"
+        },
+        "pricing_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pricing Key"
         }
       },
       "title": "EmbedderRole",
@@ -825,19 +841,6 @@
           },
           "title": "Extractors",
           "type": "array"
-        },
-        "ontology": {
-          "anyOf": [
-            {
-              "format": "path",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Ontology"
         },
         "grounding": {
           "$ref": "#/$defs/GroundingConfig"
@@ -1202,6 +1205,53 @@
       "title": "HttpConfig",
       "type": "object"
     },
+    "IngestBudget": {
+      "additionalProperties": false,
+      "description": "Limits of one ingestion build (the write path), separate from the per-request limits.\n\n``max_llm_calls`` caps extraction and community-report calls of the whole build;\n``max_embedding_calls`` caps embedding provider requests (one per batch of\n``models.roles.embedder.batch_size`` chunks; reused vectors cost none); ``max_usd`` caps the\nbuild's spend across both, reserved before every call from ``budgets.price_table`` and\ncommitted with the reported usage. Exhaustion stops the stage (``budget`` category) under the\nextraction policy; nothing is downgraded or retried.",
+      "properties": {
+        "max_llm_calls": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 10000,
+          "title": "Max Llm Calls"
+        },
+        "max_embedding_calls": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Embedding Calls"
+        },
+        "max_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd"
+        }
+      },
+      "title": "IngestBudget",
+      "type": "object"
+    },
     "IngestionConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1512,28 +1562,6 @@
           "default": null
         },
         "community": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ChatRole"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "judge": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ChatRole"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "cache_gate": {
           "anyOf": [
             {
               "$ref": "#/$defs/ChatRole"

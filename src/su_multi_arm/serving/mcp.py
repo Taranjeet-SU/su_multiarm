@@ -28,7 +28,7 @@ import threading
 import uuid
 from typing import Any, Literal
 
-from ..core.errors import AccessDenied, BudgetExhausted, DeadlineExceeded, SessionNotFound
+from ..core.errors import AccessDenied, BudgetExhausted, DeadlineExceeded, SessionConflict, SessionNotFound, WriteConflict, failure_category
 from ..core.types import ScopeSpec
 from ..models import Aggregate, SearchRequest
 from ..pipeline.spec import RequestRejected
@@ -70,6 +70,9 @@ def safe_message(exc: BaseException) -> str:
         return f"budget exhausted ({exc.kind})"
     if isinstance(exc, DeadlineExceeded):
         return "deadline exceeded"
+    if isinstance(exc, (WriteConflict, SessionConflict)):  # typed, as HTTP 409; no backend text
+        category, reason = failure_category(exc)
+        return f"{category}: {reason}"
     return GENERIC
 
 

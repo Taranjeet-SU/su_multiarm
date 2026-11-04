@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Annotated, Literal, Union
+
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from su_multi_arm.compat.config_v1 import downgrade, upgrade
 from su_multi_arm.compat.config_v1 import Config as ConfigV1
@@ -14,6 +16,7 @@ from su_multi_arm.providers import (
     CapabilityMismatch,
     OpenAICompatibleProvider,
     RoleSpec,
+    StrictSchemaError,
     lookup,
     strict_schema,
     supports_native,
@@ -149,7 +152,108 @@ def test_strict_schema_closes_objects_and_requires_every_property():
     assert "title" in strict["properties"] and "default" not in strict["properties"]["items"]
     inner = strict["$defs"]["Inner"]
     assert inner["additionalProperties"] is False and inner["required"] == ["name", "count"]
-    assert strict_schema(Open.model_json_schema()) is None
+    with pytest.raises(StrictSchemaError, match="free-form mapping"):  # was: returned None (QA-15: typed error)
+        strict_schema(Open.model_json_schema())
+
+
+class _A(BaseModel):
+    kind: Literal["a"]
+    x: int
+
+
+class _B(BaseModel):
+    kind: Literal["b"]
+    y: str
+
+
+class Discriminated(BaseModel):
+    item: Annotated[Union[_A, _B], Field(discriminator="kind")]
+
+
+class Unique(BaseModel):
+    tags: set[str]
+
+
+@pytest.mark.parametrize(
+    "schema,needle",
+    [
+        (Discriminated.model_json_schema(), "'oneOf'"),
+        (Discriminated.model_json_schema(), "'discriminator'"),
+        ({"type": "object", "properties": {"a": {"allOf": [{"type": "string"}]}}}, "'allOf'"),
+        (Unique.model_json_schema(), "'uniqueItems'"),
+        ({"type": "object", "properties": {"a": {"const": "x"}}}, "const without a sibling type"),
+        ({"type": "object", "properties": {"a": {"anyOf": [{"type": "string"}, {"type": "null"}], "minLength": 2}}}, "anyOf mixed with"),
+        ({"type": "object", "properties": {"a": {"anyOf": [{"type": "string"}, {"minLength": 1}]}}}, "branch without a type or $ref"),
+        ({"anyOf": [{"type": "object", "properties": {}}, {"type": "null"}]}, "anyOf at the root"),
+        ({"type": "object", "properties": {"a": {"type": "string", "if": {"minLength": 1}}}}, "'if'"),
+        ({"type": "object", "properties": {"a": {"type": "object", "patternProperties": {".*": {"type": "string"}}, "properties": {}}}}, "'patternProperties'"),
+        ({"type": "object", "properties": {"a": {"type": "object", "additionalProperties": {"type": "string"}, "properties": {}}}}, "additionalProperties with a schema"),
+    ],
+)
+def test_strict_schema_refuses_every_construct_openai_strict_rejects(schema, needle):
+    """QA-15: the 2026-11-03 live probe saw these refused with HTTP 400; they fail here, before any call."""
+    with pytest.raises(StrictSchemaError) as error:
+        strict_schema(schema, "Probe")
+    assert needle in str(error.value) and isinstance(error.value, CapabilityMismatch)
+
+
+def test_strict_schema_keeps_the_keywords_openai_strict_accepted():
+    schema = {
+        "type": "object",
+        "$defs": {"Leaf": {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0, "exclusiveMinimum": -1}}}},
+        "properties": {
+            "s": {"type": "string", "minLength": 1, "maxLength": 9, "pattern": "^a", "format": "date-time", "default": "a", "title": "S"},
+            "items": {"type": "array", "items": {"$ref": "#/$defs/Leaf"}, "minItems": 1, "maxItems": 3},
+            "maybe": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "optional"},
+            "ref": {"$ref": "#/$defs/Leaf", "description": "sibling description"},
+            "k": {"type": "string", "const": "x"},
+            "e": {"type": "string", "enum": ["a", "b"]},
+        },
+    }
+    strict = strict_schema(schema)
+    assert strict["required"] == ["s", "items", "maybe", "ref", "k", "e"] and "default" not in strict["properties"]["s"]
+    assert strict["$defs"]["Leaf"]["required"] == ["n"]
+
+
+def test_every_schema_the_package_sends_is_strict_expressible():
+    """QA-13/QA-15: the schemas each chat role sends convert; the planner's ``LlmPlan`` no longer
+    uses a discriminated union or free-form filters."""
+    from su_multi_arm.generation.contract import answer_schema
+    from su_multi_arm.pipeline.validate import role_schemas
+
+    for role_name, schemas in role_schemas().items():
+        for schema in schemas:
+            strict_schema(schema.model_json_schema(), schema.__name__)
+    strict_schema(answer_schema(["d1", "aggregate:1"], ["narrative", "count"]).model_json_schema(), "Answer")
+
+
+def test_native_openai_roles_are_checked_for_strict_schemas_at_validation(monkeypatch):
+    import su_multi_arm.pipeline.validate as validate
+
+    monkeypatch.setattr(validate, "role_schemas", lambda: {"planner": [Open]})
+    spec = role(provider="openai", model="gpt-4o-mini", capabilities={"structured_output": "native"})
+    with pytest.raises(ConfigError) as error:
+        validate_config(minimal(models={"roles": {"planner": spec}}))
+    assert "Open is not strict-expressible" in str(error.value) and "models.roles.planner" in str(error.value)
+    # json_schema (strict: false) and Anthropic native (tool use) are not strict json_schema: accepted
+    validate_config(minimal(models={"roles": {"planner": {**spec, "capabilities": {"structured_output": "json_schema"}}}}))
+    validate_config(minimal(models={"roles": {"planner": role(capabilities={"structured_output": "native"})}}))
+
+
+def test_doctor_probe_reports_strict_schema_status_per_role(monkeypatch, tmp_path):
+    import su_multi_arm.pipeline.validate as validate
+    from su_multi_arm import Engine
+
+    monkeypatch.setenv("SU_TEST_KEY", "offline")
+    planner = role(provider="openai", model="gpt-4o-mini", capabilities={"structured_output": "native"})
+    data = minimal(models={"roles": {"embedder": {"provider": "hash", "dimensions": 64}, "planner": planner}})
+    data["backends"]["local"]["path"] = str(tmp_path / "state")
+    engine = Engine(validate_config(data))
+    report = validate.probe_report(engine)
+    assert report["models"]["planner"]["strict_schemas"] == "ok" and report["probe"] == "ok" and report["model_calls"] == 0
+    monkeypatch.setattr(validate, "role_schemas", lambda: {"planner": [Open]})  # a regression in a sent schema
+    report = validate.probe_report(engine)
+    assert report["probe"] == "failed" and "Open is not strict-expressible" in report["models"]["planner"]["error"]
 
 
 def test_price_table_accounts_cached_reads_and_cache_writes():

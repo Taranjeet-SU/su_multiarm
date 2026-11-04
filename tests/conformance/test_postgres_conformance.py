@@ -292,3 +292,20 @@ def test_unreachable_server_is_a_typed_error():
     with pytest.raises(BackendError) as info:
         backend.catalog.get(kit.GEN, ["d1"])
     assert info.value.adapter == "postgres" and info.value.operation == "get"
+
+
+def test_write_lease_fencing_and_compare_and_set(pg_factory):
+    """Risk R1 on a real server: the advisory-lock lease refuses a second session, the heartbeat
+    confirms the session still holds it (``pg_locks``), a non-owner release unlocks nothing, and
+    activation is a compare-and-set on the expected generation. Advisory locks end with their
+    session, so there is no expiry/takeover step."""
+    from .lease_kit import check_compare_and_set, check_lease
+
+    backend = pg_factory()
+    check_lease(backend.generation_registry, None, 120.0)
+    registry = backend.generation_registry()
+    with registry.lock() as lease:
+        assert registry.lease_renew(lease.token, 120.0) is True  # the pg_locks query sees this session's lock
+    assert registry.lease_renew(lease.token, 120.0) is False  # released: no session holds it for this token
+    manifests = [{"dataset": "conformance", "generation": g.generation, "index_format": 3, "fingerprint": g.fingerprint} for g in (kit.GEN, kit.GEN2, kit.GEN.model_copy(update={"generation": "c" * 32}))]
+    check_compare_and_set(pg_factory().generation_registry(), manifests)

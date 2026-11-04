@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...core.errors import BackendError
 from ...core.types import CacheEntry, LedgerEntry, RawReply, SessionRecord
+from .._sessions import lost, next_record
 from ..memory import CACHE_KEY
 from ._db import KIND, as_date, mapped
 
@@ -162,16 +163,20 @@ class MongoSessions:
             row = self._collection().find_one({"_id": session_id})
         return None if row is None else SessionRecord.model_validate_json(row["data"])
 
-    def touch(self, session_id: str, now: float, record: SessionRecord | None = None) -> None:
-        current = self.get(session_id)
-        if current is None:
-            raise BackendError(KIND, "touch", f"unknown session {session_id}")
-        updated = (record or current).model_copy(update={"last_seen_at": now})
+    def touch(self, session_id: str, now: float, record: SessionRecord | None = None, expected_version: int | None = None) -> None:
         with mapped("touch"):
-            self._collection().update_one(
-                {"_id": session_id},
+            row = self._collection().find_one({"_id": session_id})
+        if row is None:
+            raise BackendError(KIND, "touch", f"unknown session {session_id}")
+        updated = next_record(session_id, SessionRecord.model_validate_json(row["data"]), now, record, expected_version)
+        with mapped("touch"):
+            # Filtering on the raw ``data`` just read makes this a single-document compare-and-set.
+            result = self._collection().update_one(
+                {"_id": session_id, "data": row["data"]},
                 {"$set": {"data": updated.model_dump_json(), "last_seen_at": now, "last_seen_date": as_date(now)}},
             )
+        if result.matched_count != 1:
+            raise lost(session_id, expected_version)
 
     def expire(self, now: float, ttl_seconds: float) -> int:
         with mapped("expire"):

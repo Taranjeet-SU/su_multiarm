@@ -158,7 +158,7 @@ def test_catalog_on_postgres_lexical_on_opensearch_graph_on_neo4j(engine):
     registry = engine.write_path.registry
     original = registry.activate
 
-    def refuse(manifest):
+    def refuse(manifest, **_):
         raise OSError("injected CURRENT failure")
 
     registry.activate = refuse

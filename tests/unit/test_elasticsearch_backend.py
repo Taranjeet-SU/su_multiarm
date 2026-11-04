@@ -247,26 +247,124 @@ def test_registry_activation_is_the_adapters_alias_switch_and_failures_never_tou
     assert [p for _, p, _, _ in other.requests if "_doc/" in p] == [f"/{REGISTRY}/_doc/manifest:demo:{GEN.generation}", f"/{REGISTRY}/_doc/failure:demo:{GEN.generation}", f"/{REGISTRY}/_doc/manifest:demo:{GEN.generation}"]
 
 
-def test_registry_lock_conflicts_are_typed_and_stale_locks_expire(fake):
+class LockDocument:
+    """The registry's ``lock:demo`` document with Elasticsearch's optimistic concurrency control:
+    ``_create`` conflicts when it exists; ``PUT``/``DELETE`` with ``if_seq_no`` conflict when the
+    version moved."""
+
+    def __init__(self, fake):
+        self.source, self.seq = None, 0
+        path = f"/{REGISTRY}/_doc/lock:demo"
+        fake.handlers[("GET", f"/{REGISTRY}/_mapping")] = {}
+        fake.handlers[("PUT", f"/{REGISTRY}/_create/lock:demo")] = self.create
+        fake.handlers[("GET", path)] = self.get
+        fake.handlers[("PUT", path)] = self.put
+        fake.handlers[("DELETE", path)] = self.delete
+
+    def conflict(self, params):
+        if (params or {}).get("if_seq_no") != self.seq or self.source is None:
+            return lc.TransportError(409, "version_conflict_engine_exception", "version conflict")
+        return None
+
+    def create(self, params, body):
+        if self.source is not None:
+            return lc.TransportError(409, "version_conflict_engine_exception", "document already exists")
+        self.source, self.seq = body, self.seq + 1
+        return {"result": "created"}
+
+    def get(self, params, body):
+        if self.source is None:
+            return lc.TransportError(404, "not_found", "missing")
+        return {"found": True, "_seq_no": self.seq, "_primary_term": 1, "_source": self.source}
+
+    def put(self, params, body):
+        error = self.conflict(params)
+        if error:
+            return error
+        self.source, self.seq = body, self.seq + 1
+        return {"result": "updated"}
+
+    def delete(self, params, body):
+        error = self.conflict(params)
+        if error:
+            return error
+        self.source, self.seq = None, self.seq + 1
+        return {"result": "deleted"}
+
+    @property
+    def owner(self):
+        return None if self.source is None else self.source["payload"].get("owner")
+
+
+def test_registry_lease_conflicts_are_typed_and_stale_leases_expire(fake):
+    """A live lease is a typed ``WriteConflict(held)``; a lease is taken over only after its expiry;
+    a lease written before owner tokens (``created_at`` only) expires ``ttl`` after it was taken."""
+    from su_multi_arm.core.errors import WriteConflict
+
     clock = {"now": 1000.0}
     backend = ElasticsearchBackend(index_prefix="es", transport=fake, dataset="demo", clock=lambda: clock["now"])
     registry = backend.generation_registry()
-    attempts = {"n": 0}
-
-    def create(params, body):
-        attempts["n"] += 1
-        if attempts["n"] <= 2:
-            return lc.TransportError(409, "version_conflict_engine_exception", "document already exists")
-        return {"result": "created"}
-
-    fake.handlers[("GET", f"/{REGISTRY}/_mapping")] = {}
-    fake.handlers[("PUT", f"/{REGISTRY}/_create/lock:demo")] = create
-    fake.handlers[("GET", f"/{REGISTRY}/_doc/lock:demo")] = {"found": True, "_source": {"created_at": 900.0}}
-    with pytest.raises(BackendError, match="elasticsearch.lock: another ingestion holds the lock for dataset 'demo'"):
+    lock = LockDocument(fake)
+    lock.source = {"kind": "lock", "dataset": "demo", "generation": None, "created_at": 900.0, "payload": {}}
+    with pytest.raises(WriteConflict, match="elasticsearch.lock: another ingestion holds the lock for dataset 'demo'") as info:
         with registry.lock():
             pass
-    clock["now"] = 900.0 + 3600.0 + 1
-    with registry.lock():
-        pass
-    deletes = [p for m, p, _, _ in fake.requests if m == "DELETE"]
-    assert deletes == [f"/{REGISTRY}/_doc/lock:demo"] * 2
+    assert info.value.reason == "held" and isinstance(info.value, BackendError)
+    clock["now"] = 900.0 + registry.lock_ttl + 1
+    with registry.lock() as lease:
+        assert lock.owner == lease.token and lock.source["payload"]["expires_at"] == clock["now"] + registry.lock_ttl
+        clock["now"] += registry.lock_ttl / 2
+        with pytest.raises(WriteConflict, match="another ingestion holds the lock"):
+            with ElasticsearchBackend(index_prefix="es", transport=fake, dataset="demo", clock=lambda: clock["now"]).generation_registry().lock():
+                pass  # a live lease is never taken over
+        lease.check()
+    assert lock.source is None  # released by its owner
+
+
+def test_registry_lease_release_and_renewal_by_a_non_owner_are_refused(fake):
+    """Elasticsearch must never delete another holder's lease: writer A's lease expires, B takes it
+    over, A's renewal reports the loss and A's release deletes nothing."""
+    from su_multi_arm.core.errors import WriteConflict
+
+    clock = {"now": 1000.0}
+    backend = ElasticsearchBackend(index_prefix="es", transport=fake, dataset="demo", clock=lambda: clock["now"])
+    lock = LockDocument(fake)
+    first = backend.generation_registry()
+    with first.lock() as lease_a:
+        clock["now"] += first.lock_ttl + 1  # A missed every renewal
+        second = ElasticsearchBackend(index_prefix="es", transport=fake, dataset="demo", clock=lambda: clock["now"]).generation_registry()
+        with second.lock() as lease_b:
+            assert lock.owner == lease_b.token
+            assert first.lease_renew(lease_a.token, first.lock_ttl) is False
+            with pytest.raises(WriteConflict, match="write lease lost") as info:
+                lease_a.check()
+            assert info.value.reason == "lost"
+            assert first.lease_release(lease_a.token) is False and lock.owner == lease_b.token
+        assert lock.source is None
+    assert lease_a.released is False  # A's exit deleted nothing
+    deletes = [params for m, p, params, _ in fake.requests if m == "DELETE"]
+    assert len(deletes) == 1 and deletes[0]["if_seq_no"] is not None  # only B's conditional delete
+
+
+def test_conditional_alias_switch_fences_on_the_expected_docs_index(fake, backend):
+    """Compare-and-set activation: refused before any request when the docs alias names another
+    generation; otherwise the request removes the expected generation's docs index with
+    ``must_exist`` so a concurrent switch fails it as a whole (a 404 becomes ``stale_base``)."""
+    from su_multi_arm.core.errors import WriteConflict
+
+    old_docs = f"es_demo_{'b' * 32}_docs"
+    fake.handlers[("GET", "/_alias/es_demo_docs")] = {old_docs: {"aliases": {"es_demo_docs": {}}}}
+    fake.handlers[("GET", "/_alias/es_demo_chunks")] = lc.TransportError(404, "alias_not_found", "missing")
+    fake.handlers[("GET", "/_alias/es_demo_records")] = lc.TransportError(404, "alias_not_found", "missing")
+    with pytest.raises(WriteConflict, match="stale|started from") as info:
+        backend.activate(GEN, expected="c" * 32)
+    assert info.value.reason == "stale_base" and fake.bodies("/_aliases") == []
+    backend.activate(GEN, expected="b" * 32)
+    assert fake.bodies("/_aliases")[0]["actions"][:2] == [
+        {"remove": {"index": old_docs, "alias": "es_demo_docs", "must_exist": True}},
+        {"add": {"index": DOCS, "alias": "es_demo_docs"}},
+    ]
+    fake.handlers[("POST", "/_aliases")] = lc.TransportError(404, "aliases_not_found_exception", "aliases [es_demo_docs] missing")
+    with pytest.raises(WriteConflict) as info:
+        backend.activate(GEN, expected="b" * 32)
+    assert info.value.reason == "stale_base"

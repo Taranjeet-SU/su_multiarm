@@ -31,7 +31,8 @@ pushdown possible there. A mirror is never read as the catalog.
 * ``none`` — an injected backend with neither; recorded in the manifest, never checked.
 
 Secondaries are switched first in projection order (vector, lexical, records, graph, communities),
-the authoritative ``CURRENT`` last; when any step fails, every pointer already moved is put back to
+the authoritative ``CURRENT`` last, each as a compare-and-set on what the pointer named just before
+(``expected``; ``WriteConflict(stale_base)`` when another writer moved it); when any step fails, every pointer already moved is put back to
 what it named before (or removed) in reverse order and ``CURRENT`` is unchanged.
 
 **Pinning.** A reader resolves ``CURRENT`` and then requires every secondary pointer to name the
@@ -40,6 +41,7 @@ same generation; any disagreement is a typed ``GenerationDisagreement`` (never a
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +49,8 @@ from ..backends import capabilities as caps
 from ..backends import extras
 from ..core.errors import ConfigError, GenerationDisagreement
 from ..core.types import GenerationId
+from .lease import stale_base
+from .release import ANY
 
 PROJECTION_ORDER: tuple[str, ...] = ("vector", "lexical", "records", "graph", "communities", "catalog")
 NEEDS_CATALOG_ROWS = ("lexical", "vector")  # facets that refuse chunks of documents they do not hold
@@ -161,22 +165,33 @@ class GenerationSet:
         return None
 
     @staticmethod
-    def activate(holder: Holder, gen: GenerationId, manifest: dict[str, Any]) -> None:
+    def activate(holder: Holder, gen: GenerationId, manifest: dict[str, Any], expected: Any = ANY) -> None:
+        """Move one secondary pointer; with ``expected`` a compare-and-set on what it named before."""
         if holder.activation == "pointer":
-            holder.backend.activate_generation(gen)
+            if expected is ANY:
+                holder.backend.activate_generation(gen)
+            elif "expected" in inspect.signature(holder.backend.activate_generation).parameters:
+                holder.backend.activate_generation(gen, expected=expected)
+            else:  # injected pointer without compare-and-set: read and compare (see extras.GenerationPointer)
+                actual = holder.backend.active_generation(gen.dataset)
+                if actual != expected:
+                    raise stale_base(holder.kind, actual, expected)
+                holder.backend.activate_generation(gen)
         elif holder.activation == "registry":
             registry = holder.backend.generation_registry()
             registry.write_manifest(manifest)
-            registry.activate(manifest)
+            registry.activate(manifest, expected=expected)
 
     @staticmethod
     def restore(holder: Holder, gen: GenerationId, before: str | None) -> None:
-        """Put the holder's pointer back to ``before`` (or remove it when it named nothing)."""
+        """Put the holder's pointer back to ``before`` (or remove it when it named nothing), each only
+        while it still names ``gen``."""
         if holder.activation == "pointer":
             if before is None:
                 holder.backend.deactivate_generation(gen)
             else:
-                holder.backend.activate_generation(gen.model_copy(update={"generation": before}))
+                # only while the pointer still names the failed generation (never over another writer's)
+                GenerationSet.activate(holder, gen.model_copy(update={"generation": before}), {}, expected=gen.generation)
         elif holder.activation == "registry":
             registry = holder.backend.generation_registry()
             if before is None:
@@ -185,7 +200,7 @@ class GenerationSet:
                 previous = registry.manifest(before)
                 if previous is None:
                     raise ValueError(f"backend {holder.name!r}: no manifest for the previous generation {before}; pointer left on {gen.generation}")
-                registry.activate(previous)
+                registry.activate(previous, expected=gen.generation)
 
     def pointers(self, dataset: str) -> dict[str, str | None]:
         """Every secondary pointer (holders with activation ``none`` are not listed)."""

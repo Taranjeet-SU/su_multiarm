@@ -159,7 +159,7 @@ def test_failed_loads_never_move_the_pointer(config, documents, neo4j_env, engin
     # 2. the load succeeds but the authoritative CURRENT switch fails: the pointer is moved back
     registry = engine.write_path.registry
 
-    def refuse(manifest):
+    def refuse(manifest, **_):
         raise OSError("injected CURRENT failure")
 
     monkeypatch.setattr(registry, "activate", refuse)

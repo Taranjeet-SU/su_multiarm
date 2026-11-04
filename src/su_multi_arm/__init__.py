@@ -10,4 +10,4 @@ from .engine import Engine
 from .models import SearchRequest
 
 __all__ = ["Config", "load_config", "Document", "SearchRequest", "Engine"]
-__version__ = "2.0.0a1"
+__version__ = "2.0.0a2"

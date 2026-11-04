@@ -165,3 +165,28 @@ def test_wrong_password_is_a_typed_error(neo4j_server):
     backend = Neo4jBackend(uri, "neo4j", "not-the-password", namespace="badauth", timeout_seconds=5)
     with pytest.raises(BackendError, match="neo4j"):
         backend.graph.memberships(kit.GEN)
+
+
+def test_pointer_activation_is_a_compare_and_set(adapter_factory):
+    """Risk R1: the pointer moves only from the expected generation; a refused switch is a typed
+    ``WriteConflict(stale_base)`` and rolls back (no pointer node is left behind)."""
+    from su_multi_arm.core.errors import WriteConflict
+
+    adapter = adapter_factory()
+    entities, relations = kit.graph_fixture()
+    gen3 = kit.GEN.model_copy(update={"generation": "c" * 32})
+    for gen in (kit.GEN, kit.GEN2, gen3):
+        adapter.graph.upsert(gen, entities, relations, [])
+    with pytest.raises(WriteConflict) as info:
+        adapter.activate_generation(kit.GEN, expected=kit.GEN2.generation)  # no pointer yet
+    assert info.value.reason == "stale_base" and adapter.active_generation(kit.GEN.dataset) is None
+    adapter.activate_generation(kit.GEN, expected=None)
+    with pytest.raises(WriteConflict):
+        adapter.activate_generation(kit.GEN2, expected=None)
+    adapter.activate_generation(kit.GEN2, expected=kit.GEN.generation)
+    with pytest.raises(WriteConflict):
+        adapter.activate_generation(gen3, expected=kit.GEN.generation)
+    assert adapter.active_generation(kit.GEN.dataset) == kit.GEN2.generation
+    unloaded = kit.GEN.model_copy(update={"generation": "d" * 32})
+    with pytest.raises(BackendError, match="no committed load"):
+        adapter.activate_generation(unloaded, expected=kit.GEN2.generation)

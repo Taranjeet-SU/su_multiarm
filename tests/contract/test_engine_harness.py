@@ -107,7 +107,8 @@ def test_nine_count_probe_shapes_never_yield_a_number_through_the_engine(monkeyp
     assert not has_number(result.answer.answer) and result.answer.claims == []
     if policy == "raw_all_arms":
         assert set(result.retrieval.arm_hits) == {"dense", "lexical"} and result.contract == "abstained"
-        assert [v.rule for v in result.violations] == ["claim_without_exact_scope", "aggregate_intent_without_scope"]
+        # 2.0.0a2: the answer text ("There are 7 matching records.") is checked too (QA-04)
+        assert [v.rule for v in result.violations] == ["claim_without_exact_scope", "aggregate_intent_without_scope", "answer_text_without_exact_scope"]
         assert any(u.reason == "aggregate_intent_without_scope" for u in result.unsupported_constraints)
     else:
         assert result.retrieval.hits == [] and result.contract == "passed" and result.trace["model_calls"] == []
@@ -119,7 +120,7 @@ def test_nine_count_probe_shapes_never_yield_a_number_through_the_engine(monkeyp
 def test_exactly_resolvable_count_still_counts_and_the_number_is_kept(monkeypatch):
     def respond(self, system, payload, schema, budget, stage):
         aggregate = next(e for e in payload["evidence"] if e["source"] == "structured")
-        return Answer(answer="Three records are open.", claims=[Claim(text="3 open records", kind="count", evidence_ids=[aggregate["id"]])], citations=[aggregate["id"]])
+        return Answer(answer="Two records are open.", claims=[Claim(text="2 open records", kind="count", evidence_ids=[aggregate["id"]])], citations=[aggregate["id"]])
 
     monkeypatch.setattr(JsonModel, "call", respond)
     engine = engine_for("rules", "fail_closed")

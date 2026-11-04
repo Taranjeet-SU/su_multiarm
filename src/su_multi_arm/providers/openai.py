@@ -3,8 +3,9 @@
 * Native structured output (registry ``native_kind: json_schema_strict``): ``response_format:
   {type: json_schema, json_schema: {name, schema, strict: true}}`` with the schema converted to
   strict form (every object closed, every property required). A schema strict mode cannot express
-  (free-form mappings such as ``dict[str, ...]`` fields) is a ``CapabilityMismatch`` before any call:
-  declare ``json_schema`` (``strict: false``) for that role instead. Never downgraded silently.
+  (free-form mappings, ``oneOf``/``allOf``/``discriminator``, ``uniqueItems``, typeless ``const``;
+  see ``base.strict_schema``) is a ``StrictSchemaError`` (a ``CapabilityMismatch``) before any call;
+  config validation runs the same check on the schemas the package sends. Never downgraded.
 * ``json_schema`` sends the schema with ``strict: false``; ``json_mode`` sends ``{type: json_object}``;
   both also put the schema in the system prompt, and every reply is validated strictly.
 * Prompt caching is passive (automatic prefix caching): ``usage.prompt_tokens_details.cached_tokens``
@@ -75,12 +76,9 @@ class OpenAIProvider(HttpChatProvider):
         body: dict[str, Any] = {"model": self.role.model, self._max_tokens_param(): self.role.max_tokens}
         if schema is not None:
             if mode == "native:json_schema_strict":
-                strict = strict_schema(schema.model_json_schema())
-                if strict is None:
-                    raise CapabilityMismatch(
-                        f"{schema.__name__} has free-form mappings that strict structured output cannot express; "
-                        "declare structured_output: json_schema for this role"
-                    )
+                # StrictSchemaError (a CapabilityMismatch) lists every construct strict mode refuses;
+                # config validation runs the same check on the schemas the package sends.
+                strict = strict_schema(schema.model_json_schema(), schema.__name__)
                 body["response_format"] = {"type": "json_schema", "json_schema": {"name": schema_name(schema), "schema": strict, "strict": True}}
             else:
                 text = system + schema_instruction(schema)

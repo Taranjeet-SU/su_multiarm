@@ -193,3 +193,19 @@ def test_unreachable_server_is_a_typed_error():
         backend.catalog.get(kit.GEN, ["d1"])
     assert info.value.adapter == "mongodb" and info.value.operation == "generation"
     backend.client.close()
+
+
+def test_write_lease_fencing_and_compare_and_set(adapter_factory):
+    """Risk R1 on a real server: owner-token lease, takeover only after expiry, release/renewal by a
+    non-owner refused, activation as compare-and-set on the expected generation."""
+    from .lease_kit import check_compare_and_set, check_lease
+
+    backend = adapter_factory()
+    clock = adapter_factory.clock
+
+    def advance(seconds):
+        clock["now"] += seconds
+
+    check_lease(backend.generation_registry, advance, backend.generation_registry().lock_ttl_seconds)
+    manifests = [{"dataset": "conformance", "generation": g.generation, "index_format": 3, "fingerprint": g.fingerprint} for g in (kit.GEN, kit.GEN2, kit.GEN.model_copy(update={"generation": "c" * 32}))]
+    check_compare_and_set(adapter_factory().generation_registry(), manifests)

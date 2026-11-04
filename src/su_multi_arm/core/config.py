@@ -215,6 +215,15 @@ class EmbedderRole(StrictModel):
     document_prefix: str = ""
     revision: str | None = None
     device: str = "cpu"
+    # Key into budgets.price_table for hosted embedders (falls back to the model id). Not part of the
+    # index recipe: the write path excludes it from the fingerprint.
+    pricing_key: str | None = None
+
+    def price_key(self) -> str | None:
+        """Pricing key for the write-path USD budget; ``None`` for local embedders (no spend)."""
+        if self.provider in {"hash", "sentence_transformers"}:
+            return None
+        return self.pricing_key or self.model
 
     @model_validator(mode="after")
     def keyed(self):
@@ -228,19 +237,43 @@ class RerankerRole(StrictModel):
     model: str = Field(min_length=1)
 
 
+# Configuration keys for features that do not exist in this release (completeness review risk R3).
+# A configured key is refused with a clear message instead of being accepted and never read; each
+# moves out of these tables when the phase that consumes it lands.
+UNIMPLEMENTED_ROLES: dict[str, str] = {
+    "judge": "the evaluation harness and its judges arrive in Phase 4",
+    "cache_gate": "the cache arm and its gate arrive in Phase 2",
+}
+UNIMPLEMENTED_EXTRACTION: dict[str, str] = {
+    "ontology": "the ontology contract arrives in Phase 3",
+}
+
+
+def reject_unimplemented(data: Any, keys: dict[str, str], prefix: str) -> Any:
+    """``ConfigError`` (with the key path) for any key of ``keys`` present in a mapping."""
+    if isinstance(data, dict):
+        for key, why in keys.items():
+            if key in data:
+                raise ConfigError(f"not implemented in this release ({why}); remove the key", f"{prefix}.{key}")
+    return data
+
+
 class ModelRoles(StrictModel):
     planner: ChatRole | None = None
     reviewer: ChatRole | None = None
     extractor: ChatRole | None = None
     generator: ChatRole | None = None
     community: ChatRole | None = None
-    judge: ChatRole | None = None
-    cache_gate: ChatRole | None = None
     embedder: EmbedderRole = Field(default_factory=EmbedderRole)
     reranker: RerankerRole | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def unimplemented_roles(cls, data):
+        return reject_unimplemented(data, UNIMPLEMENTED_ROLES, "models.roles")
+
     def chat_roles(self) -> dict[str, ChatRole]:
-        names = ("planner", "reviewer", "extractor", "generator", "community", "judge", "cache_gate")
+        names = ("planner", "reviewer", "extractor", "generator", "community")
         return {n: getattr(self, n) for n in names if getattr(self, n) is not None}
 
 
@@ -369,6 +402,14 @@ class ArmsConfig(StrictModel):
             raise ValueError("at least one retrieval arm must be configured")
         return self
 
+    @model_validator(mode="after")
+    def cache_arm_unimplemented(self):
+        # The key is part of the plan's schema, but no cache arm ships yet (risk R3): refuse it at
+        # validation, not only at engine construction.
+        if self.cache is not None:
+            raise ValueError("cache: not implemented in this release (the cache arm arrives in Phase 2); remove the key")
+        return self
+
 
 class DiversityConfig(StrictModel):
     field: str = Field(pattern=IDENTIFIER)
@@ -411,7 +452,9 @@ class ReviewConfig(StrictModel):
 
 
 class AnswerContractConfig(StrictModel):
-    on_violation: Literal["abstain_with_reason", "fail"] = "abstain_with_reason"
+    # abstain_with_reason: abstain (a non-narrative claim on an answer whose text states no
+    # count/list/absence is stripped instead); strip: also remove unbacked sentences; fail: raise.
+    on_violation: Literal["abstain_with_reason", "strip", "fail"] = "abstain_with_reason"
 
 
 class GenerationStageConfig(StrictModel):
@@ -465,7 +508,6 @@ class GroundingConfig(StrictModel):
 
 class ExtractionConfig(StrictModel):
     extractors: list[Literal["gazetteer", "regex", "spacy", "gliner", "llm"]] = Field(default_factory=lambda: ["gazetteer"])
-    ontology: Path | None = None
     grounding: GroundingConfig = Field(default_factory=GroundingConfig)
     policy: Literal["strict", "quarantine", "partial"] = "strict"
     prompt: str | None = None  # llm extractor prompt; built-in neutral prompt when unset
@@ -478,6 +520,11 @@ class ExtractionConfig(StrictModel):
     pos: list[str] = Field(default_factory=lambda: ["PROPN"])
     gliner_model: str = "urchade/gliner_small-v2.1"
     threshold: float = Field(default=0.5, ge=0, le=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def unimplemented_keys(cls, data):
+        return reject_unimplemented(data, UNIMPLEMENTED_EXTRACTION, "extraction")
 
     @model_validator(mode="after")
     def coherent(self):
@@ -560,6 +607,21 @@ class SessionBudget(StrictModel):
     max_usd: float | None = Field(default=None, gt=0)
 
 
+class IngestBudget(StrictModel):
+    """Limits of one ingestion build (the write path), separate from the per-request limits.
+
+    ``max_llm_calls`` caps extraction and community-report calls of the whole build;
+    ``max_embedding_calls`` caps embedding provider requests (one per batch of
+    ``models.roles.embedder.batch_size`` chunks; reused vectors cost none); ``max_usd`` caps the
+    build's spend across both, reserved before every call from ``budgets.price_table`` and
+    committed with the reported usage. Exhaustion stops the stage (``budget`` category) under the
+    extraction policy; nothing is downgraded or retried."""
+
+    max_llm_calls: int | None = Field(default=10000, ge=1)
+    max_embedding_calls: int | None = Field(default=None, ge=1)
+    max_usd: float | None = Field(default=None, gt=0)
+
+
 class BudgetsConfig(StrictModel):
     max_llm_calls: int = Field(default=12, ge=1, le=1000000)
     max_input_tokens: int | None = Field(default=None, ge=1)
@@ -568,11 +630,14 @@ class BudgetsConfig(StrictModel):
     deadline_seconds: float = Field(default=60, gt=0, le=3600)
     price_table: Path | None = None
     session: SessionBudget | None = None  # per-session limits on top of the per-request ones above
+    ingest: IngestBudget = Field(default_factory=IngestBudget)  # whole-build limits of the write path
 
     @model_validator(mode="after")
     def usd_needs_prices(self):
         if self.max_usd is not None and self.price_table is None:
             raise ValueError("max_usd requires price_table (operator-supplied; no bundled prices)")
+        if self.ingest.max_usd is not None and self.price_table is None:
+            raise ValueError("ingest.max_usd requires price_table (operator-supplied; no bundled prices)")
         if self.session is not None and self.session.max_usd is not None and self.price_table is None:
             raise ValueError("session.max_usd requires price_table (operator-supplied; no bundled prices)")
         return self
@@ -787,14 +852,28 @@ def validate_config(data: dict[str, Any]) -> Config:
     try:
         return Config.model_validate(apply_profile(data))
     except ValidationError as exc:
-        first = exc.errors()[0]
-        original = (first.get("ctx") or {}).get("error")
-        if isinstance(original, ConfigError):
-            raise original from None
-        message = first.get("msg", "invalid").removeprefix("Value error, ")
-        if first.get("type") == "extra_forbidden":
-            message = "unknown key"
-        raise ConfigError(message, _path_of(first)) from None
+        errors = exc.errors()
+        if len(errors) == 1 and isinstance((errors[0].get("ctx") or {}).get("error"), ConfigError):
+            raise errors[0]["ctx"]["error"] from None
+        problems = [_diagnostic(error) for error in errors]
+        if len(problems) == 1:
+            raise ConfigError(problems[0].message, problems[0].path, diagnostics=problems) from None
+        listed = "; ".join(f"{d.path}: {d.message}" for d in problems)
+        raise ConfigError(f"{len(problems)} configuration errors: {listed}", problems[0].path, diagnostics=problems) from None
+
+
+def _diagnostic(error: dict[str, Any]):
+    """One pydantic error as a ``Diagnostic`` (``unknown key`` for a forbidden extra key)."""
+    from .component import Diagnostic
+
+    original = (error.get("ctx") or {}).get("error")
+    if isinstance(original, ConfigError):
+        return Diagnostic(severity="error", code="invalid", message=str(original).removeprefix(f"{original.path}: "), path=original.path or _path_of(error))
+    message = error.get("msg", "invalid").removeprefix("Value error, ")
+    code = error.get("type", "invalid")
+    if code == "extra_forbidden":
+        message, code = "unknown key", "unknown_key"
+    return Diagnostic(severity="error", code=code, message=message or "invalid", path=_path_of(error))
 
 
 def _resolve_paths(config: Config, base: Path) -> Config:
@@ -810,9 +889,47 @@ def _resolve_paths(config: Config, base: Path) -> Config:
             pipeline.arms.exact_id.alias_map = (base / pipeline.arms.exact_id.alias_map).resolve()
     if config.budgets.price_table:
         config.budgets.price_table = (base / config.budgets.price_table).resolve()
-    if config.extraction.ontology:
-        config.extraction.ontology = (base / config.extraction.ontology).resolve()
     return config
+
+
+def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
+    """``(mapping, key, dotted path)`` of every file-path value in a v2 mapping (the same set as
+    ``_resolve_paths``)."""
+    slots: list[tuple[dict[str, Any], str, str]] = []
+
+    def add(mapping: Any, key: str, path: str) -> None:
+        if isinstance(mapping, dict) and isinstance(mapping.get(key), str):
+            slots.append((mapping, key, path))
+
+    for name, backend in (data.get("backends") or {}).items():
+        if isinstance(backend, dict) and backend.get("kind") == "sqlite":
+            add(backend, "path", f"backends.{name}.path")
+    pipelines = [("pipeline", data.get("pipeline"))] + [(f"pipelines.{n}", p) for n, p in (data.get("pipelines") or {}).items()]
+    for prefix, pipeline in pipelines:
+        if not isinstance(pipeline, dict):
+            continue
+        for stage in ("decision", "generation"):
+            add(pipeline.get(stage), "prompt_file", f"{prefix}.{stage}.prompt_file")
+        add((pipeline.get("arms") or {}).get("exact_id"), "alias_map", f"{prefix}.arms.exact_id.alias_map")
+    add(data.get("budgets"), "price_table", "budgets.price_table")
+    return slots
+
+
+def rebase_paths(data: dict[str, Any], source_dir: Path, target_dir: Path) -> list[str]:
+    """Rewrite relative file paths of a v2 mapping written next to ``source_dir``'s config so they
+    name the same files from a config written in ``target_dir`` (paths are relative to the YAML
+    file). Absolute and ``~`` paths are kept. Returns the dotted keys that changed (QA-10)."""
+    source_dir, target_dir = source_dir.resolve(), target_dir.resolve()
+    changed: list[str] = []
+    for mapping, key, dotted in _path_slots(data):
+        value = mapping[key]
+        if value.startswith("~") or Path(value).is_absolute():
+            continue
+        rebased = Path(os.path.relpath(source_dir / value, target_dir)).as_posix()
+        if rebased != Path(value).as_posix():
+            mapping[key] = rebased
+            changed.append(dotted)
+    return changed
 
 
 def load_config(path: str | Path, *, check_plugins: bool = True, warn: bool = True) -> Config:

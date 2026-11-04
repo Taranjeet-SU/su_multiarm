@@ -1,7 +1,11 @@
 # Contributing
 
-Start with the research, architecture and implementation status under `docs/`. Install `.[dev,api,mcp,faiss,communities]`,
-run `pytest -q`, then `ruff check src tests`. Use synthetic examples only. Do not commit customer
+Start with the research, architecture and implementation status under `docs/`. Install `.[dev,api,mcp,faiss,communities]`
+(or `.[all,dev]`), run `pytest -q`, then `ruff check src tests`. CI runs the same `pytest -q`. It needs no
+services: the `external` tests skip with the reason when their `SU_TEST_*` variable is unset and the
+default throwaway stack in `tests/services/` does not answer (or the client extra is not installed).
+A configured variable whose server does not answer fails instead of skipping. To run them, start that
+stack and use `pytest -q -m external`. Use synthetic examples only. Do not commit customer
 records, question sets, model weights, indexes, tokens, private endpoints or `.env` files.
 
 For a backend, add an optional dependency, typed configuration, a lazy adapter and integration tests

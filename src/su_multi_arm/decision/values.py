@@ -370,3 +370,104 @@ def resolve_request_filters(resolver: ValueResolver, filters: dict[str, JsonScal
         if resolution.zero_match:
             result.zero_match_fields.append(field)
     return result
+
+
+class FilterCheck(StrictModel):
+    """Caller filters validated against ``MetadataSchema`` before anything executes (QA-02).
+
+    ``applied`` is what is pushed down: the typed value of a valid filter (after an unambiguous
+    coercion), the caller's value **as given** for an invalid or undeclared one. A filter is never
+    dropped, so a scope never silently widens. Every invalid or undeclared filter is an
+    ``UnsupportedConstraint``, and every aggregate computed under one is ``bounded``: an invalid
+    filter never yields an exact zero. ``coercions`` and ``untyped`` are recorded in the trace."""
+
+    applied: dict[str, JsonScalar] = Field(default_factory=dict)
+    unsupported: list[UnsupportedConstraint] = Field(default_factory=list)
+    invalid: dict[str, str] = Field(default_factory=dict)  # field -> unsupported reason
+    coercions: list[dict[str, Any]] = Field(default_factory=list)  # {field, from, to, type}
+    untyped: list[str] = Field(default_factory=list)  # undeclared fields applied as untyped string equality
+
+    def trace(self) -> dict[str, Any]:
+        """Field names, coercion kinds and reasons only (values stay out of the trace)."""
+        return {
+            "fields": sorted(self.applied),
+            "coercions": [{"field": c["field"], "type": c["type"]} for c in self.coercions],
+            "untyped": list(self.untyped),
+            "invalid": dict(self.invalid),
+        }
+
+
+UNTYPED_SUGGESTION = (
+    "undeclared field: applied as untyped string equality (metadata_schema.unknown_fields: allow); "
+    "declare it as a filterable field for typed matching and exact aggregates"
+)
+
+
+VALUE_NOT_OBSERVED = (
+    "the filter value is not among the field's observed values in this generation; it was applied as "
+    "given, so the aggregate is bounded and an absence or zero-count claim on it is refused"
+)
+
+
+def _coerce(spec: FieldSpec, value: JsonScalar) -> JsonScalar:
+    """Unambiguous coercions only: ``"3"``→3 (integer), ``"2.5"``→2.5 (number), ``"true"``→True
+    (boolean), an integer → its decimal text (``string``/``id``). Anything else is returned unchanged
+    and validated (and refused) by the resolver."""
+    if value is None or (isinstance(value, bool) and spec.type != "boolean"):
+        return value
+    try:
+        if spec.type in {"integer", "number"}:
+            return _parse_number(spec, value)
+        if spec.type == "boolean":
+            return _parse_boolean(spec, value)
+    except BoundError:
+        return value
+    if spec.type in {"string", "id"} and isinstance(value, int):
+        return str(value)
+    return value
+
+
+def check_request_filters(resolver: ValueResolver, filters: dict[str, JsonScalar]) -> FilterCheck:
+    """Validate caller filters against the schema (see ``FilterCheck``).
+
+    * declared field: unambiguous coercion, then the ``ValueResolver`` row for ``eq``
+      (``type_mismatch``, ``unparseable_bound``, ``timezone_missing``, enum ``value_not_observed``,
+      ``field_not_filterable``). Datetime/date values are parsed but pushed down as given, so the
+      backend's stored-value comparison is unchanged. A string/id value on a listable field under
+      its catalog cap that no record holds is applied but reported as ``value_not_observed``.
+    * undeclared field under ``unknown_fields: reject``: ``field_not_filterable``.
+    * undeclared field under ``unknown_fields: allow``: applied as untyped string equality,
+      labelled in ``untyped`` and reported (``field_not_filterable``) because its aggregate cannot be
+      exact."""
+    schema = resolver.schema
+    check = FilterCheck()
+    for field, value in filters.items():
+        spec = schema.field(field)
+        if spec is None:
+            check.applied[field] = value
+            check.invalid[field] = "field_not_filterable"
+            suggestion = UNTYPED_SUGGESTION if schema.unknown_fields == "allow" else f"declare {field!r} as a filterable field in metadata_schema"
+            if schema.unknown_fields == "allow":
+                check.untyped.append(field)
+            check.unsupported.append(UnsupportedConstraint(constraint_text=f"{field} eq {value!r}", reason="field_not_filterable", suggestion=suggestion))
+            continue
+        coerced = _coerce(spec, value)
+        resolution = resolver.resolve(Predicate(field=field, op="eq", value=coerced), from_request=True)
+        if resolution.unsupported is not None:
+            check.applied[field] = value  # as given: never dropped, never widened
+            check.invalid[field] = resolution.unsupported.reason
+            check.unsupported.append(resolution.unsupported)
+            continue
+        if spec.type in {"datetime", "date"}:
+            check.applied[field] = value
+            continue
+        check.applied[field] = coerced
+        if resolution.zero_match and resolver.observed(field) is not None:
+            # A listable field whose value universe is known, and the caller's value is not in it
+            # (a typo, or the wrong case on a case-sensitive field): applied as given, but its
+            # aggregate is not exact, so "0" or an absence claim never passes on it (N4).
+            check.invalid[field] = "value_not_observed"
+            check.unsupported.append(UnsupportedConstraint(constraint_text=f"{field} eq {value!r}", reason="value_not_observed", suggestion=VALUE_NOT_OBSERVED))
+        if type(coerced) is not type(value) or coerced != value:
+            check.coercions.append({"field": field, "from": value, "to": coerced, "type": f"{type(value).__name__}->{spec.type}"})
+    return check

@@ -18,7 +18,7 @@ import numpy as np
 
 from ..backends import capabilities as caps
 from ..backends.contracts import CONTRACT_NAMES
-from ..core.errors import BackendError
+from ..core.errors import BackendError, SessionConflict
 from ..core.types import (
     Chunk,
     Document,
@@ -517,6 +517,16 @@ def check_session(adapter: Any) -> None:
         pass
     sessions.touch("s1", 50.0)
     _ensure(sessions.get("s1").last_seen_at == 50.0, "touch")
+    # Compare-and-set (QA-05): a write from a stale version is refused and changes nothing.
+    stored = sessions.get("s1")
+    sessions.touch("s1", 50.0, stored.model_copy(update={"usage": {"calls": 1.0}}), expected_version=stored.version)
+    _ensure(sessions.get("s1").version == stored.version + 1 and sessions.get("s1").usage == {"calls": 1.0}, "cas write bumps the version")
+    try:
+        sessions.touch("s1", 50.0, stored.model_copy(update={"usage": {"calls": 7.0}}), expected_version=stored.version)
+        raise AssertionError("stale compare-and-set accepted")
+    except SessionConflict:
+        pass
+    _ensure(sessions.get("s1").usage == {"calls": 1.0}, "stale cas wrote nothing")
     try:
         sessions.touch("ghost", 1.0)
         raise AssertionError("unknown session")

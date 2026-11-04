@@ -4,7 +4,8 @@ title: "su_multi_arm: configurable multi-arm retrieval with typed scope, provena
 type: software
 authors:
   - name: "su_multi_arm contributors"
-version: "2.0.0a1"
+version: "2.0.0a2"
+date-released: "2026-11-04"
 license: Apache-2.0
 repository-code: "https://github.com/Taranjeet-SU/su_multiarm"
 url: "https://taranjeet-su.github.io/su_multiarm/"

@@ -286,40 +286,106 @@ def validate_reply(schema: type[T], raw: str, stage: str) -> T:
         ) from error
 
 
-def strict_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
-    """The schema in OpenAI strict form (every object closed, every property required), or ``None``
-    when it contains a free-form mapping (``additionalProperties`` with a schema, or an object
-    without declared properties), which strict mode cannot express. Defaults and titles are
-    dropped; the reply is still validated with the original pydantic model, so a value the model
-    now has to emit explicitly is accepted."""
+# OpenAI strict structured output accepts a subset of JSON Schema. ``STRICT_KEYWORDS`` holds the
+# documented structural keywords plus those the 2026-11-03 live probe saw accepted
+# (docs/plans/reviews/qa_2.0.0a1.md, QA-15). Everything else (``oneOf``, ``allOf``, ``not``,
+# ``discriminator``, ``uniqueItems``, ``if``/``then``/``else``, ``patternProperties``,
+# ``prefixItems`` ...) is refused before any call. ``title`` and ``default`` are dropped: the reply is
+# validated with the original pydantic model, so a value the model now has to emit is accepted.
+STRICT_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "const",
+        "anyOf",
+        "$ref",
+        "$defs",
+        "description",
+        "pattern",
+        "format",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+    }
+)
+STRICT_DROPPED: frozenset[str] = frozenset({"title", "default"})
+_ANYOF_SIBLINGS: frozenset[str] = frozenset({"anyOf", "description"})
 
-    class NotStrict(Exception):
-        pass
 
-    def walk(node: Any) -> Any:
+class StrictSchemaError(CapabilityMismatch):
+    """A schema OpenAI strict mode cannot express. ``problems`` lists every offending construct
+    with its JSON path so validation reports all of them at once. Raised before any call."""
+
+    def __init__(self, name: str, problems: list[str]):
+        self.schema_name = name
+        self.problems = list(problems)
+        super().__init__(f"{name} is not strict-expressible: " + "; ".join(self.problems) + " (declare structured_output: json_schema for this role)")
+
+
+def strict_schema(schema: dict[str, Any], name: str = "schema") -> dict[str, Any]:
+    """The schema in OpenAI strict form (every object closed, every property required).
+
+    Raises ``StrictSchemaError`` listing every construct strict mode refuses: a keyword outside
+    ``STRICT_KEYWORDS`` (``oneOf``, ``allOf``, ``discriminator``, ``uniqueItems`` ...), a ``const``
+    without a sibling ``type``, an ``anyOf`` at the root, an ``anyOf`` mixed with constraining
+    sibling keywords or with a branch that has neither ``type`` nor ``$ref``, and free-form mappings
+    (``additionalProperties`` with a schema, or an object without declared properties). Nothing is
+    rewritten into a different construct: a schema either converts as it is or is refused."""
+    problems: list[str] = []
+
+    def walk(node: Any, path: str) -> Any:
         if isinstance(node, list):
-            return [walk(v) for v in node]
+            return [walk(v, f"{path}[{i}]") for i, v in enumerate(node)]
         if not isinstance(node, dict):
             return node
         result: dict[str, Any] = {}
         for key, value in node.items():
-            if key in {"default", "title"}:
+            if key in STRICT_DROPPED:
+                continue
+            if key not in STRICT_KEYWORDS:
+                problems.append(f"{path}: keyword {key!r} is not supported in strict mode")
                 continue
             if key in {"properties", "$defs"} and isinstance(value, dict):
-                result[key] = {name: walk(sub) for name, sub in value.items()}
+                result[key] = {sub: walk(child, f"{path}.{key}.{sub}") for sub, child in value.items()}
+            elif key in {"enum", "required", "const"}:
+                result[key] = value
             else:
-                result[key] = walk(value)
+                result[key] = walk(value, f"{path}.{key}")
+        if "const" in node and "type" not in node:
+            problems.append(f"{path}: const without a sibling type")
+        if "anyOf" in node:
+            mixed = sorted(set(node) - _ANYOF_SIBLINGS - STRICT_DROPPED)
+            if mixed:
+                problems.append(f"{path}: anyOf mixed with {mixed}")
+            if path == "$":
+                problems.append(f"{path}: anyOf at the root")
+            for i, branch in enumerate(node["anyOf"] if isinstance(node["anyOf"], list) else []):
+                if not isinstance(branch, dict) or not ({"type", "$ref"} & set(branch)):
+                    problems.append(f"{path}.anyOf[{i}]: branch without a type or $ref")
         if node.get("type") == "object" or "properties" in node:
-            if "properties" not in node or node.get("additionalProperties") not in (None, False):
-                raise NotStrict
-            result["additionalProperties"] = False
-            result["required"] = list(node["properties"])
+            if "properties" not in node:
+                problems.append(f"{path}: object without declared properties (free-form mapping)")
+            elif node.get("additionalProperties") not in (None, False):
+                problems.append(f"{path}: additionalProperties with a schema (free-form mapping)")
+            else:
+                result["additionalProperties"] = False
+                result["required"] = list(node["properties"])
         return result
 
-    try:
-        return walk(schema)
-    except NotStrict:
-        return None
+    converted = walk(schema, "$")
+    if problems:
+        raise StrictSchemaError(name, problems)
+    return converted
 
 
 class HttpCall:

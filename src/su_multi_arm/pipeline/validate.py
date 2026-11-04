@@ -184,6 +184,54 @@ def _pipeline_diagnostics(config: Config, name: str, pipeline: PipelineConfig) -
     return out
 
 
+def role_schemas() -> dict[str, list[type]]:
+    """The reply schemas the package sends per chat role (QA-13). The generator's per-request
+    variant (evidence-id and claim-kind enums) has the same shape as ``Answer``."""
+    from ..decision.llm import LlmPlan
+    from ..models import Answer, CommunityReport, Extraction
+    from .review import Review
+
+    return {"planner": [LlmPlan], "generator": [Answer], "reviewer": [Review], "extractor": [Extraction], "community": [CommunityReport]}
+
+
+def strict_schema_problems(provider: str, model: str, structured_output: str, role: str) -> list[str]:
+    """Problems of the schemas ``role`` sends when its native mode is OpenAI strict json_schema;
+    empty when the role is not strict-native or every schema converts. Consults the provider
+    capability registry, never the network."""
+    from ..providers.base import StrictSchemaError, strict_schema
+    from ..providers.capabilities import lookup
+
+    if structured_output != "native":
+        return []
+    try:
+        native_kind = lookup(provider, model).native_kind
+    except KeyError:
+        return []
+    if native_kind != "json_schema_strict":
+        return []
+    problems: list[str] = []
+    for schema in role_schemas().get(role, []):
+        try:
+            strict_schema(schema.model_json_schema(), schema.__name__)
+        except StrictSchemaError as exc:
+            problems.append(str(exc))
+    return problems
+
+
+def _strict_schema_diagnostics(config: Config) -> list[Diagnostic]:
+    out = []
+    for role, spec in config.models.roles.chat_roles().items():
+        for problem in strict_schema_problems(spec.provider, spec.model, spec.capabilities.structured_output, role):
+            out.append(
+                _error(
+                    f"models.roles.{role}.capabilities.structured_output",
+                    "schema_not_strict",
+                    problem,
+                )
+            )
+    return out
+
+
 def config_diagnostics(config: Config) -> list[Diagnostic]:
     """Every static problem of a parsed v2 config (profile overlay already applied)."""
     from ..core.config import AVAILABLE_PROFILES, BUILTIN_ACTIONS, BUILTIN_TOOLS, DEFAULT_PIPELINE
@@ -205,6 +253,7 @@ def config_diagnostics(config: Config) -> list[Diagnostic]:
         if problem:
             out.append(_error("sessions.store", "capability_missing", problem))
     roles = config.models.roles
+    out.extend(_strict_schema_diagnostics(config))
     if "llm" in config.extraction.extractors and roles.extractor is None:
         out.append(_error("extraction.extractors", "role_missing", "extraction.extractors includes llm: models.roles.extractor is required"))
     pipelines = config.all_pipelines()
@@ -285,6 +334,10 @@ def probe_report(engine: Any) -> dict[str, Any]:
         except KeyError as exc:
             entry["registry"] = None
             entry["error"] = str(exc)
+        strict = strict_schema_problems(spec.provider, spec.model, spec.capabilities.structured_output, role)
+        entry["strict_schemas"] = strict or "ok"
+        if strict:
+            entry["error"] = "; ".join(strict)
         models[role] = entry
     embedder = config.models.roles.embedder
     models["embedder"] = {"provider": embedder.provider, "model": embedder.model, "dimensions": embedder.dimensions, "called": False}

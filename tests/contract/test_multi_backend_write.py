@@ -238,7 +238,7 @@ def test_activation_order_is_derived_first_catalog_last(tmp_path, monkeypatch):
     order = []
     registry = engine.write_path.registry
     original = registry.activate
-    monkeypatch.setattr(registry, "activate", lambda manifest: (order.append(("local", [*log])), original(manifest))[1])
+    monkeypatch.setattr(registry, "activate", lambda manifest, **kw: (order.append(("local", [*log])), original(manifest, **kw))[1])
     manifest = engine.ingest(DOCS)
     gen = manifest["generation"]
     assert [name for name, _ in log] == ["vec", "lex", "graph"]
@@ -252,7 +252,7 @@ def test_activation_failure_rolls_back_switched_backends_and_keeps_current(faili
     engine, built, log = pointer_engine(tmp_path, monkeypatch)
     first = engine.ingest(DOCS)["generation"]
     if failing == "local":
-        monkeypatch.setattr(engine.write_path.registry, "activate", lambda manifest: (_ for _ in ()).throw(OSError("injected CURRENT failure")))
+        monkeypatch.setattr(engine.write_path.registry, "activate", lambda manifest, **kw: (_ for _ in ()).throw(OSError("injected CURRENT failure")))
     else:
         built[failing].fail_activate = True
     with pytest.raises(IngestError, match="activation failed") as info:

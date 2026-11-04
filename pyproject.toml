@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "su-multi-arm"
-version = "2.0.0a1"
+version = "2.0.0a2"
 description = "Configurable, provenance-aware multi-arm retrieval and grounded answers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -44,7 +44,13 @@ packages = ["src/su_multi_arm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["external: isolated external database integration tests"]
+# tests import shared helpers as ``tests.…``; the console-script ``pytest`` does not put the repo
+# root on sys.path by itself (``python -m pytest`` does). a2 review B4.
+pythonpath = ["."]
+markers = [
+  "external: isolated external database integration tests",
+  "qa: reproducible QA findings (tests/qa); xfail(strict=True) until fixed",
+]
 
 [tool.ruff]
 line-length = 110

@@ -9,6 +9,7 @@ import sqlalchemy as sa
 
 from ...core.errors import BackendError
 from ...core.types import CacheEntry, LedgerEntry, RawReply, SessionRecord
+from .._sessions import lost, next_record
 from ..memory import CACHE_KEY
 from ._db import KIND
 
@@ -118,14 +119,18 @@ class SqlSessions:
             row = conn.execute(sa.select(s.c.data).where(s.c.id == session_id)).first()
         return None if row is None else SessionRecord.model_validate_json(row[0])
 
-    def touch(self, session_id: str, now: float, record: SessionRecord | None = None) -> None:
+    def touch(self, session_id: str, now: float, record: SessionRecord | None = None, expected_version: int | None = None) -> None:
         s = self._b.rt["sessions"]
         with self._b.tx("touch") as conn:
             row = conn.execute(sa.select(s.c.data).where(s.c.id == session_id)).first()
             if row is None:
                 raise BackendError(KIND, "touch", f"unknown session {session_id}")
-            updated = (record or SessionRecord.model_validate_json(row[0])).model_copy(update={"last_seen_at": now})
-            conn.execute(s.update().where(s.c.id == session_id).values(data=updated.model_dump_json(), last_seen_at=now))
+            updated = next_record(session_id, SessionRecord.model_validate_json(row[0]), now, record, expected_version)
+            result = conn.execute(
+                s.update().where(s.c.id == session_id, s.c.data == row[0]).values(data=updated.model_dump_json(), last_seen_at=now)
+            )
+            if result.rowcount != 1:
+                raise lost(session_id, expected_version)
 
     def expire(self, now: float, ttl_seconds: float) -> int:
         s = self._b.rt["sessions"]

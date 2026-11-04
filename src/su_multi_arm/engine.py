@@ -48,6 +48,7 @@ from .core.config import SqlAlchemyBackend as SqlAlchemyBackendConfig
 from .core.config import SqliteBackend as SqliteBackendConfig
 from .core.errors import BackendError, ConfigError
 from .core.types import Document, GroupRow, Measure, Page, Predicate, Scope, ScopeResult, ScopeSpec
+from .decision.values import FilterCheck, ValueResolver, check_request_filters
 from .decision import (
     Capabilities,
     CascadeAgent,
@@ -68,6 +69,7 @@ from .decision import (
 )
 from .extraction.base import BuiltinExtractor
 from .generation import AggregateEvidence, AnswerContract
+from .generation.contract import CLAIM_KINDS, answer_schema
 from .ingestion.write import WritePath
 from .models import Aggregate, Answer, AnswerResult, Coverage, Hit, SearchRequest, SearchResult, UnsupportedConstraint
 from .pipeline import JsonModelReviewer, ReviewInput, ReviewStage, ReviewStageConfig
@@ -75,6 +77,7 @@ from .pipeline.spec import ARM_ORDER, PipelineRuntime, RequestRejected, allowed_
 from .pipeline.validate import decision_for_mode, raise_for
 from .profiles.prompts import GENERATOR_PROMPT, voice_instruction
 from .providers import Embedder, JsonModel, RunBudgetMeter
+from .providers._chat import MissingSecret
 from .runtime.acl import ANONYMOUS, AccessPolicy, NoConstraints, Principal
 from .runtime.actions import ActionRequest, ActionRunner
 from .runtime.budget import BudgetLimits, load_price_table
@@ -84,7 +87,7 @@ from .runtime.context import RunContext, new_context
 from .runtime.events import AnswerStream, ArmResultEvent, ContractEvent, DecisionEvent, EvidenceEvent, ReviewRoundEvent
 from .runtime.session import Session, SessionManager
 from .runtime.tools import invoke_tool
-from .runtime.trace import Trace
+from .runtime.trace import Sensitive, Trace
 from .runtime.turns import SessionTurns
 from .selection import Candidate, PackExtra, PackRecord, PerArm, Selected, SelectionPolicy, pack, select
 
@@ -144,6 +147,7 @@ class _Retrieval:
     incomplete: bool = False
     pack_trace: dict[str, Any] = field(default_factory=dict)
     unresolved_record_id: str | None = None  # record_context id unknown or outside the principal's scope
+    filter_check: FilterCheck = field(default_factory=FilterCheck)  # request filters validated against the schema
 
 
 class Engine:
@@ -377,26 +381,85 @@ class Engine:
         return ReviewStage(ReviewStageConfig(enabled=True, max_hops=review.max_hops), Dependencies(components=components))
 
     def _validate_components(self) -> None:
-        """``validate()`` of every component of every pipeline and every tool; all errors at once."""
+        """``validate()`` of every component of every pipeline and every tool; all errors at once.
+
+        A missing API key (``missing_secret``) of a decision or review component that only a
+        non-default pipeline or a non-default request mode uses does not fail construction (QA-14):
+        ingest and requests on other pipelines do not need it. It is re-checked when a request first
+        selects that ``(pipeline, mode)`` (``_require_keys``) and reported by ``doctor``."""
         env = Environment(env=dict(os.environ), base_path=Path.cwd())
         problems: list[Diagnostic] = []
-        stages: list[tuple[str, Any]] = [("extraction", self.extractor)]
+        # (path, component, lazy scope or None for "needed by every request / by ingest")
+        stages: list[tuple[str, Any, tuple[str, str] | None]] = [("extraction", self.extractor, None)]
         for name, runtime in self.pipelines.items():
             prefix = "pipeline" if name == "default" else f"pipelines.{name}"
-            stages.extend((f"{prefix}.arms.{arm}", component) for arm, component in runtime.arms.items())
-            stages.extend((f"{prefix}.decision", agent) for agent in runtime.decisions.values())
-            stages.extend((f"{prefix}.review", review) for review in runtime.reviews.values() if review is not None)
-        stages.extend((f"tools.{name}", tool) for name, tool in self._tools.items())
+            stages.extend((f"{prefix}.arms.{arm}", component, None) for arm, component in runtime.arms.items())
+            for mode in runtime.decisions:
+                lazy = None if (name == self.config.default_pipeline and mode == runtime.default_mode) else (name, mode)
+                stages.append((f"{prefix}.decision", runtime.decisions[mode], lazy))
+                if runtime.reviews.get(mode) is not None:
+                    stages.append((f"{prefix}.review", runtime.reviews[mode], lazy))
+        stages.extend((f"tools.{name}", tool, None) for name, tool in self._tools.items())
         seen: set[int] = set()
-        for path, component in stages:
+        self._deferred_keys: dict[tuple[str, str], list[tuple[str, Any]]] = {}
+        for path, component, lazy in stages:
             if id(component) in seen:
                 continue
             seen.add(id(component))
             for diagnostic in component.validate(env):
-                if diagnostic.severity == "error":
-                    problems.append(diagnostic.model_copy(update={"path": diagnostic.path or path, "message": f"{diagnostic.component or component.name}: {diagnostic.message}"}))
+                if diagnostic.severity != "error":
+                    continue
+                if lazy is not None and diagnostic.code == "missing_secret":
+                    self._deferred_keys.setdefault(lazy, []).append((path, component))
+                    continue
+                problems.append(diagnostic.model_copy(update={"path": diagnostic.path or path, "message": f"{diagnostic.component or component.name}: {diagnostic.message}"}))
         if problems:
             raise ConfigError("; ".join(d.message for d in problems), problems[0].path if len(problems) == 1 else None, diagnostics=problems)
+
+    def _choose(self, request: SearchRequest) -> tuple[PipelineRuntime, str]:
+        """``choose`` plus the deferred key check of the selected ``(pipeline, mode)``."""
+        pipe, mode = choose(self.config, self.pipelines, request.pipeline, request.mode)
+        self._require_keys(pipe.name, mode)
+        return pipe, mode
+
+    def _require_keys(self, pipeline: str, mode: str) -> None:
+        """Fail closed (``MissingSecret``, before any work) when a key deferred at construction is
+        still unset; once every key is present the check is not repeated."""
+        pending = self._deferred_keys.get((pipeline, mode))
+        if not pending:
+            return
+        env = Environment(env=dict(os.environ), base_path=Path.cwd())
+        missing = [f"{path}: {d.message}" for path, component in pending for d in component.validate(env) if d.severity == "error"]
+        if missing:
+            raise MissingSecret(f"pipeline {pipeline!r} (mode {mode!r}) cannot run: {'; '.join(missing)}", stage="decision")
+        self._deferred_keys.pop((pipeline, mode), None)
+
+    def missing_keys(self) -> dict[str, dict[str, list[str]]]:
+        """Unset API-key variables per pipeline and role, plus ``ingest`` for write-path roles
+        (``doctor``). Only roles a pipeline or the write path actually uses are listed."""
+        roles = self.config.models.roles
+
+        def unset(role_names: list[str]) -> dict[str, list[str]]:
+            out: dict[str, list[str]] = {}
+            for role_name in role_names:
+                role = getattr(roles, role_name)
+                if role is not None and role.api_key_env and not os.environ.get(role.api_key_env):
+                    out[role_name] = [role.api_key_env]
+            return out
+
+        report: dict[str, dict[str, list[str]]] = {}
+        write_roles = (["extractor"] if "llm" in self.config.extraction.extractors else []) + ["community"]
+        if found := unset(write_roles):
+            report["ingest"] = found
+        for name, runtime in self.pipelines.items():
+            used = ["generator"]
+            if any(decision_for_mode(runtime.config.decision, m).uses_llm() for m in runtime.decisions):
+                used.append("planner")
+            if runtime.review_enabled():
+                used.append("reviewer")
+            if found := unset(used):
+                report[f"pipeline:{name}"] = found
+        return report
 
     # --- lifecycle ---------------------------------------------------------------------------
 
@@ -471,19 +534,24 @@ class Engine:
         if session_id is None:
             return self._context_for(principal, pinned), pinned, None, None, request
         session = self.sessions.open(principal or ANONYMOUS, session_id)
-        limits = self.sessions.clip(session, self._limits())
-        ctx = self._context_for(principal, pinned, session=session, limits=limits)
-        catalog = self.backends[self.config.storage.catalog].catalog
+        # Clip to the session remainder and hold it for this turn in one compare-and-set (QA-05).
+        limits = self.sessions.reserve(session, self._limits())
+        try:
+            ctx = self._context_for(principal, pinned, session=session, limits=limits)
+            catalog = self.backends[self.config.storage.catalog].catalog
 
-        def exists(ids: list[str]) -> set[str]:
-            return {d.id for d in catalog.get(ctx.generation, ids)}
+            def exists(ids: list[str]) -> set[str]:
+                return {d.id for d in catalog.get(ctx.generation, ids)}
 
-        info = self.sessions.prepare(ctx, session, exists)
-        if request is not None:
-            added = self.sessions.exclusions(ctx, session, list(request.exclude_ids))
-            if added:
-                request = request.model_copy(update={"exclude_ids": [*request.exclude_ids, *added]})
-                info["exclusions_added"] = added
+            info = self.sessions.prepare(ctx, session, exists)
+            if request is not None:
+                added = self.sessions.exclusions(ctx, session, list(request.exclude_ids))
+                if added:
+                    request = request.model_copy(update={"exclude_ids": [*request.exclude_ids, *added]})
+                    info["exclusions_added"] = added
+        except BaseException:
+            self.sessions.release(session)
+            raise
         return ctx, pinned, session, info, request
 
     def _finish(self, ctx: RunContext, session: Session | None, info: dict[str, Any] | None, query: str | None, shown: list[str], answer_id: str | None = None) -> None:
@@ -517,6 +585,47 @@ class Engine:
             excluded.append(record_id)  # the record being looked at never retrieves itself
         predicates = [*acl, *(Predicate(field=k, op="eq", value=v) for k, v in filters.items())]
         return Scope(predicates=predicates, exclude_ids=excluded), acl
+
+    def _check_filters(self, ctx: RunContext, request: SearchRequest) -> tuple[SearchRequest, FilterCheck]:
+        """Validate the caller's filters against ``MetadataSchema`` before anything executes (QA-02):
+        unambiguous coercions are applied (and traced), invalid or undeclared filters are applied as
+        given and reported, so no aggregate under them is ever exact."""
+        if not request.filters:
+            return request, FilterCheck()
+        resolver = ValueResolver(self.config.metadata_schema, self.records, ctx.generation, ctx.constraints())
+        check = check_request_filters(resolver, dict(request.filters))
+        ctx.trace.event("request_filters", **check.trace())
+        if check.applied != request.filters or any(type(check.applied[k]) is not type(v) for k, v in request.filters.items()):
+            request = request.model_copy(update={"filters": dict(check.applied)})
+        return request, check
+
+    @staticmethod
+    def _unsupported(*groups: list[UnsupportedConstraint]) -> list[UnsupportedConstraint]:
+        """Concatenate constraint lists, dropping exact duplicates (same text and reason)."""
+        seen: set[tuple[str, str]] = set()
+        out: list[UnsupportedConstraint] = []
+        for group in groups:
+            for item in group:
+                key = (item.constraint_text, item.reason)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(item)
+        return out
+
+    @staticmethod
+    def _bound_aggregate(aggregate: dict[str, Any], unsupported: list[UnsupportedConstraint]) -> None:
+        """An aggregate computed under an unapplied qualifier or an invalid request filter answers a
+        different question: it is reported ``bounded`` with the reasons attached (never ``exact``)."""
+        if not unsupported:
+            return
+        if aggregate.get("exactness") == "exact":
+            aggregate["exactness"] = "bounded"
+        listed = list(aggregate.get("unsupported") or [])
+        for item in unsupported:
+            dumped = item.model_dump(mode="json")
+            if dumped not in listed:
+                listed.append(dumped)
+        aggregate["unsupported"] = listed
 
     def _canonical_record(self, ctx: RunContext, request: SearchRequest) -> tuple[dict[str, str] | None, str | None]:
         """The catalog record the caller context names, read through the principal's ACL scope.
@@ -576,7 +685,10 @@ class Engine:
             scope=explicit,
             canonical_record=canonical,
         )
-        intents = detect_intents(request.query, capabilities.id_patterns)
+        # The deployment's structured targets bound the aggregate grammar (QA-03): without them the
+        # schema-less permissive grammar turns ordinary questions ("the latest release notes") into
+        # aggregate intents. Every surface (search, answer, stream, tools, HTTP, MCP) comes through here.
+        intents = detect_intents(request.query, capabilities.id_patterns, capabilities.structured_targets())
         decision = pipe.decisions[mode].decide(ctx, decision_request, intents, capabilities)
         return decision_request, capabilities, decision, intents, unresolved
 
@@ -645,10 +757,20 @@ class Engine:
                     pools.setdefault(step.arm, []).append(
                         Candidate(record_id=hit.document_id, arm=step.arm, score=hit.score, chunk_ids=list(hit.chunk_ids), source=hit.source, provenance=list(hit.provenance), pinned=pinned)
                     )
+                predicates = [p.model_dump(mode="json", exclude_defaults=True) for p in step.scope.predicates] if isinstance(step, StructuredStep) else []
                 for aggregate in result.aggregates:
                     aggregate["id"] = f"aggregate:{len(state.aggregates) + 1}"
                     aggregate["filters"] = filters
+                    # The predicates actually counted (QA-09): request filters plus the compiled scope.
+                    aggregate["predicates"] = predicates
+                    self._bound_aggregate(aggregate, [*(step.unapplied if isinstance(step, StructuredStep) else []), *state.filter_check.unsupported])
                     state.aggregates.append(aggregate)
+                if isinstance(step, StructuredStep):
+                    ctx.trace.event(
+                        "structured_scope",
+                        predicates=[{"field": p.field, "op": p.op, "value": Sensitive(p.model_dump(mode="json", include={"value", "lower", "upper"}))} for p in step.scope.predicates],
+                        unapplied=len(step.unapplied),
+                    )
                 for report in result.reports:
                     if report.get("kind") == "exact_id":
                         for token, record_id in report["matched"].items():
@@ -664,6 +786,7 @@ class Engine:
                         "query": getattr(step, "query", state.request.query),
                         "seconds": seconds,
                         "filters": filters,
+                        **({"predicates": predicates} if isinstance(step, StructuredStep) else {}),
                         "documents": len(result.hits),
                         "aggregate": bool(result.aggregates),
                         "paths": len(result.paths),
@@ -776,13 +899,15 @@ class Engine:
             trace["coverage"] = {"incomplete": True, "stages": ctx.trace.root.attributes.get("incomplete_stages", [])}
         if state.unresolved_record_id is not None:
             trace["record_context"] = {"record_id": "unresolved", "used": False}
+        if state.request.filters:
+            trace["request_filters"] = state.filter_check.trace()
         return SearchResult(
             query=state.request.query,
             generation=ctx.generation.generation,
             hits=hits,
             arm_hits=arm_hits,
             aggregates=state.aggregates,
-            unsupported_constraints=[*decision.unsupported, *self._exact_unsupported(state)],
+            unsupported_constraints=self._unsupported(decision.unsupported, state.filter_check.unsupported, self._exact_unsupported(state)),
             trace=trace,
         )
 
@@ -801,12 +926,20 @@ class Engine:
         started = time.perf_counter()
         self._check_request(request)
         if pipe is None:
-            pipe, mode = choose(self.config, self.pipelines, request.pipeline, request.mode)
+            pipe, mode = self._choose(request)
         mode = mode or pipe.default_mode
+        request, check = self._check_filters(ctx, request)
         decision_request, capabilities, decision, _, unresolved = self._decide(ctx, request, pipe, mode)
         decision_seconds = time.perf_counter() - started
         state = _Retrieval(
-            request=request, decision_request=decision_request, capabilities=capabilities, decision=decision, pipe=pipe, mode=mode, unresolved_record_id=unresolved
+            request=request,
+            decision_request=decision_request,
+            capabilities=capabilities,
+            decision=decision,
+            pipe=pipe,
+            mode=mode,
+            unresolved_record_id=unresolved,
+            filter_check=check,
         )
         steps = self._steps(decision, decision_request)
         if emit is not None:
@@ -843,7 +976,7 @@ class Engine:
     def search(self, request: SearchRequest | str, principal: Principal | None = None, session_id: str | None = None) -> SearchResult:
         if isinstance(request, str):
             request = SearchRequest(query=request)
-        pipe, mode = choose(self.config, self.pipelines, request.pipeline, request.mode)
+        pipe, mode = self._choose(request)
         ctx, _pinned, session, info, request = self._begin(principal, session_id, request)
         result: SearchResult | None = None
         try:
@@ -971,16 +1104,24 @@ class Engine:
         # Memory never reaches the generator: the payload is the question, the caller context and
         # the evidence packed for this turn only.
         payload = {"question": state.request.query, "record_context": self._record_context(state), "evidence": evidence}
+        schema: Any = Answer
+        if generator.enforces_schema():
+            # QA-08: where the provider enforces the schema, cited ids are restricted to the supplied
+            # evidence and non-narrative claim kinds to requests that carry aggregate evidence.
+            has_aggregate = any(row.get("source") == "structured" for row in evidence)
+            kinds = CLAIM_KINDS if has_aggregate else ("narrative",)
+            schema = answer_schema([row["id"] for row in evidence], kinds)
+            ctx.trace.event("generator_schema", evidence_ids=len(evidence), claim_kinds=list(kinds))
         if on_delta is not None and generator.streams():
-            reply = generator.call_stream(prompt, payload, Answer, bridge, "generator", on_delta)
+            reply = generator.call_stream(prompt, payload, schema, bridge, "generator", on_delta)
         else:
-            reply = generator.call(prompt, payload, Answer, bridge, "generator")
+            reply = generator.call(prompt, payload, schema, bridge, "generator")
         return reply if isinstance(reply, Answer) else Answer.model_validate(reply.model_dump(mode="json"))
 
     def answer(self, request: SearchRequest | str, principal: Principal | None = None, session_id: str | None = None) -> AnswerResult:
         if isinstance(request, str):
             request = SearchRequest(query=request)
-        pipe, mode = choose(self.config, self.pipelines, request.pipeline, request.mode)
+        pipe, mode = self._choose(request)
         started = time.perf_counter()
         ctx, pinned, session, info, request = self._begin(principal, session_id, request)
         return self._answer_turn(ctx, pinned, session, info, request, pipe, mode, started)
@@ -991,7 +1132,7 @@ class Engine:
         an ``error`` event. The ``done`` event carries the same ``AnswerResult`` as ``answer``."""
         if isinstance(request, str):
             request = SearchRequest(query=request)
-        pipe, mode = choose(self.config, self.pipelines, request.pipeline, request.mode)
+        pipe, mode = self._choose(request)
         self._check_request(request)
         started = time.perf_counter()
         ctx, pinned, session, info, request = self._begin(principal, session_id, request)
@@ -1069,9 +1210,12 @@ class Engine:
             evidence_ids=evidence_ids,
             aggregates=aggregates,
             intents=state.decision.intents,
-            unsupported=state.decision.unsupported,
+            unsupported=self._unsupported(state.decision.unsupported, state.filter_check.unsupported),
             coverage=self._coverage(manifest),
             trace=ctx.trace,
+            question=state.request.query,
+            targets=state.capabilities.structured_targets(),
+            passages=[row.get("passage", "") for row in evidence if row.get("source") != "structured"],
         )
         trace: dict[str, Any] = {
             "seconds": time.perf_counter() - started,
@@ -1151,7 +1295,7 @@ class Engine:
     # --- EngineOperations for the built-in tools -------------------------------------------------
 
     def search_in(self, ctx: RunContext, request: SearchRequest) -> SearchResult:
-        pipe, mode = choose(self.config, self.pipelines, request.pipeline, request.mode)
+        pipe, mode = self._choose(request)
         return self._retrieve(ctx, request, pipe, mode)[1]
 
     def documents_in(self, ctx: RunContext, ids: list[str]) -> list[Document]:
@@ -1176,5 +1320,13 @@ class Engine:
         unknown = sorted({f for f in named if f not in declared})
         if unknown:
             raise RequestRejected(f"aggregate fields {unknown} are not declared in metadata_schema")
-        constraints = [*ctx.constraints(), *(Predicate(field=k, op="eq", value=v) for k, v in filters.items())]
-        return self.records.execute(ctx.generation, spec, constraints)
+        # Same filter validation as search/answer (QA-02): coerced when unambiguous, otherwise
+        # applied as given and the result is never exact.
+        check = check_request_filters(ValueResolver(self.config.metadata_schema, self.records, ctx.generation, ctx.constraints()), dict(filters))
+        ctx.trace.event("request_filters", **check.trace())
+        constraints = [*ctx.constraints(), *(Predicate(field=k, op="eq", value=v) for k, v in check.applied.items())]
+        result = self.records.execute(ctx.generation, spec, constraints)
+        if check.unsupported:
+            exactness = "bounded" if result.exactness == "exact" else result.exactness
+            result = result.model_copy(update={"exactness": exactness, "unsupported": [*result.unsupported, *check.unsupported]})
+        return result

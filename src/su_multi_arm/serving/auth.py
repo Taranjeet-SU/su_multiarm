@@ -8,9 +8,9 @@ A ``PrincipalResolver`` turns request headers into a ``runtime.acl.Principal`` o
   identity the CLI and the Python API use, so sessions created there are usable here) with the
   ``search``, ``answer`` and ``tools`` scopes; no ``actions`` scope.
 * ``BearerTokenResolver`` — one shared token read from the environment variable named by
-  ``serving.http.token_env`` (or ``serve --token-env``); constant-time comparison. The principal is
-  ``bearer`` with ``search``, ``answer``, ``tools`` and ``actions`` scopes (an action still needs
-  ``serving.actions.allow``).
+  ``serving.http.token_env`` (or ``serve --token-env``); the scheme is case-insensitive and the
+  token is compared in constant time. The principal is ``bearer`` with ``search``, ``answer``,
+  ``tools`` and ``actions`` scopes (an action still needs ``serving.actions.allow``).
 
 OAuth2, OIDC, mTLS or per-client API keys are **outside the core**: implement ``resolve(headers)``
 in your own code and pass it as ``create_app(..., principal_resolver=...)`` /
@@ -50,12 +50,14 @@ class BearerTokenResolver:
     def __init__(self, token: str, principal: Principal = BEARER_PRINCIPAL):
         if not token:
             raise ValueError("bearer token must not be empty")
-        self._expected = "Bearer " + token
+        self._expected = token.encode()
         self.principal = principal
 
     def resolve(self, headers: Mapping[str, str]) -> Principal:
-        supplied = headers.get("authorization") or ""
-        if not secrets.compare_digest(supplied.encode(), self._expected.encode()):
+        # RFC 9110 §11.1: the auth scheme is case-insensitive ("bearer", "Bearer", "BEARER"); the
+        # token itself is compared exactly, in constant time.
+        scheme, _, credentials = (headers.get("authorization") or "").partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(credentials.strip(" ").encode(), self._expected):
             raise Unauthenticated("invalid bearer token")
         return self.principal
 

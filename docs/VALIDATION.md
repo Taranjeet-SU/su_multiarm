@@ -1,28 +1,27 @@
 # Validation report
 
-## 2.0.0a1 status — 2026-11-03
+## 2.0.0a2 status — 2026-11-04
 
-Release candidate: `2.0.0a1` (branch `v2/phase-0`). Phase 0 and Phase 1 of
-[the v2 implementation plan](plans/v2_implementation_plan.md) are implemented: the v2 kernel and
-config, the six first-release adapters (SQLite, PostgreSQL, generic SQL, OpenSearch, Elasticsearch,
-MongoDB) plus Neo4j for graph, OpenAI / Anthropic / OpenAI-compatible providers, rules / classifier /
-LLM / cascade decision agents, declarative pipelines, sessions, tools and actions, and HTTP + SSE and
-MCP (stdio and streamable HTTP) serving.
+Release candidate: `2.0.0a2` (branch `v2/phase-0`). This release fixes the 2.0.0a1 QA findings
+(QA-01 to QA-16), the 2.0.0a1 completeness-review risks R1 to R3 and the 2.0.0a2 release-review
+blockers B1 to B6. [CHANGELOG.md](https://github.com/Taranjeet-SU/su_multiarm/blob/main/CHANGELOG.md)
+lists the changes. The scope of Phase 0 and Phase 1 is unchanged from 2.0.0a1.
 
-What the evidence is, by level (dated entries below give the detail):
+Evidence by level. The "2.0.0a2 release evidence" entry at the end has the detail:
 
-- **Synthetic local suite** (`pytest -m 'not external'`): unit, contract, parity and conformance tests
-  on synthetic fixtures with the in-memory, SQLite and SQLAlchemy-on-SQLite adapters and mocked
-  providers. Count at the release-review fix commit: see the 2026-11-03 entry at the end.
-- **Real-service conformance** (disposable local containers, `-m external`): one consolidated run of
-  every adapter's conformance suite plus `tests/services/*` at source commit `8f6dd56` (100 passed,
-  17 skipped, 0 failed; image digests recorded). See "2.0.0a1 release evidence" at the end.
-- **Local-model provider smoke**: `tests/services/test_local_llm.py` 1 passed against a small local
-  model (`qwen2.5:1.5b`) behind an OpenAI-compatible endpoint (coordinator run, 2026-11-03).
-- **Lexical cross-engine agreement**: informational report in
-  [LEXICAL_AGREEMENT.md](LEXICAL_AGREEMENT.md) (synthetic examples, 7 documents; not a gate).
-- **Not measured**: relevance or answer quality on any non-synthetic corpus, paid-provider behaviour
-  (hosted Anthropic and OpenAI remain mocked), scaling and concurrency.
+- **Synthetic local suite**: `python -m pytest -m 'not external'`, **1018 passed**, plus the bare
+  `pytest -q` that CI runs in a fresh venv with the CI extras: 1007 passed, 131 skipped, 0 errors.
+- **Real-service conformance**: one consolidated `-m external` run on the five disposable containers
+  gave **108 passed, 18 skipped, 0 failed**. Image digests are recorded.
+- **2.0.0a1 index compatibility**: an index built by the published 2.0.0a1 tree opens and serves
+  search under 2.0.0a2. A golden test pins the 2.0.0a1 fingerprint of every shipped example.
+- **Paid providers**: OpenAI (`gpt-4o-mini`) was exercised for real in the 2.0.0a2 QA-08 rerun
+  (slice D entry). **Anthropic has still not completed a real call.** The 2.0.0a2 smoke got HTTP 429
+  on its first request and spent $0.00.
+- **Local-model provider smoke**: `tests/services/test_local_llm.py` passed against a small local
+  model (2026-11-03). It was not re-run for 2.0.0a2.
+- **Not measured**: relevance or answer quality on any non-synthetic corpus, Anthropic behaviour,
+  scaling, and contention between writers on different hosts.
 
 The sections that follow, starting with the 0.1.0a1 alpha report, are kept as dated history; their
 version numbers and test counts describe the code at that date, not this release.
@@ -1192,3 +1191,219 @@ uncommitted capability-table tests in the working tree). Before this slice the s
 passed and 1 failed: the tracked-file denylist test matched its own `DENYLIST` line once the test
 file was committed (it had passed while untracked); the test now excludes its own file.
 
+
+## 2.0.0a2 serving/config slice — 2026-11-04 (QA-05, 07, 10, 11, 12, 14, 16; review risk R3)
+
+Evidence level: **synthetic and mocked**, plus one small real-service check. Fixes for the
+2.0.0a1 QA findings named above (`docs/plans/reviews/qa_2.0.0a1.md`); each fixed finding's
+`xfail(strict=True)` marker in `tests/qa/test_qa_2_0_0a1.py` was removed and the test now passes.
+
+- QA-05 sessions: every session write is a compare-and-set on `SessionRecord.version`; the
+  session-budget clip is a per-turn hold taken in the same CAS. Tests: 30 concurrent `search` turns
+  on one session on sqlite and memory keep 30 turns; 30 concurrent `answer` turns under
+  `budgets.session.max_llm_calls: 3` make at most 3 model calls (the generator is a fake that sleeps
+  50 ms to force overlap); store-level CAS tests on memory, sqlite, sqlalchemy-on-sqlite (conformance
+  kit) and a MongoDB document fake. **Real service**: the kit's `check_session` (now with the CAS
+  checks) passed on PostgreSQL and SQLAlchemy-on-PostgreSQL against the local throwaway stack
+  (`tests/services/`, already running, isolated random prefixes). MongoDB CAS was **not** run against a
+  server: its conformance fixture drops a shared database name and the stack was in use by another run.
+- QA-07 sqlite lexical: the query is no longer `str.casefold`ed (FTS5 `unicode61` folds it as it
+  folded the text). `Straße`, `ﬁle`, `Œuvre` and Greek capitals match their own indexed words;
+  `strasse`/`file` do not (unicode61 expands neither). `scripts/lexical_agreement.py` (sqlite only,
+  no `SU_TEST_*` variable set): per-query results byte-identical before and after the change on the
+  23-query list, so `docs/LEXICAL_AGREEMENT.md` stays valid.
+- QA-10 `config upgrade --output` rebases relative paths for the output's directory (CLI test from
+  another directory opens the v1 index). QA-11 schema errors are aggregated with key paths; the CLI
+  prints concise errors with exit codes 1/2/3 and a traceback only with `--debug`. QA-12 the bearer
+  scheme is case-insensitive. QA-14 keys used only by non-default pipelines/modes are checked on
+  first use; `doctor` reports `missing_keys`.
+- QA-16: `pytest -q` in a venv with every extra installed and **no** services: 823 passed, 115
+  skipped, 12 xfailed, 0 errors, measured before the 4 `tests/unit/test_service_probe.py` tests
+  were added and before the throwaway stack was started by another run (before the fix: 27 failed,
+  46 errors from the OpenSearch/Elasticsearch conformance and OpenSearch services tests). The external search-engine tests now skip with the
+  reason when their variable is unset and the default stack does not answer.
+- Risk R3: `extraction.ontology`, `models.roles.judge`, `models.roles.cache_gate` and
+  `pipeline.arms.cache` are refused at validation ("not implemented in this release"); a unit test
+  walks every Config field and requires a reader (name-based).
+
+Local suite at the slice commit: `pytest -q -m 'not external'` 824 passed, 12 xfailed (before: 766
+passed, 20 xfailed at `95bb183`); ruff clean; `docs/config.schema.json` regenerated.
+Not covered: MongoDB CAS on a real server; multi-process (as opposed to multi-thread and
+multi-manager) session contention; hosted providers (all model calls are fakes).
+
+## Decision agent, typed scope, request filters, answer contract, generation — 2026-11-04 (2.0.0a2, slice a2/decision-contract)
+
+Fixes for QA-01, QA-02, QA-03, QA-04, QA-08, QA-09, QA-13 and QA-15 of
+[the 2.0.0a1 QA report](plans/reviews/qa_2.0.0a1.md). Evidence levels:
+
+- **Synthetic / mocked (offline)**: `pytest -m 'not external'` 846 passed, 9 xfailed (was 766 passed,
+  20 xfailed). The QA reproductions for QA-01, QA-02 (3), QA-03 (3), QA-04, QA-09, QA-13 and QA-15
+  now pass without `xfail`; model replies are replayed through a mocked HTTP transport. New tests:
+  `tests/unit/test_answer_text_contract.py` (statement detection incl. non-count numbers: versions,
+  dates, ids, decimals, percentages, durations, step numbers, quotations from evidence; strip/abstain/
+  fail; absence needs an empty exact scope; per-request answer schema),
+  `tests/contract/test_scope_qualifiers_and_filters.py` (the recorded QA-01 shape and four variants,
+  exact scopes stay exact, request filters, caller-typed aggregates, plain retrieval, QA-09
+  predicates, every QA-02 filter class, the aggregate tool, QA-03 on `examples/v2/local.yaml` and the
+  v1 `examples/local.yaml` through search, answer, stream, the `search` tool and HTTP), and strict
+  schema cases in `tests/unit/test_provider_capabilities.py` (every refused keyword, the accepted
+  keyword set, every schema the package sends, validation and `doctor --probe` reporting). The nine
+  NL-count probe tests still pass (their raw-fallback violation list now also names
+  `answer_text_without_exact_scope`).
+- **Real provider (paid, OpenAI `gpt-4o-mini`, QA-08 only)**: the same 25 plain how-to questions as
+  the QA report (10 questions twice on the QA's synthetic 305-document corpus with its config:
+  `rules` decision, native generator, neutral profile; plus the 5 questions of
+  `test_qa08_narrative_questions_mostly_answer` on the committed synthetic fixture). Before (QA report,
+  2.0.0a1): 24 of 25 abstained. After (this slice): **0 of 25 abstained**, all 25 `contract: passed`,
+  every claim typed `narrative` (the per-request schema offered no other kind because no aggregate
+  evidence was supplied), no invented ids. One reply (1 of 25) had an empty `answer` string with a cited
+  narrative claim and passed; the contract now rejects that (`empty_answer`, unit-tested offline, not
+  re-run against the provider), so the effective rate for that sample is 1 of 25. The opt-in
+  `test_qa08_narrative_questions_mostly_answer` passed once more against the provider afterwards (5
+  questions). Spend through the QA transport-level guard and ledger
+  (`~/su_mutliarm_tests/qa/qa_ledger.jsonl`, pessimistic $2/$8 per 1M tokens): 30 calls, $0.3425
+  (tags `a2_qa08` $0.2909, `a2_qa08_pytest` $0.0516); cumulative OpenAI QA spend $0.8641 of the $2.00
+  cap; no call refused. Anthropic was not used (the supplied key is invalid).
+
+Not measured: answer correctness or relevance of the 25 answers (only the contract outcome was
+recorded), the QA-04 text detector's precision on real model output beyond these 25 replies,
+languages other than English (the detector yields no statements; typed claims still bind), and
+Anthropic native tool use with the per-request enum schema.
+
+## Write path: leases, fencing, incremental embeddings, ingestion budget — 2026-11-04 (slice 2.0.0a2/W)
+
+Fixes completeness-review risks R1 and R2 (`docs/plans/reviews/a1_completeness_review.md`) and QA-06
+(`docs/plans/reviews/qa_2.0.0a1.md`). R1: every generation registry has an owner-token write lease
+with heartbeat renewal, expiry only after missed renewals, owner-only renewal/release (Elasticsearch
+no longer deletes another holder's lock document), and activation as a compare-and-set on the
+expected previous generation (`ingestion/lease.py`, ARCHITECTURE "Writers"). R2: vectors are reused
+by exact input and embedding recipe and streamed in `batch_size` windows; the manifest reports
+`embedded`/`reused_embeddings` and what is still rebuilt (`incremental`). QA-06: `budgets.ingest`
+(`max_llm_calls` default 10000, `max_embedding_calls`, `max_usd`) replaces the per-request cap on the
+write path, with reservations before every LLM and embedding call.
+
+Evidence level:
+
+* **Synthetic unit/contract tests** (`pytest -m 'not external'`, bytecode off, external basetemp):
+  **797 passed, 126 deselected, 19 xfailed** (before: 766 passed, 117 deselected, 20 xfailed; the
+  QA-06 test lost its `xfail` and passes). New: `tests/unit/test_write_leases.py` (two concurrent
+  writer threads on sqlite and memory — exactly one activates, the other gets `WriteConflict(held)`,
+  its retry keeps every document; a writer whose lease expired and was taken over fails
+  `write_conflict:lost`; a moved base fails `write_conflict:stale_base`; lease/CAS checks on the
+  memory, file, SQLAlchemy-on-SQLite, MongoDB (fake collection) and PostgreSQL (fake connection)
+  registries), `tests/unit/test_incremental_embeddings.py` (one changed document re-embeds only its
+  changed chunks, counted at the embedder; a title change re-embeds that document; a change of prefix,
+  dimension, model or revision re-embeds all; unchanged recipe reuses all; embedding-call budget;
+  corrupt stored vector fails the build; vectors streamed per window), `tests/unit/test_ingest_budget.py`
+  (offline `httpx.MockTransport`: 16 extraction calls succeed under a per-request cap of 2; the ingest
+  cap stops at 3; `ingest.max_usd` stops extraction with committed spend ≤ the cap; embedding requests
+  counted and priced from reported usage; unpriced spending role refused at construction; v1
+  upgrade mapping), plus Elasticsearch lease/alias-fence unit tests with a fake transport.
+* **Real-service tests** (throwaway `su-multi-arm-tests` containers, started with
+  `up -d --wait postgres mongo elasticsearch opensearch neo4j` and removed with `rm -sf` of exactly
+  those services): `pytest -m external tests/conformance tests/services/test_multi_backend_engine.py`
+  **98 passed, 16 skipped (undeclared kit capabilities), 0 failed**, including the new lease/CAS tests
+  on PostgreSQL (advisory lock seen in `pg_locks`), SQLAlchemy-on-PostgreSQL, MongoDB, Elasticsearch
+  (lease document with `if_seq_no`, alias `must_exist` fence, concurrent-switch refusal) and the
+  OpenSearch alias and Neo4j pointer compare-and-set. Images: `opensearchproject/opensearch@sha256:72fe2fc8…`,
+  `elasticsearch@sha256:413d8df6…`, `pgvector/pgvector@sha256:40b40496…`, `neo4j@sha256:5a015e53…`,
+  `mongo@sha256:c630c593…`.
+* **Not measured**: no hosted provider was called (USD accounting is checked against an operator
+  price table with mocked usage); no throughput or memory measurement at scale; multi-process
+  writer contention was exercised with threads (and, on the servers, with separate registry objects),
+  not with separate hosts.
+
+Ruff clean. `docs/config.schema.json` regenerated with `core.schema.write_all` (adds `budgets.ingest`
+and `models.roles.embedder.pricing_key`; the embedder `pricing_key` is excluded from the index
+fingerprint, so existing generations stay valid).
+
+## 2.0.0a2 release evidence — 2026-11-04 (branch `v2/phase-0`, release-review fixes)
+
+Source: the release-review fix commits on `v2/phase-0` after `70dca3f`. Inputs: the blocking and
+non-blocking items of `docs/plans/reviews/a2_release_review.md`. The review's own runs at `756b345`
+were:
+
+- `python -m pytest -q` with no services: 937 passed, 124 skipped.
+- Bare `pytest -q`: 2 collection errors.
+- External run on five containers: 107 passed, 1 failed, 18 skipped.
+
+All runs below used `PYTHONDONTWRITEBYTECODE=1` with temporary paths under
+`~/su_mutliarm_tests/claude/a2fix/`.
+
+| Run | Result |
+|---|---|
+| `ruff check src tests` | All checks passed |
+| `python -m pytest -q -m 'not external'` (repo venv) | **1018 passed**, 126 deselected. Before the fixes, at `70dca3f`: 934 passed, 1 skipped |
+| Fresh venv from `git archive HEAD` with the CI extras `[dev,api,mcp,faiss,communities,sql,postgres,openai,anthropic]`, bare `pytest -q`, no `SU_TEST_*` | **1007 passed, 131 skipped, 0 errors**. With `-o pythonpath=` the collection fails with 2 errors (B4 reproduced and fixed). The first fresh run also had 8 errors: the Elasticsearch and OpenSearch conformance modules imported the client without the extra. They now skip unless a server URL is set. |
+| `pytest -q -m external -rs`, all six `SU_TEST_*` variables, five containers (`su-multi-arm-tests`) | **108 passed, 18 skipped, 0 failed** (1018 deselected). Skips: undeclared capabilities (16), paid QA-08 (1), local LLM not configured (1) |
+| Image IDs | elasticsearch 8.17.4 `sha256:413d8df69823e9f41f6008f025fcbaf31a5849ab9c74894731d7ded65543cd56`; mongo 7.0.16 `sha256:c630c59342c1493d50345136df2af14a76b9e827dd5316bfabee07a0880a5f3a`; neo4j 5.26.0-community `sha256:5a015e53de1895e7eee1574ae0325cf8c4b89587222778108c594bdd45a474b5`; opensearch 2.19.1 `sha256:72fe2fc84be8295906b8efca020b46c58ed45c8da60cd9b8b49e1991e38e89a4`; pgvector 0.8.0-pg17 `sha256:40b404964359299eefdd5f8518facf1886c562848cf4de13b6eaf91cb70c2b87` |
+| Containers | Started with `up -d --wait` and removed with `down -v`. `docker ps` listed the same four unrelated containers before and after. |
+| `su-multi-arm --version` (fresh venv); `python -m build` | `su-multi-arm 2.0.0a2`; `su_multi_arm-2.0.0a2-py3-none-any.whl` + `.tar.gz` (sdist includes CHANGELOG.md) |
+
+**Blockers.**
+
+- **B1 (synthetic, engine-level).** The reviewer's repro now gives `bounded` with
+  `qualifier_not_applied: "priority 3"` and `contract: abstained`. The repro is "How many priority
+  3 tickets are open?" with a planner scope of `status=open`, on 36 records where the truth is 4.
+  Variants:
+  - The same holds with `priority` listable, and for "have priority 3", "priority is 3", "priority
+    above 2" and "priority: 3".
+  - A scope or filter that applies the qualifier (`priority=3`, `"3"`, request filter, or `range
+    lower 3`) stays exact at 4.
+  - A wrong value (2) is flagged.
+  - Unit tests cover `version 2.1` (number), `severity high` (non-listable string), `escalated` /
+    `escalated false` (boolean), an id field, comparisons, and a negative list of 11 plain questions.
+
+  The nine count probes (`tests/unit/test_count_probes.py`) and the plain-retrieval tests are
+  unchanged and pass.
+- **B2 (local, both trees).** `examples/v2/local.yaml` was ingested with the published 2.0.0a1 tree,
+  a `git archive` of `public-main` = `a58df97`. `search` under 2.0.0a2 then exits 0 with top hits
+  `case:certificate`, `kb:certificate`. Without the fix the same index gives `index/config fingerprint
+  mismatch` (exit 3). The fingerprints of all 8 shipped examples are equal across the two trees,
+  computed with backend paths fixed. `tests/unit/test_index_fingerprint_golden.py` pins them. With the
+  fix reverted, 8 of its 9 tests fail.
+- **B3.** The external run above has 0 failed (`test_failed_loads_never_move_the_pointer` passes).
+- **B4.** See the fresh-venv row above.
+- **B5 (contract, TestClient).**
+  - `ingest_delta` while another writer holds the lease returns 409 with
+    `result.category: write_conflict`, `reason: held` and no backend text. The audit record keeps the
+    detail.
+  - Invalid arguments return 422 (`invalid_request`).
+  - `WriteConflict` and `SessionConflict` on `/v2/search` return 409 with a typed `detail`.
+  - MCP `safe_message` returns `write_conflict: <reason>` / `session_conflict:
+    cas_attempts_exhausted`.
+- **B6.** `2.0.0a2` in pyproject, `__version__`, `--version`, the FastAPI app, CITATION (with
+  `date-released`), and the README and docs banners. CHANGELOG.md was added.
+
+**Non-blocking items done (synthetic).**
+
+- **N1:** the reviewer's detector false positives are a negative fixture list. Real statements still
+  fire, for example "Only 12 tickets", "Overall, 12 tickets", "That is the complete list of open
+  tickets".
+- **N2:** a stated count that differs from the cited exact aggregate is `answer_number_mismatch`
+  ("99 open records" against 12 abstains; "12 of 36 records" passes). One existing harness test
+  stated "Three" against a count of 2. Its text was corrected to "Two".
+- **N4:** `product: "CloudTaxx"` and `"cloudtax"` (case-sensitive field) are reported as
+  `value_not_observed`, the count is not exact, and an absence answer abstains.
+- **N5:** a hosted embedder without `budgets.ingest.max_usd` or `max_embedding_calls` is refused at
+  construction. Loopback `openai_compatible` and local embedders are accepted.
+- **N8:** the key-file path was removed from `.claude/agents/*`.
+
+**Not done:** N3, N6, N7, N9 beyond the action route, and N10. They are recorded as known
+limitations in CHANGELOG.md.
+
+**Real Anthropic smoke: not completed.** This was the first real Anthropic attempt with a key that
+lists models.
+
+- **Setup.** `claude-haiku-5-5` ran through the QA spend guard (`~/su_mutliarm_tests/qa/`, Anthropic
+  cap $2.00, this run's budget $0.50) on a synthetic two-document corpus.
+- **Result.** The first request was the LLM extraction call: native `tool_use`, `cache_control`
+  on the system block and tool, `max_tokens` 1024. It returned **HTTP 429**. The package failed the
+  build fail-closed: `IngestError`, category `provider`, no retry, and the provider body is not echoed.
+- **Stopped.** Following the run rules, nothing was retried and no further call was made.
+- **Spend.** The ledger shows 1 reservation ($0.0014) settled at **$0.00**. Cumulative Anthropic
+  spend is $0.00 over 3 attempts: two 401s on 2026-11-03 and this 429.
+- **Not established.** The run cannot tell a rate limit from a missing quota, because the guard does
+  not log bodies. Still unsettled: whether `input_schema` with `$defs` is accepted (`LlmPlan` has 6
+  `$defs`, `Answer` has 1), native planner and generator calls, streaming, and cache read/write token
+  reporting. The Anthropic provider stays at "contract-mocked" evidence.

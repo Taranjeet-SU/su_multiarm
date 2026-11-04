@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from typing import ClassVar
 
 from ..core.config import LexicalArm as LexicalArmConfig
 from ..core.types import LexicalQuery
-from ..providers import tokens
 from ..runtime.context import RunContext
 from .base import ArmInput, ArmResult, BaseArm
 
 MAX_TERMS = 128
+
+
+def query_terms(text: str) -> list[str]:
+    """Distinct query words in their original spelling (QA-07).
+
+    The backend's own analyzer folds the query exactly as it folded the indexed text (FTS5
+    ``unicode61``, PostgreSQL ``to_tsvector``, the Lucene ``standard`` analyzer; the memory index
+    casefolds both sides). Folding here with ``str.casefold`` went further than ``unicode61`` and
+    the Lucene analyzers (``ß``->``ss``, ``ﬁ``->``fi``), so the query could never match its own
+    indexed word. Repeats are dropped by ``str.lower`` (which, like the analyzers, keeps ``ß``)."""
+    seen: dict[str, str] = {}
+    for word in re.findall(r"\w+", text):
+        seen.setdefault(word.lower(), word)
+    return list(seen.values())
 
 
 class LexicalArm(BaseArm):
@@ -19,7 +33,7 @@ class LexicalArm(BaseArm):
     capability: ClassVar[str] = "lexical"
 
     def _run(self, ctx: RunContext, inputs: ArmInput) -> ArmResult:
-        terms = list(dict.fromkeys(tokens(inputs.query)))[:MAX_TERMS]
+        terms = query_terms(inputs.query)[:MAX_TERMS]
         if not terms:
             return ArmResult(arm=self.name)
         facet = self._facet()

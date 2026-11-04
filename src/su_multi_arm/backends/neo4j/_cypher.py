@@ -74,6 +74,20 @@ SET p.generation = $generation, p.g = $g, p.activated_at = $now
 RETURN p.generation AS generation
 """
 
+# Compare-and-set: the SET on the merged pointer takes its write lock before the comparison, so two
+# writers cannot both pass it; no row means "generation not loaded" or "pointer names another one"
+# (the caller tells them apart and rolls the transaction back).
+POINTER_ACTIVATE_IF = """
+MATCH (n:SuGraphGeneration {g: $g}) WHERE n.state = 'loaded'
+MERGE (p:SuGraphPointer {pointer: $pointer})
+SET p.claimed_at = $now
+WITH p WHERE ($expected IS NULL AND p.generation IS NULL) OR p.generation = $expected
+SET p.generation = $generation, p.g = $g, p.activated_at = $now
+RETURN p.generation AS generation
+"""
+
+GENERATION_LOADED = "MATCH (n:SuGraphGeneration {g: $g}) WHERE n.state = 'loaded' RETURN count(n) AS loaded"
+
 POINTER_DEACTIVATE = "MATCH (p:SuGraphPointer {pointer: $pointer}) WHERE p.g = $g DELETE p RETURN count(*) AS removed"
 
 GENERATIONS_LIST = (
@@ -218,6 +232,8 @@ ALL_TEMPLATES: tuple[str, ...] = (
     GENERATION_CLOSE,
     POINTER_READ,
     POINTER_ACTIVATE,
+    POINTER_ACTIVATE_IF,
+    GENERATION_LOADED,
     POINTER_DEACTIVATE,
     GENERATIONS_LIST,
     GENERATION_DROP,

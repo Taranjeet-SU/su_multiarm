@@ -14,10 +14,25 @@ staged ``(backend, projection)`` pair and anything left for cleanup. The manifes
 backend's generation identity, activation mechanism and lexical analyzer id. Per-document status
 lives in the ledger (``document_status`` entries keyed by the generation id); extraction outputs and
 raw model replies are kept in the ledger for reuse and replay.
+
+**Writers.** A build runs under the registry's write lease (``ingestion/lease.py``: owner token,
+heartbeat renewal, owner-only release); a second writer is refused with ``WriteConflict(held)``.
+Before activation the lease is renewed synchronously, and every pointer switch is a compare-and-set
+on what it named before (``CURRENT``: the generation the build started from). A lost lease or a
+moved base fails the build with ``IngestConflict`` (also a ``WriteConflict``) and never switches
+``CURRENT``.
+
+**Incremental embeddings and budgets.** Embedding inputs are streamed in ``batch_size`` windows; a
+vector is reused from the ledger when its exact input (title + field + chunk text) and recipe were
+embedded before, so an upsert embeds only new or changed chunks (manifest ``embedded`` /
+``reused_embeddings``). Everything else of the new generation is still rebuilt (manifest
+``incremental``). LLM calls, embedding requests and USD of the build are limited by
+``budgets.ingest`` (``ingestion/budget.py``), never by the per-request ``budgets.max_llm_calls``.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import time
@@ -31,7 +46,7 @@ from ..backends import extras
 from ..backends._scope import document_values
 from ..communities.base import build_communities
 from ..communities.reports import ReportFailure, community_report, disabled_report
-from ..core.errors import BackendError, ConfigError, GenerationInUse, IndexNotReady
+from ..core.errors import BackendError, BudgetExhausted, ConfigError, GenerationInUse, IndexNotReady, WriteConflict
 from ..core.types import (
     Chunk,
     Document,
@@ -49,7 +64,9 @@ from ..core.types import (
 from ..extraction.base import BuiltinExtractor, ExtractionFailure, ExtractionInput, canonicalise
 from ..extraction.chunking import chunk_document, to_v2_document
 from ..extraction.dedupe import dedupe_relations
-from ..providers import CallBudget, tokens
+from ..providers import tokens
+from ..runtime.budget import load_price_table
+from .budget import IngestMeter, check_prices, require_ingest_cap
 from .normalize import redact_document
 from .generations import GenerationSet
 from .policy import ExtractionPolicy, PolicyViolation
@@ -57,6 +74,14 @@ from .release import GenerationRegistry, generation_id
 
 INDEX_FORMAT = 3
 SAMPLE = 5
+EMBEDDING_INPUT = "{title}\n{field}: {text}"  # the template ``WritePath.embedding_input`` applies
+# What an upsert (``ingest`` without ``replace``, the ``ingest_delta`` action) does incrementally
+# today, recorded in every manifest. Everything else is rebuilt into the new generation.
+INCREMENTAL = {
+    "embeddings": "reused by exact input and recipe; only new or changed chunks are embedded",
+    "extraction": "reused per chunk and extractor recipe from the ledger; only new or changed chunks are extracted",
+    "rebuilt": ["catalog", "lexical", "records", "vectors (re-written, not re-embedded)", "graph", "communities", "community reports"],
+}
 
 
 class IngestError(RuntimeError):
@@ -65,6 +90,18 @@ class IngestError(RuntimeError):
     def __init__(self, failure: dict[str, Any]):
         self.failure = failure
         super().__init__(f"{failure['category']}: {failure['message']}")
+
+
+class IngestConflict(IngestError, WriteConflict):
+    """A build lost the write path to another writer: its lease was lost, or ``CURRENT`` no longer
+    names the generation it started from. Nothing was activated; ``failure`` is recorded as for any
+    failed build (category ``write_conflict:<reason>``). Also a ``WriteConflict``, like the
+    ``held`` refusal raised before a build starts."""
+
+    def __init__(self, failure: dict[str, Any], conflict: WriteConflict):
+        self.failure, self.conflict = failure, conflict
+        self.adapter, self.operation, self.reason = conflict.adapter, conflict.operation, conflict.reason
+        RuntimeError.__init__(self, f"{failure['category']}: {failure['message']}")
 
 
 class WritePath:
@@ -103,6 +140,10 @@ class WritePath:
             kind = getattr(backends[storage.catalog], "kind", "?")
             raise ConfigError(f"backend {storage.catalog!r} ({kind}) has no generation registry and cannot hold the authoritative catalog", "storage.catalog")
         self.registry: GenerationRegistry = registry()
+        budgets = config.budgets
+        self.price_table = load_price_table(budgets.price_table) if budgets.price_table else None
+        check_prices(config, self.price_table, "llm" in getattr(config.extraction, "extractors", []))
+        require_ingest_cap(config)
 
     # --- helpers -----------------------------------------------------------------------------
 
@@ -119,7 +160,7 @@ class WritePath:
             "chunking": self.cfg.ingestion.chunking.model_dump(mode="json"),
             "privacy": self.cfg.privacy.model_dump(mode="json", exclude={"trace_masking"}),
             "extractor": self.extractor.recipe_fingerprint(),
-            "embedder": roles.embedder.model_dump(mode="json"),
+            "embedder": roles.embedder.model_dump(mode="json", exclude={"pricing_key"}),
             "communities": self.cfg.communities.model_dump(mode="json"),
             "community_model": None if roles.community is None else roles.community.model,
             "backends": {slot: self.cfg.backends[name].model_dump(mode="json") for slot, name in sorted(self.slots.items())},
@@ -182,10 +223,12 @@ class WritePath:
             raise ValueError("document dataset must match configured dataset")
         if set(delete_ids) & {d.id for d in documents}:
             raise ValueError("cannot upsert and delete the same ID")
-        with self.registry.lock():
+        with self.registry.lock() as lease:
             previous: GenerationId | None = None
             existing: dict[str, Document] = {}
-            if self.registry.current() is not None:
+            active = self.registry.current()
+            base = None if active is None else active["generation"]  # activation is a compare-and-set on it
+            if active is not None:
                 try:
                     previous, _ = self.current()
                 except ValueError:
@@ -219,8 +262,11 @@ class WritePath:
                 if policy.coverage.incomplete and not allow_partial:
                     stage = next(n for n, s in policy.coverage.stages.items() if s.status == "incomplete")
                     raise PolicyViolation("incomplete_stage", policy.coverage.stages[stage].first_unprocessed, f"stage {stage} is incomplete; pass allow_partial to activate a partial generation", stage=stage)
+                if lease is not None:
+                    lease.check()  # one synchronous renewal: a lost lease never reaches activation
+                    manifest["lease"] = lease.state()
                 self.registry.write_manifest(manifest)
-                self._activate(gen, manifest)
+                self._activate(gen, manifest, base)
                 for backend in self._distinct_backends():  # the new generation is the one to keep now
                     backend.protect(gen)
                     if previous is not None:
@@ -239,11 +285,15 @@ class WritePath:
                     pass
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
+                conflict = _conflict(exc)
+                if conflict is not None:
+                    raise IngestConflict(failure, conflict) from exc
                 raise IngestError(failure) from exc
 
-    def _activate(self, gen: GenerationId, manifest: dict[str, Any]) -> None:
+    def _activate(self, gen: GenerationId, manifest: dict[str, Any], base: str | None) -> None:
         """Secondary pointers move first (``GenerationSet`` order: derived projections), then the
-        authoritative ``CURRENT``. If any step fails, the pointers already moved are put back, in
+        authoritative ``CURRENT`` as a compare-and-set on ``base`` (the generation the build started
+        from; each secondary on what it named just before). If any step fails, the pointers already moved are put back, in
         reverse order, to what they named before (or removed), ``CURRENT`` is left unchanged and an
         ``ActivationError`` carries the per-backend compensation outcome. A pointer that cannot be
         put back keeps naming the failed generation: its cleanup is refused (listed in
@@ -257,10 +307,10 @@ class WritePath:
                     continue
                 step = holder.name
                 before = self.generations.active(holder, gen.dataset)
-                self.generations.activate(holder, gen, manifest)
+                self.generations.activate(holder, gen, manifest, expected=before)
                 moved.append((holder, before))
             step = self.generations.authoritative.name
-            self.registry.activate(manifest)
+            self.registry.activate(manifest, expected=base)
         except BaseException as exc:
             compensation = []
             for holder, before in reversed(moved):
@@ -334,6 +384,9 @@ class WritePath:
 
     @staticmethod
     def _categorise(exc: BaseException) -> tuple[str, str | None, str, str | None]:
+        conflict = _conflict(exc)
+        if conflict is not None:
+            return f"write_conflict:{conflict.reason}", None, str(exc), "activate"
         if isinstance(exc, PolicyViolation):
             return exc.category, exc.unit, str(exc), exc.stage
         if isinstance(exc, ExtractionFailure):
@@ -376,7 +429,8 @@ class WritePath:
         cfg = self.cfg
         chunking = cfg.ingestion.chunking
         ledger = self._facet("ledger")
-        budget = CallBudget(cfg.budgets.max_llm_calls)
+        meter = IngestMeter(cfg.budgets.ingest, self.price_table)
+        roles = cfg.models.roles
         sequence = [0]
 
         def log(kind: str, **payload: Any) -> None:
@@ -404,11 +458,12 @@ class WritePath:
             reached.append((holder.name, "records"))
             holder.backend.records.upsert(gen, records, cfg.metadata_schema)
         # 4. extraction under policy
-        outputs, reused, llm_calls = self._extract(gen, corpus, chunks_by_doc, policy, budget, ledger)
-        # 5. embeddings
+        extraction_meter = meter.role(roles.extractor.price_key() if roles.extractor else None, "extraction")
+        outputs, reused, llm_calls = self._extract(gen, corpus, chunks_by_doc, policy, extraction_meter, ledger)
+        # 5. embeddings (streamed in batches; unchanged inputs reuse their stored vectors)
         if "vector" in self.slots:
             reached.append((self.slots["vector"], "vector"))
-        vectors = self._embed(gen, corpus, all_chunks, policy)
+        embedded = self._embed(gen, corpus, all_chunks, policy, meter, ledger)
         # 6. graph: canonical mentions, deduped relations, communities
         mentions: list[Entity] = []
         relations: list[Relation] = []
@@ -430,7 +485,8 @@ class WritePath:
             membership_map.setdefault(mention.id, set()).add(mention.span.document_id)
             names.setdefault(mention.id, mention.name)
         communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed)
-        communities = self._reports(communities, all_chunks, policy, budget)
+        report_meter = meter.role(roles.community.price_key() if roles.community else None, "community_reports")
+        communities = self._reports(communities, all_chunks, policy, report_meter)
         memberships = [Membership(community_id=c.id, member_id=doc_id, basis="entity") for c in communities for doc_id in c.document_ids]
         community_count = {doc_id: 0 for doc_id in per_doc}
         for membership in memberships:
@@ -449,7 +505,7 @@ class WritePath:
                 "document_status",
                 document_id=document.id,
                 chunks=len(parts),
-                dense="indexed" if parts and vectors is not None else ("incomplete" if parts else "empty"),
+                dense=("indexed" if embedded is not None and all(c.id in embedded.ids for c in parts) else "incomplete") if parts else "empty",
                 lexical="indexed" if parts else "empty",
                 structured="canonical_record",
                 extraction=policy.document_status(document.id),
@@ -465,7 +521,7 @@ class WritePath:
                 community_memberships=community_count[document.id],
             )
         # 8. per-projection validation
-        projections = self._validate_projections(gen, corpus, all_chunks, vectors)
+        projections = self._validate_projections(gen, corpus, all_chunks, embedded)
         projections.update(self._validate_graph(gen, corpus, mentions, communities, memberships))
         facts = [r for r in relations if r.edge_kind == "fact"]
         co_occurrences = [r for r in relations if r.edge_kind == "co_occurrence"]
@@ -491,7 +547,11 @@ class WritePath:
             "reused_extractions": reused,
             "seconds": time.perf_counter() - started,
             "redactions_in_input": redactions,
-            "llm_calls": budget.calls,
+            "llm_calls": meter.calls,
+            "embedded": embedded.embedded if embedded else 0,
+            "reused_embeddings": embedded.reused if embedded else 0,
+            "budget": meter.summary(),
+            "incremental": INCREMENTAL,
             "embedding": cfg.models.roles.embedder.model_dump(mode="json"),
             "coverage": policy.coverage.to_manifest(),
             "projections": projections,
@@ -501,7 +561,7 @@ class WritePath:
         log("manifest", status=manifest["status"], documents=len(corpus), chunks=len(all_chunks))
         return manifest
 
-    def _extract(self, gen: GenerationId, corpus: list[Document], chunks_by_doc: dict[str, list[Chunk]], policy: ExtractionPolicy, budget: CallBudget, ledger: Any):
+    def _extract(self, gen: GenerationId, corpus: list[Document], chunks_by_doc: dict[str, list[Chunk]], policy: ExtractionPolicy, budget: Any, ledger: Any):
         outputs: dict[str, list[ExtractionOutput]] = {}
         recipe = (self.extractor.recipe_fingerprint() or "none")[:16]
         reused = llm_calls = processed = 0
@@ -546,24 +606,97 @@ class WritePath:
         policy.stage_complete("extraction", processed)
         return outputs, reused, llm_calls
 
-    def _embed(self, gen: GenerationId, corpus: list[Document], chunks: list[Chunk], policy: ExtractionPolicy) -> np.ndarray | None:
+    def embedding_recipe(self) -> dict[str, Any]:
+        """Everything besides the input text that determines a stored vector: provider, model,
+        revision, dimension, endpoint of hosted models, document prefix, normalisation and the input
+        template (title and field name are embedded with the chunk text)."""
+        role = self.cfg.models.roles.embedder
+        return {
+            "provider": role.provider,
+            "model": role.model,
+            "revision": role.revision,
+            "dimensions": role.dimensions,
+            "endpoint": role.base_url if role.provider in {"openai", "openai_compatible"} else None,
+            "document_prefix": role.document_prefix,
+            "normalisation": "l2",
+            "input": EMBEDDING_INPUT,
+        }
+
+    @staticmethod
+    def embedding_input(title: str, chunk: Chunk) -> str:
+        return EMBEDDING_INPUT.format(title=title, field=chunk.field, text=chunk.text)
+
+    @staticmethod
+    def embedding_key(recipe_sha: str, text: str) -> str:
+        return f"embedding:{recipe_sha}:{hashlib.sha256(text.encode()).hexdigest()}"
+
+    def _embed(self, gen: GenerationId, corpus: list[Document], chunks: list[Chunk], policy: ExtractionPolicy, meter: IngestMeter, ledger: Any) -> "Embedded | None":
+        """Stream the chunks in ``batch_size`` windows: a vector whose exact input and recipe were
+        embedded before (by any generation) is reused from the ledger; the rest of the window is
+        embedded in one budgeted provider request, stored for reuse and upserted. Only the window
+        and the sampled vectors are held. A provider or budget failure stops the stage (policy)."""
         if "vector" not in self.slots:
             return None
+        role = self.cfg.models.roles.embedder
+        recipe_sha = hashlib.sha256(json.dumps(self.embedding_recipe(), sort_keys=True).encode()).hexdigest()[:32]
         titles = {d.id: d.title for d in corpus}
-        texts = [f"{titles[c.document_id]}\n{c.field}: {c.text}" for c in chunks]
-        try:
-            vectors = self.embedder.encode(texts)
-        except Exception as exc:  # provider outage, shape error: a whole-stage failure
-            policy.stage_failed("embeddings", "provider", str(exc), 0, len(chunks), chunks[0].id if chunks else None)
-            return None
         vector = self._facet("vector")
-        if chunks:
-            vector.upsert(gen, [c.id for c in chunks], vectors)
+        result = Embedded()
+        sample_ids = {c.id for c in chunks[:SAMPLE]}
+        price_key = role.price_key()
+        window: list[Chunk] = []
+        try:
+            for start in range(0, len(chunks), role.batch_size):
+                window = chunks[start : start + role.batch_size]
+                texts = [self.embedding_input(titles[c.document_id], c) for c in window]
+                keys = [self.embedding_key(recipe_sha, t) for t in texts]
+                rows: list[np.ndarray | None] = [self._cached_vector(ledger, k, role.dimensions) for k in keys]
+                missing = [i for i, row in enumerate(rows) if row is None]
+                if missing:
+                    reservations = meter.reserve_embedding(sum(len(texts[i]) for i in missing), price_key)
+                    try:
+                        fresh = self.embedder.encode([texts[i] for i in missing])
+                    finally:
+                        meter.commit_embedding(reservations, getattr(getattr(self.embedder, "provider", None), "last_usage", None))
+                    fresh = np.asarray(fresh, dtype=np.float32)
+                    if fresh.shape != (len(missing), role.dimensions):
+                        raise ValueError(f"embedder returned shape {fresh.shape}, expected ({len(missing)}, {role.dimensions})")
+                    for i, row in zip(missing, fresh):
+                        rows[i] = row
+                        ledger.put_raw(keys[i], base64.b64encode(row.astype("<f4").tobytes()).decode("ascii"), True)
+                matrix = np.vstack(rows).astype(np.float32)
+                vector.upsert(gen, [c.id for c in window], matrix)
+                result.embedded += len(missing)
+                result.reused += len(window) - len(missing)
+                result.ids.update(c.id for c in window)
+                for chunk, row in zip(window, matrix):
+                    if chunk.id in sample_ids:
+                        result.sample[chunk.id] = row
+        except (ConfigError, ProjectionError, BackendError):
+            raise
+        except BudgetExhausted as exc:
+            policy.stage_failed("embeddings", "budget", str(exc), len(result.ids), len(chunks) - len(result.ids), window[0].id if window else None)
+        except Exception as exc:  # provider outage, shape error: the stage stops here
+            policy.stage_failed("embeddings", "provider", str(exc), len(result.ids), len(chunks) - len(result.ids), window[0].id if window else None)
+        else:
+            policy.stage_complete("embeddings", len(chunks))
         vector.refresh(gen)
-        policy.stage_complete("embeddings", len(chunks))
-        return vectors
+        return result
 
-    def _reports(self, communities, chunks: list[Chunk], policy: ExtractionPolicy, budget: CallBudget):
+    @staticmethod
+    def _cached_vector(ledger: Any, key: str, dimensions: int) -> np.ndarray | None:
+        cached = ledger.get_raw(key)
+        if cached is None or not cached.valid:
+            return None
+        try:
+            row = np.frombuffer(base64.b64decode(cached.raw_reply, validate=True), dtype="<f4")
+        except ValueError as exc:  # never silently re-embedded: the ledger entry is damaged
+            raise ProjectionError("vector", key, f"stored embedding is unreadable: {exc}") from exc
+        if row.shape != (dimensions,) or not np.isfinite(row).all():
+            raise ProjectionError("vector", key, f"stored embedding has {row.shape[0]} values, the recipe needs {dimensions}")
+        return row.astype(np.float32)
+
+    def _reports(self, communities, chunks: list[Chunk], policy: ExtractionPolicy, budget: Any):
         role = self.cfg.models.roles.community
         if self.community_model is None or role is None:
             for community in communities:
@@ -586,7 +719,7 @@ class WritePath:
         policy.stage_complete("community_reports", len(communities))
         return done
 
-    def _validate_projections(self, gen: GenerationId, corpus: list[Document], chunks: list[Chunk], vectors: np.ndarray | None) -> dict[str, Any]:
+    def _validate_projections(self, gen: GenerationId, corpus: list[Document], chunks: list[Chunk], embedded: "Embedded | None") -> dict[str, Any]:
         """Counts against the catalog and a sample of ids round-tripping through every target: the
         same sampled chunk ids must come back from the catalog, every scope mirror, the lexical and
         vector projections (with the catalog's document id), and their documents from every records
@@ -638,14 +771,16 @@ class WritePath:
             results["lexical"] = {"backend": holder.name, "rows": len(chunks), "verified": True, "analyzer_id": self.generations.analyzer_id(holder, gen)}
         if "vector" in self.slots:
             vector = self._facet("vector")
-            expected = len(chunks) if vectors is not None else 0
+            expected = len(embedded.ids) if embedded is not None else 0
             _expect("vector", vector.count(gen), expected, "vectors")
-            if vectors is not None:
-                for index, chunk in enumerate(sample):
-                    hits = vector.search(gen, np.asarray(vectors[index]), Scope(document_ids=[chunk.document_id]), 1)
-                    if not hits or hits[0].chunk_id != chunk.id or hits[0].document_id != chunk.document_id:
-                        raise ProjectionError("vector", chunk.id, "sampled vector did not round-trip")
-            results["vector"] = {"backend": self.slots["vector"], "rows": expected, "verified": vectors is not None, "incomplete": vectors is None}
+            complete = expected == len(chunks)
+            for chunk in sample:
+                if embedded is None or chunk.id not in embedded.sample:
+                    continue
+                hits = vector.search(gen, np.asarray(embedded.sample[chunk.id]), Scope(document_ids=[chunk.document_id]), 1)
+                if not hits or hits[0].chunk_id != chunk.id or hits[0].document_id != chunk.document_id:
+                    raise ProjectionError("vector", chunk.id, "sampled vector did not round-trip")
+            results["vector"] = {"backend": self.slots["vector"], "rows": expected, "verified": complete, "incomplete": not complete}
         return results
 
     def _validate_graph(self, gen: GenerationId, corpus: list[Document], mentions: list[Entity], communities: list[Any], memberships: list[Membership]) -> dict[str, Any]:
@@ -688,6 +823,16 @@ class WritePath:
         return results
 
 
+class Embedded:
+    """What the embedding stage wrote: chunk ids upserted, fresh vs reused counts, sampled vectors."""
+
+    def __init__(self) -> None:
+        self.ids: set[str] = set()
+        self.embedded = 0
+        self.reused = 0
+        self.sample: dict[str, np.ndarray] = {}
+
+
 class ProjectionError(RuntimeError):
     def __init__(self, projection: str, unit: str | None, message: str):
         self.projection, self.unit = projection, unit
@@ -711,6 +856,15 @@ def _delete_on(backend: Any, gen: GenerationId) -> None:
     if not callable(delete):
         delete = backend.catalog.delete_generation
     delete(gen)
+
+
+def _conflict(exc: BaseException) -> WriteConflict | None:
+    """The write conflict behind a failure (directly, or the cause of a failed activation step)."""
+    if isinstance(exc, WriteConflict):
+        return exc
+    if isinstance(exc, ActivationError) and isinstance(exc.cause, WriteConflict):
+        return exc.cause
+    return None
 
 
 def _expect(projection: str, actual: int, expected: int, what: str) -> None:

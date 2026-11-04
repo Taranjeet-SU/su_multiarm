@@ -76,7 +76,7 @@ class TokenEvent(_Event):
 
 class ContractEvent(_Event):
     event: Literal["contract"] = "contract"
-    status: Literal["passed", "abstained"]
+    status: Literal["passed", "stripped", "abstained"]
     violations: list[Violation] = Field(default_factory=list)
     unsupported_constraints: list[UnsupportedConstraint] = Field(default_factory=list)
     tokens_streamed: int = 0

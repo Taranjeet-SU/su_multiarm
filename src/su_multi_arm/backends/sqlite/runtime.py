@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...core.errors import BackendError
 from ...core.types import CacheEntry, LedgerEntry, RawReply, SessionRecord
+from .._sessions import lost, next_record
 from ..memory import CACHE_KEY
 from ._db import KIND
 
@@ -98,13 +99,17 @@ class SqliteSessions:
             row = db.execute("SELECT data FROM sessions WHERE id=?", (session_id,)).fetchone()
         return None if row is None else SessionRecord.model_validate_json(row["data"])
 
-    def touch(self, session_id: str, now: float, record: SessionRecord | None = None) -> None:
-        current = self.get(session_id)
-        if current is None:
-            raise BackendError(KIND, "touch", f"unknown session {session_id}")
-        updated = (record or current).model_copy(update={"last_seen_at": now})
+    def touch(self, session_id: str, now: float, record: SessionRecord | None = None, expected_version: int | None = None) -> None:
         with self._b.runtime_db() as db:
-            db.execute("UPDATE sessions SET data=?, last_seen_at=? WHERE id=?", (updated.model_dump_json(), now, session_id))
+            row = db.execute("SELECT data FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row is None:
+                raise BackendError(KIND, "touch", f"unknown session {session_id}")
+            updated = next_record(session_id, SessionRecord.model_validate_json(row["data"]), now, record, expected_version)
+            cursor = db.execute(
+                "UPDATE sessions SET data=?, last_seen_at=? WHERE id=? AND data=?", (updated.model_dump_json(), now, session_id, row["data"])
+            )
+            if cursor.rowcount != 1:
+                raise lost(session_id, expected_version)
 
     def expire(self, now: float, ttl_seconds: float) -> int:
         with self._b.runtime_db() as db:
