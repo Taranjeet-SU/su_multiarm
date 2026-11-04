@@ -233,3 +233,60 @@ def test_a_stated_number_must_equal_the_backing_aggregate():
     assert share.contract == "passed"
     denominator_alone = AnswerContract().enforce(count_answer("There are 36 open records [aggregate:1]."), evidence_ids=EVIDENCE, aggregates=[EXACT], intents=COUNT, targets=TARGETS)
     assert denominator_alone.contract == "abstained"
+
+
+# --- 2.0.0a3 parity fix: the population of a ratio is not the stated count -------------------------
+
+TICKETS = AggregateEvidence(id="aggregate:1", result=ScopeResult(exactness="exact", denominator=2048, value=1400, matched_ids=["c1"]))
+TICKET_TARGETS = ["ticket", "record"]
+TICKET_COUNT = detect_intents("How many tickets are there?", targets=TICKET_TARGETS)
+
+
+def ticket_check(text: str, aggregate: AggregateEvidence = TICKETS):
+    return AnswerContract().enforce(count_answer(text), evidence_ids=EVIDENCE, aggregates=[aggregate], intents=TICKET_COUNT, targets=TICKET_TARGETS)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "There are 1400 tickets [aggregate:1], out of 2048 records in the snapshot.",
+        "There are 1,400 ticket records, out of a denominator of 2,048 records [aggregate:1].",
+        "1400 ticket records match [aggregate:1]. The aggregate's denominator is 2048 records.",
+        "1400 tickets match; denominator: 2048 records [aggregate:1].",
+        "1400 tickets match, with 2,048 filtered records as the denominator [aggregate:1].",
+        "1400 tickets match among 2,048 canonical records in the snapshot [aggregate:1].",
+        "The count covers 1400 tickets over 2048 records in this snapshot [aggregate:1].",
+        "1400 tickets match, which is 72% of 2048 records [aggregate:1].",
+        "1400/2048 records are tickets [aggregate:1].",
+        "1400 of 2000 records are tickets [aggregate:1].",
+        "These sum to 1400 ticket records out of 5000 records [aggregate:1].",
+    ],
+)
+def test_a_cited_denominator_or_ratio_population_is_not_a_mismatch(text):
+    result = ticket_check(text)
+    assert result.contract == "passed", (text, result.violations)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "There are 1450 tickets [aggregate:1], out of 2048 records in the snapshot.",  # wrong count, right denominator
+        "There are 2048 tickets [aggregate:1].",  # the population stated as the count
+        "A total of 2048 tickets match [aggregate:1].",
+        "There are 1400 tickets and 1500 records [aggregate:1].",  # a second, unbacked number
+        "1450 ticket records match among 2,048 canonical records [aggregate:1].",
+    ],
+)
+def test_a_wrong_count_next_to_a_population_still_abstains(text):
+    result = ticket_check(text)
+    assert result.contract == "abstained" and "answer_number_mismatch" in [v.rule for v in result.violations], text
+
+
+def test_group_values_totals_and_their_sum_are_values_of_the_evidence():
+    from su_multi_arm.core.types import GroupRow
+
+    groups = [GroupRow(key={"status": "closed"}, value=1250, count=1250), GroupRow(key={"status": "open"}, value=150, count=150)]
+    grouped = AggregateEvidence(id="aggregate:1", result=ScopeResult(exactness="exact", denominator=2048, value={"closed": 1250, "open": 150}, groups=groups, total=1400))
+    for text in ("150 tickets are open [aggregate:1].", "These sum to 1400 tickets [aggregate:1].", "1250 tickets are closed out of 2048 records [aggregate:1]."):
+        assert ticket_check(text, grouped).contract == "passed", text
+    assert ticket_check("151 tickets are open [aggregate:1].", grouped).contract == "abstained"

@@ -41,11 +41,20 @@ from .._lucene_common import (
     meta,
 )
 from .catalog import OpenSearchCatalog, OpenSearchRecords
-from .search import OpenSearchLexical, OpenSearchVector
+from .search import HNSW_ENGINE, OpenSearchLexical, OpenSearchVector
 
 KIND = "opensearch"
 ANALYZER_ID = "lucene_standard"
+# Supported server majors and the k-NN engines each accepts for *new* indices (k-NN plugin release
+# notes: nmslib deprecated in 2.19, index creation with nmslib blocked from 3.0.0).
+KNN_ENGINES: dict[int, frozenset[str]] = {2: frozenset({"lucene", "faiss", "nmslib"}), 3: frozenset({"lucene", "faiss"})}
 DOCS_PATTERN = re.compile(r"^(?P<prefix>[a-z][a-z0-9_]*)_(?P<dataset>[a-z0-9][a-z0-9_-]*)_(?P<generation>[0-9a-f]{32})_docs$")
+
+
+def server_major(number: str) -> int | None:
+    """Major of a ``version.number`` such as ``3.9.0`` (``None`` when it is not ``<int>.…``)."""
+    head = number.split(".", 1)[0]
+    return int(head) if head.isdigit() else None
 
 
 def _mappings(index_kind: str, dataset: str, generation: str, knn: bool) -> dict[str, Any]:
@@ -147,13 +156,22 @@ class OpenSearchBackend:
             raise BackendError(self.kind, operation, f"HTTP {exc.status} {exc.error_type}: {exc.reason}") from exc
 
     def probe(self) -> dict[str, Any]:
-        """Server identity (``GET /``); refuses anything that is not OpenSearch 2.x."""
+        """Server identity (``GET /``); refuses anything that is not OpenSearch 2.x or 3.x.
+
+        The index layout and query DSL are the same on both majors, so the major is reported here
+        and not recorded in the generation identity. The HNSW engine the adapter writes
+        (``search.HNSW_ENGINE``) must be one the detected major accepts for new indices; otherwise
+        the probe fails with a typed error (OpenSearch 3.0 blocks index creation with ``nmslib``).
+        """
         info = self.call("probe", "GET", "/")
         version = info.get("version", {}) if isinstance(info, dict) else {}
         distribution, number = version.get("distribution"), str(version.get("number", ""))
-        if distribution != "opensearch" or not number.startswith("2."):
-            raise BackendError(self.kind, "probe", f"expected an OpenSearch 2.x server, got {distribution!r} {number!r}")
-        return {"distribution": distribution, "version": number, "lucene_version": version.get("lucene_version")}
+        major = server_major(number)
+        if distribution != "opensearch" or major not in KNN_ENGINES:
+            raise BackendError(self.kind, "probe", f"expected an OpenSearch 2.x or 3.x server, got {distribution!r} {number!r}")
+        if self.knn_method == "hnsw" and HNSW_ENGINE not in KNN_ENGINES[major]:
+            raise BackendError(self.kind, "probe", f"knn engine {HNSW_ENGINE!r} cannot create indices on OpenSearch {number} (supported: {', '.join(sorted(KNN_ENGINES[major]))})")
+        return {"distribution": distribution, "version": number, "major": major, "lucene_version": version.get("lucene_version")}
 
     # --- naming and index lifecycle ----------------------------------------------------------
 

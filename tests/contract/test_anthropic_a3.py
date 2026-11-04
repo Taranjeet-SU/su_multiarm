@@ -175,8 +175,12 @@ def test_output_format_refuses_free_form_mappings_before_any_call():
 
 
 def test_every_package_schema_converts_for_output_format():
-    for name in ("planner", "generator", "reviewer", "extractor", "community"):
+    for name in ("generator", "reviewer", "extractor", "community"):
         assert strict_schema_problems("anthropic", "claude-haiku-5-5", "native", name) == []
+    # The plan schema converts (no free-form mapping) but is over the complexity ceilings: the real
+    # API refused it with HTTP 400 "compiled grammar is too large" (2.0.0a3 parity run).
+    [problem] = strict_schema_problems("anthropic", "claude-haiku-5-5", "native", "planner")
+    assert "LlmPlan is too complex for output_config.format" in problem and "structured_output: none" in problem
 
 
 def test_stop_details_are_recorded():

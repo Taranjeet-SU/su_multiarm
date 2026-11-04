@@ -48,6 +48,10 @@ BACKEND_TESTS: dict[str, str] = {
     "kuzu": "tests/conformance/test_kuzu_conformance.py",
     "mongodb": "tests/conformance/test_mongodb_conformance.py",
 }
+# Server versions a real-service suite was run against, when it was run beyond the 2.0.0a1 release run.
+BACKEND_SERVER_RUNS: dict[str, str] = {
+    "opensearch": "passed against OpenSearch 2.19.1 and 3.9.0 in the 2.0.0a3 run, see VALIDATION.md",
+}
 IN_PROCESS = {"memory", "sqlite", "kuzu"}  # kuzu is embedded: its conformance runs in-process (needs the kuzu extra)
 
 CHAT_EVIDENCE: dict[str, str] = {
@@ -82,7 +86,8 @@ def _backend_evidence(kind: str) -> str:
         return f"in-process conformance kit, default test run (`{rel}`)"
     if "pytest.mark.external" not in path.read_text():
         raise SystemExit(f"{rel} is not marked external; cannot claim real-service conformance for {kind!r}")
-    return f"real-service conformance suite `{rel}` (passed in the 2.0.0a1 release run, see VALIDATION.md)"
+    run = BACKEND_SERVER_RUNS.get(kind, "passed in the 2.0.0a1 release run, see VALIDATION.md")
+    return f"real-service conformance suite `{rel}` ({run})"
 
 
 def backends_table() -> str:

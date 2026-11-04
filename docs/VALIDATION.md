@@ -19,6 +19,103 @@ entry at the end has the evidence.
 - **Not measured**: answer quality or relevance on any non-synthetic corpus, and Anthropic
   behaviour beyond these single calls.
 
+## 2.0.0a3 fixes from the final parity run — 2026-11-04
+
+The final private parity run found five package defects; all five are fixed. CHANGELOG.md
+(2.0.0a3, Fixed) lists them.
+
+**Evidence level: synthetic and mocked only.** No paid or real-service call was made, and the
+parity run was not repeated with the fixes.
+
+- **Suite.** `pytest -m 'not external'` went from 1189 to **1225 passed**. Bare `pytest -q` gives
+  1228 passed and 124 skipped. `ruff check src tests` is clean.
+- **Golden index fingerprints are unchanged.** `examples/v2/hosted_models.yaml` now declares
+  `structured_output: none` for its planner; chat roles are not part of the fingerprint.
+- **Structured output**, mocked HTTP (`tests/contract/test_structured_output_fallback.py`):
+  - the pre-flight counts the plan schema at 37 optional and 23 union-typed properties, over the
+    ceilings of 24 and 16;
+  - a registry-default Sonnet 5.x planner resolves to prompt mode with a warning, and a declared
+    `native` one is refused;
+  - a mocked 400 "compiled grammar is too large" is `ProviderSchemaTooComplex`. It produces exactly
+    one recorded switch for a registry-default role and none for a declared one. Another 400 is
+    never switched.
+  - Whether the real API accepts every schema under the ceilings is **not verified**. The ceilings
+    are the documented limits; the real 400 was observed for the plan schema only.
+- **Answer-number check.** Synthetic phrasings of a cited denominator or ratio population pass,
+  modelled on the parity run's patterns ("out of", "denominator is", "as the denominator", "among",
+  "over", "%", "/"). Wrong counts next to a population, and the denominator stated alone, still
+  abstain (`tests/unit/test_answer_text_contract.py`).
+- **Rules path.** Synthetic questions with a dropped ordinal, state word or threshold abstain with
+  `qualifier_not_applied`. "X-mention" is a topic. The existing grammar cases are unchanged
+  (`tests/unit/test_query_compiler.py`).
+- **Sort by count.** A planner scope sorting groups by `count` or by its measure compiles to the
+  ranking and executes on the memory store; the ill-defined cases are refused.
+- **Precomputed verify.** Rows built from the engine template pass the default spot check, and rows
+  of the bare text fail it. With `input: chunk_text` the reverse holds (hash embedder,
+  `tests/unit/test_precomputed_vectors.py`).
+
+## OpenSearch 3.x support and the Lucene result window — 2026-11-04 (branch `v2/phase-0`, base `cf242ce`)
+
+**Evidence level: real-service (isolated local containers) plus mocked transport.** All data is the
+synthetic conformance kit and a synthetic 300-document corpus. No paid call was made.
+
+Servers (compose project `su-multi-arm-tests`, all on 127.0.0.1, security plugin disabled):
+
+| Service | Image | Digest | Lucene | Bundled JDK |
+|---|---|---|---|---|
+| `opensearch` (19200) | `opensearchproject/opensearch:2.19.1` | `sha256:72fe2fc84be8295906b8efca020b46c58ed45c8da60cd9b8b49e1991e38e89a4` | 9.12.1 | 21.0.6 |
+| `opensearch3` (19202, profile `opensearch3`) | `opensearchproject/opensearch:3.9.0` | `sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e` | 10.5.1 | 25.0.4.1 |
+| `elasticsearch` (19201) | `docker.elastic.co/elasticsearch/elasticsearch:8.17.4` | `sha256:413d8df69823e9f41f6008f025fcbaf31a5849ab9c74894731d7ded65543cd56` | — | — |
+
+3.9.0 was the latest stable 3.x tag on Docker Hub at the time of the run.
+
+- **OpenSearch conformance** (`pytest -m external -k opensearch tests/services/test_opensearch_adapter.py
+  tests/conformance`): **20 passed, 8 skipped** on 2.19.1 (`SU_TEST_OPENSEARCH_MAJOR=2`) and
+  **20 passed, 8 skipped** on 3.9.0 (`SU_TEST_OPENSEARCH_MAJOR=3`). The skips are the capabilities
+  OpenSearch does not declare (graph, ledger, session, cache). This covers exact and HNSW vectors,
+  the alias pointer, and the records checks.
+- **Elasticsearch conformance** (`-k elasticsearch tests/conformance`): **18 passed, 8 skipped**.
+  The base `94d978e` code gave 4 failed on the same server (the result-window defect below).
+- **Result-window defect, found by this run.** On base `94d978e`, `test_capability[opensearch-records]`,
+  `[opensearch_hnsw-records]` and `test_run_all[opensearch|opensearch_hnsw]` failed on 2.19.1 with
+  HTTP 400 "Result window is too large ... [10001]", and the same 4 failed on Elasticsearch. The
+  structured arm's text count pages `lexical.search` with 10000-hit pages, and the look-ahead hit
+  made `from + size` 10001. Fixed in the shared `OpenSearchLexical.search`, with a mocked
+  regression test (`test_lexical_paging_never_crosses_the_result_window`).
+- **Cross-major comparison** (workspace script, synthetic 300 documents, 5 lexical queries plus 1
+  scoped, 5 vector queries, exact and HNSW): lexical rankings were identical on 6 of 6 queries. Every
+  2.19.1 score was **exactly 2.2 ×** the 3.9.0 score over 143 hits, which is `k1 + 1` (3.0 replaced
+  `LegacyBM25Similarity` with `BM25Similarity`). Exact and HNSW+rescore vector results were
+  identical across majors (max |score difference| 0), and HNSW+rescore equalled exact on 5 of 5
+  queries on both.
+- **nmslib.** On 3.9.0, creating a `knn_vector` index with `engine: nmslib` returned
+  `mapper_parsing_exception` ("cannot be used for new index creation in OpenSearch from 3.0.0"). The
+  same request succeeded on 2.19.1. The adapter writes `lucene`. The probe guard for a blocked engine
+  is unit-tested only.
+- **3.x changes checked and not affecting the adapter.** These come from the 3.0.0 release notes and
+  the k-NN plugin notes for 3.0–3.9:
+  - The index-level `knn.algo_param.*` and `knn.space_type` settings and `knn.plugin.enabled` were
+    removed. The adapter sets only `index.knn` and the per-field `method`.
+  - `_bulk batch_size` was removed. The adapter does not use it.
+  - Keyword `term` queries no longer score by default. The adapter uses keyword terms only in filter
+    context.
+  - Derived source for vectors is on by default for `index.knn: true` indices. The chunk updates and
+    the painless re-denormalisation passed on 3.9.0.
+  - Painless `cosineSimilarity` over `knn_vector` doc values (the exact path) is unchanged.
+  - JDK 21 is the minimum. The image bundles it.
+  - The security demo configuration needs `OPENSEARCH_INITIAL_ADMIN_PASSWORD`, which is not needed
+    with `DISABLE_SECURITY_PLUGIN` and `DISABLE_INSTALL_DEMO_CONFIG`.
+- **Suite.** `pytest -m 'not external'` gives **1237 passed**. The base `cf242ce` gave 1224 passed
+  and 1 failed: a hygiene test on an execution-log line, fixed here. Bare `pytest -q` with the 2.19.1
+  and Elasticsearch containers up gives **1278 passed, 86 skipped**. `ruff check src tests` is clean.
+- **Not covered.** These were not tested:
+  - OpenSearch 3.0–3.8 and 2.x other than 2.19.1;
+  - an in-place 2.x → 3.x upgrade of an existing index (expected to keep working, with BM25 scores
+    rescaled);
+  - the multi-backend engine test (`tests/services/test_multi_backend_engine.py`), which needs
+    PostgreSQL and Neo4j, against 3.x;
+  - security-enabled clusters.
+
 ## 2.0.0a2 status — 2026-11-04 (historical)
 
 Release candidate: `2.0.0a2` (branch `v2/phase-0`). This release fixes the 2.0.0a1 QA findings
@@ -1625,3 +1722,52 @@ repository). No paid model call was made.
   `bm25` build cost beyond this one ingest (886 s and peak RSS 10.4 GB, against 833 s and 10.4 GB
   for the FTS5 build of the same corpus; the segment held 23.4M postings and 229k terms);
   concurrent-request latency.
+
+## Production-workload parity, final paired run — 2026-11-04 (2.0.0a3, commit `cec3ffb`)
+
+Evidence level: **measured on private corpora** (aggregate only; corpora, questions, gold, prompts,
+configs and per-query results stay outside this repository). Two previously served workloads were
+replayed through the package on one CPU host; the old services were not called. The old side is the
+services' own recorded results, with their own gold sets, metric definitions and denominators.
+Answers on both sides were graded blind by the same small model judge (`claude-haiku-4-5`), each
+alone under a random id. Paid model spend is capped; nothing in scope was skipped for budget.
+
+**Corpus A** (support corpus: ~59k records / 521k chunks, four source types; imported 1024-d
+vectors, alignment-audited; sqlite `lexical_engine: bm25` with `verbatim_boost` and
+`pin_identifiers`; per-arm 20 with `source_slots` and `source_order`):
+
+| Measure | Old | Package | Verdict |
+|---|---|---|---|
+| Frozen retrieval set (630 queries), dense R@10 / MRR | 0.673 / 0.357 | 0.678 / 0.384 | met |
+| Lexical R@10 / MRR | 0.698 / 0.426 | 0.700 / 0.424 | met (CI includes 0) |
+| Fused (RRF) R@10 / MRR | 0.826 / 0.645 | 0.834 / 0.637 | met (CI includes 0) |
+| Diagnostic set (27 targets), hits @20 / @10 / pool | 12 / 12 / 15 | 12 / 9 / 13 | @20 met; @10 and pool not met |
+| Retrieval latency p50, CPU, warm (frozen plan, in-process) | 0.10–0.27 s | 0.49 s (8 threads, `gc.freeze`) / 0.83 s (2 threads) | not met (CPU query encoding ~0.4 s; lexical 0.24 s) |
+| Answer latency p50, planner + generator | 14–20 s | 16.9 s | met |
+| Answers fully solving (36, rubric), newer planner + newer small generator | 12 | 6 | not met |
+| Same, frozen planner output + newer small generator | 12 | 8 | not met; most of the loss is the generator model |
+| Same, frozen planner output + the old generator model (2.0.0a2 run) | 12 | 15 | met |
+| Graph evidence through a read-only attached Kuzu store | 12 questions, 46 documents, 0 targets | 36 questions, 6,232 documents, 1 target (0 beyond dense/lexical) | functional parity met; relevance difference not measurable |
+
+**Corpus B** (ticket analytics: ~1.7k records; 100 owner questions with expected answers; old served
+answers exist for 45):
+
+| Measure | Old | Package | Verdict |
+|---|---|---|---|
+| Correct, questions with old answers (45) | 42 | 18 | not met |
+| Correct, remaining questions (55) | not recorded | 4 | not measurable against the old service |
+| Deterministic `rules` path (no model): exact counts correct / exact but wrong | – | 18 / 4 | the 4 are silent wrong "exact" numbers |
+| Answer latency p50 | 10.3 s | 7.3 s | met |
+
+**Gaps found** (classified):
+- **Package:**
+  - native `output_format` for the planner schema is rejected by the provider (grammar too large); prompt mode was used;
+  - `answer_number_mismatch` treats a cited denominator as the stated count (10 abstentions with correct numbers);
+  - the rules grammar returns exact aggregates while dropping qualifiers such as "second", mention filters and "active";
+  - planners sort by the measure name, which the compiler rejects;
+  - the vector-import spot check cannot use the producer's input template;
+  - lexical/encode latency is above the old service.
+- **Configuration:** ranking fields were not declared `sortable` for corpus B; corpus B used the FTS lexical engine.
+- **Model change:** the newer small generator declines more often (fewer unsupported claims, fewer solved).
+
+Corpus B's dense embedding model differs from the served one (an owner decision).

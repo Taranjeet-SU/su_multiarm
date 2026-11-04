@@ -130,7 +130,8 @@ class RulesAgent(DecisionAgent):
             if draft.measure is None:
                 draft.limit = DEFAULT_LIST_LIMIT
         if unsupported:
-            raise DecisionFailure("unresolvable_value" if parsed.residual else "unsupported_measure", "grammar left unbound qualifiers", unsupported)
+            dropped = parsed.residual or any(u.reason == "qualifier_not_applied" for u in unsupported)
+            raise DecisionFailure("unresolvable_value" if dropped else "unsupported_measure", "grammar left unbound qualifiers", unsupported)
         compiled = compiler.compile(draft, request.filters)
         return self._finish(compiled, intents)
 

@@ -112,7 +112,7 @@ It exposes no `vector` facet: MongoDB vector search is Atlas-only and the matrix
 `planned`. Its conformance suite (`tests/conformance/test_mongodb_conformance.py`) is `external`
 and runs against the `mongo:7` container of `tests/services/`.
 `backends/opensearch/` (Phase 1) serves `catalog`, `lexical`, `vector` and `records` on the same
-contracts against OpenSearch 2.x through `opensearch-py`, with `backends/_lucene_common.py` holding
+contracts against OpenSearch 2.x and 3.x through `opensearch-py`, with `backends/_lucene_common.py` holding
 the engine-neutral parts shared with the future Elasticsearch adapter (index naming, the typed field
 layout that compiles a `Scope` into a native `bool.filter`, predicate and lexical query DSL, paging,
 transport protocol, bulk checks). Every index is named `<prefix>_<dataset>_<generation>_<kind>`;
@@ -245,7 +245,10 @@ before the request and commits the reported usage afterwards; the `classifier` a
 `providers/` (plan §3.6) holds the `ChatProvider` protocol (`complete_json`, `complete_json_raw`,
 `complete_text`) and its implementations `anthropic` (Messages API; native structured output as
 `output_config.format` or one forced tool, per the registry, and the default for capable models since
-2.0.0a3; thinking tokens recorded as reasoning usage; `cache_control` on system and tool blocks), `openai` (Chat Completions; native = strict
+2.0.0a3. A schema over the `output_config.format` complexity ceilings (`OUTPUT_FORMAT_LIMITS`) is
+never sent natively: a registry-default role resolves to prompt mode at config time, and the API's
+"grammar too large" 400 is `ProviderSchemaTooComplex`, after which a registry-default role makes one
+recorded `structured_output_fallback` switch. Thinking tokens are recorded as reasoning usage; `cache_control` on system and tool blocks), `openai` (Chat Completions; native = strict
 `json_schema`; passive caching read from usage; `base.strict_schema` converts a schema to strict
 form or raises `StrictSchemaError` listing every refused construct, and config validation and
 `doctor --probe` run it on the schemas each native OpenAI role sends), `openai_compatible` (local servers; request hints
@@ -481,8 +484,15 @@ count, dimension, finite, non-zero rows, unique keys); every chunk is matched to
 field and exact-text digest, and a chunk without a key fails the build unless `on_missing: embed`.
 The row-to-key pairing is positional and cannot be proven from the files: the digests fix the pair as
 published, and the optional `verify` spot check re-embeds `sample` chunks with the configured
-provider (its `document_prefix`, the chunk text as keyed) and requires cosine `>= min_cosine`, which
-detects a permuted or foreign keys file and tests that the rows come from the configured model.
+provider (its `document_prefix`) and requires cosine `>= min_cosine`, which detects a permuted or
+foreign keys file and tests that the rows come from the configured model. `verify.input` names what
+the producer embedded, and so what is re-embedded:
+- `engine_template` (default since the 2.0.0a3 parity fix) is the engine's own `{title}\n{field}:
+  {text}`, the same input `on_missing: embed` uses;
+- `chunk_text` is the bare text as keyed.
+
+The manifest's `verify` report records the input. A producer that used another template cannot be
+spot-checked. `verify` is not part of the import identity.
 Queries are always encoded by the configured provider. The import's identity in the index
 fingerprint and the embedding recipe is its digests (`PrecomputedVectors.identity()`), never its
 paths, so relocated files keep the index and changed content changes it; the recipe's `input` is

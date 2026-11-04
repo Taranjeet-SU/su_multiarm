@@ -6,6 +6,7 @@ rescore agreeing with exact search, and the records scan cap. Uses the stack in 
 
 from __future__ import annotations
 
+import os
 import secrets
 
 import numpy as np
@@ -37,9 +38,14 @@ def backend():
         b.close()
 
 
-def test_probe_reports_opensearch_2(backend):
+def test_probe_reports_a_supported_major(backend):
+    """2.x and 3.x are accepted; ``SU_TEST_OPENSEARCH_MAJOR`` pins which one the configured server must be."""
     info = backend().probe()
-    assert info["distribution"] == "opensearch" and info["version"].startswith("2.")
+    assert info["distribution"] == "opensearch" and info["major"] in (2, 3) and info["version"].startswith(f"{info['major']}.")
+    expected = os.environ.get("SU_TEST_OPENSEARCH_MAJOR")
+    if expected:
+        assert info["major"] == int(expected), f"SU_TEST_OPENSEARCH_MAJOR={expected} but the server is {info['version']}"
+    assert backend(knn_method="hnsw").probe()["major"] == info["major"]
 
 
 def test_generation_identity_alias_activation_and_delete_guard(backend):

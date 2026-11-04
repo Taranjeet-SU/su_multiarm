@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 
 import yaml
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationError, field_validator, model_validator
 
 from ..backends import capabilities as caps
 from ..models import StrictModel
@@ -256,10 +256,42 @@ class ChatRole(StrictModel):
     capabilities: CapabilityDeclaration = Field(default_factory=CapabilityDeclaration)
     evidence_budget: EvidenceBudget | None = None
     pricing_key: str | None = None  # key into budgets.price_table; ``price_key()`` falls back to the model id
+    # How ``structured_output`` was resolved: ``declared`` (the config sets it) or ``registry_default``
+    # (unset; resolved from the registry). Only a registry default may be moved to prompt mode for an
+    # oversized schema (``ModelRoles``) or switched once at run time (``ProviderSchemaTooComplex``).
+    _structured_output_source: str = PrivateAttr(default="declared")
+    _structured_output_note: str | None = PrivateAttr(default=None)
 
     def price_key(self) -> str:
         """What the engine passes to ``Budget.reserve_call``; the documented default is the model id."""
         return self.pricing_key or self.model
+
+    def __eq__(self, other: object) -> bool:
+        # Equality is over the configured fields: how ``structured_output`` was resolved is
+        # provenance (a dumped and reloaded role declares the resolved value), not configuration.
+        if not isinstance(other, ChatRole):
+            return NotImplemented
+        return type(self) is type(other) and self.__dict__ == other.__dict__
+
+    __hash__ = None  # type: ignore[assignment]  # mutable model, as pydantic's default
+
+    @property
+    def structured_output_defaulted(self) -> bool:
+        """``structured_output`` was not set in the config (it came from the registry default)."""
+        return self._structured_output_source == "registry_default"
+
+    @property
+    def structured_output_note(self) -> str | None:
+        """Why the registry default was resolved to prompt mode at config time (``None`` otherwise)."""
+        return self._structured_output_note
+
+    def use_prompt_mode(self, note: str) -> None:
+        """Resolve a registry-default ``native`` to ``none`` (prompt mode) and record why. Only for
+        a role whose mode was not declared; a declared mode is never changed."""
+        if not self.structured_output_defaulted:  # pragma: no cover - guarded by the caller
+            raise ValueError("a declared structured_output is never changed")
+        self.capabilities = self.capabilities.model_copy(update={"structured_output": "none"})
+        self._structured_output_note = note
 
     @model_validator(mode="after")
     def coherent(self):
@@ -274,6 +306,7 @@ class ChatRole(StrictModel):
         if self.capabilities.structured_output is None:
             mode = default_structured_output(self.provider, self.model)
             self.capabilities = self.capabilities.model_copy(update={"structured_output": mode})
+            self._structured_output_source = "registry_default"
         problems = check_role(
             self.provider,
             self.model,
@@ -289,14 +322,21 @@ class ChatRole(StrictModel):
 
 
 class PrecomputedVerify(StrictModel):
-    """Optional content check of imported rows: re-embed ``sample`` matched chunks (seeded, chunk
-    text exactly as keyed, through the configured provider with its ``document_prefix``) and require
-    cosine ``>= min_cosine`` against the imported row for every sampled chunk. This is the only
-    check that can detect a vector row paired with the wrong key."""
+    """Optional content check of imported rows: re-embed ``sample`` matched chunks (seeded, through
+    the configured provider with its ``document_prefix``) and require cosine ``>= min_cosine``
+    against the imported row for every sampled chunk. This is the only check that can detect a
+    vector row paired with the wrong key.
+
+    ``input`` is what the producer embedded for a keyed chunk, and so what is re-embedded:
+    ``engine_template`` (default) is the input the package's own embedder uses (``{title}\\n{field}:
+    {text}``, ``ingestion.write.EMBEDDING_INPUT``; also what ``on_missing: embed`` embeds);
+    ``chunk_text`` is the bare chunk text as keyed. A producer that used another template cannot be
+    spot-checked (set ``sample: 0``); the check never guesses."""
 
     sample: int = Field(default=0, ge=0, le=10000)  # 0 = off
     min_cosine: float = Field(default=0.98, gt=0, le=1)
     seed: int = 0
+    input: Literal["engine_template", "chunk_text"] = "engine_template"
 
 
 class PrecomputedVectors(StrictModel):
@@ -393,6 +433,24 @@ class ModelRoles(StrictModel):
     @classmethod
     def unimplemented_roles(cls, data):
         return reject_unimplemented(data, UNIMPLEMENTED_ROLES, "models.roles")
+
+    @model_validator(mode="after")
+    def fit_native_schemas(self):
+        """Deterministic pre-flight (2.0.0a3 parity fix): a role whose ``native`` mode is only the
+        registry default, realised as Anthropic ``output_config.format``, falls back to prompt mode
+        (``none``) when a schema the role sends is over the provider's complexity ceilings
+        (``providers.base.output_format_problems``). The resolution is recorded on the role and
+        reported by ``validate`` / ``doctor`` as a ``structured_output_fallback`` warning. A declared
+        ``native`` is never changed; ``validate`` reports it as an error instead."""
+        from ..pipeline.validate import output_format_role_problems
+
+        for name, role in self.chat_roles().items():
+            if not role.structured_output_defaulted or role.capabilities.structured_output != "native":
+                continue
+            problems = output_format_role_problems(role.provider, role.model, name)
+            if problems:
+                role.use_prompt_mode("structured_output resolved to none (prompt mode): " + "; ".join(problems))
+        return self
 
     def chat_roles(self) -> dict[str, ChatRole]:
         names = ("planner", "reviewer", "extractor", "generator", "community")

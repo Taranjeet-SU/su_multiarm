@@ -1156,3 +1156,127 @@ Latency p50/p95: before 1.21/2.47 s (2 threads) → bm25 0.74/1.32 s (2 threads)
 Follow-ups: query-encode cost (ONNX/quantised encoder, or encode cache for repeated queries); GC tail
 (serving-level `gc.freeze()` option); `bm25` segment for incremental (delta) ingest is a full rebuild;
 `hit_parts` document heads still parse the stored document JSON (a heads column would avoid it).
+
+### 2026-11-04 — 2.0.0a3/parity-fixes: package defects from the final parity run — DONE (synthetic/mocked evidence)
+
+Base `94d978e` (v2/phase-0), commit `85e4f05`. No paid or real-service call.
+
+Done:
+1. **Native structured output on oversized schemas.**
+   - `providers.base`: `OUTPUT_FORMAT_LIMITS` (24 optional and 16 union-typed properties on the wire
+     schema), `output_format_complexity` / `output_format_problems`, and `ProviderSchemaTooComplex`
+     (HTTP 400 whose body names the grammar or complexity; the body is never echoed).
+   - `ModelRoles.fit_native_schemas`: a registry-default `native` role resolves to `none` for an
+     oversized schema (`ChatRole.structured_output_note`), and `validate`/`doctor` report a
+     `structured_output_fallback` warning. A declared `native` gets `schema_not_strict` (an error).
+   - `HttpChatProvider._schema_exchange`: a call-time pre-flight, plus one recorded switch to prompt
+     mode after the typed 400. Both apply to registry-default roles only. The record is
+     `structured_output_fallback` in the call record and the `model_call` trace.
+   - `examples/v2/hosted_models.yaml` planner: `structured_output: none`.
+2. **`answer_number_mismatch`.**
+   - `statements.population_frame` covers "out of", "denominator is/of/:", "as the denominator",
+     ratio "N/M", "% of" and "N of M": such a number is not compared.
+   - The denominator matches after a preposition (of/among/over/across/within/from, not "total
+     of"), and so does the sum of the group counts.
+3. **Rules grammar.**
+   - These are `qualifier_not_applied` and the agent abstains (`unresolvable_value`):
+     - a free ordinal (2nd–10th);
+     - `active`/`inactive` that is not a declared state or value;
+     - a numeric comparison bound to no field.
+   - The topic cue no longer starts inside a hyphenated word, and "X-mention <unit>" is the topic X.
+   - A topic made only of grammar words is ignored.
+4. **`ScopeCompiler` sort by count.** On a grouped scope, `sort` by
+   count/record_count/group_count/records/measure/value, by the measure kind or by a numeric
+   measure's field becomes `order`. Without `group_by`, or with a contradicting `order`, it is
+   `measure_unsupported`. The planner prompt mentions it.
+5. **Precomputed `verify.input`.** `engine_template` (the default) re-embeds `{title}\n{field}:
+   {text}`; `chunk_text` re-embeds the bare text. It is recorded in the spot-check report and is
+   not in the index identity.
+
+Deviations:
+- (a) The task says a number equal to the aggregate's denominator must not trigger a mismatch. The
+  existing test "there are 36 open records" (denominator 36, count 12) abstains, and that stays: a
+  bare denominator stated as the count is a real wrong count. The denominator therefore matches only
+  after a population preposition or inside a ratio frame. This covers every phrasing seen in the
+  parity run.
+- (b) `ChatRole.__eq__` ignores the private resolution provenance, so a dumped and reloaded config
+  (which declares the resolved mode) stays equal to the original.
+- (c) The complexity ceilings are Anthropic's documented limits. The real 400 was observed for the
+  plan schema only, so whether every under-limit schema is accepted is not verified.
+- (d) The `verify.input` default changed to `engine_template`. This is allowed because `precomputed`
+  is unpublished (new in a3). Rows of the bare text need `input: chunk_text`.
+
+Tests: `not external` 1189 → **1225 passed**; `pytest -q` 1228 passed, 124 skipped; ruff clean;
+schema regenerated; golden fingerprints unchanged. New and changed tests:
+- new: `tests/contract/test_structured_output_fallback.py`;
+- added cases in `test_answer_text_contract.py`, `test_query_compiler.py` and
+  `test_precomputed_vectors.py`;
+- `test_anthropic_a3.py`: the planner is now expected to be over the ceilings.
+
+Follow-ups:
+- A real-API check of the pre-flight ceilings, with one call on a schema at the limit.
+- Re-run the parity answer paths on both private corpora with these fixes.
+- Text-mention ratio operations, which the parity report lists as a gap, are still not implemented.
+- The parity report's config gaps (`sortable` organization/module/rca, the SU config on bm25) are
+  deployment configuration, not package changes.
+
+### 2026-11-04 — a3/opensearch3: OpenSearch 3.x support next to 2.x, Lucene result-window paging — DONE (real-service on 2.19.1, 3.9.0, ES 8.17.4)
+
+Base `94d978e`, rebased onto `cf242ce`. Code commit `5e41469`.
+
+Done:
+1. **3.x differences checked.** Sources: the OpenSearch 3.0.0 release notes, the k-NN plugin notes
+   for 3.0 alpha/beta through 3.9, and the core PR #17306. Each was then checked against the
+   servers. The ones that matter:
+   - Lucene 10 (10.5.1 in 3.9.0).
+   - JDK 21 minimum (the image bundles 25).
+   - `BM25Similarity` replaces `LegacyBM25Similarity` by default, for every index the server
+     serves. Measured: scores are exactly 1/2.2 of 2.x, with identical rankings.
+   - `nmslib` index creation is blocked from 3.0 (verified: `mapper_parsing_exception`).
+   - The index-level `knn.algo_param.*`, `knn.space_type` and `knn.plugin.enabled` settings were
+     removed. The adapter does not use them.
+   - Derived vector source is the default.
+   - Keyword `term` queries no longer score. The adapter uses them in filter context only.
+   - `_bulk batch_size` was removed (not used).
+   - The security demo config needs `OPENSEARCH_INITIAL_ADMIN_PASSWORD`, which the compose
+     settings avoid by disabling security.
+2. **`probe`** accepts 2.x and 3.x and returns `major`. It raises a typed error for an HNSW engine
+   the major blocks (`adapter.KNN_ENGINES`, `search.HNSW_ENGINE = "lucene"`).
+3. **No layout or identity change.** Mappings, `_meta`, the DSL and `generation_identity` are the
+   same on both majors, and the 2.x golden fingerprints are unchanged.
+4. **Result-window fix** in the shared `OpenSearchLexical.search` (also used by Elasticsearch),
+   with a mocked regression test.
+5. **Compose.** New `opensearch3` service (3.9.0, profile `opensearch3`, port 19202, digest in a
+   compose comment). New `SU_TEST_OPENSEARCH_MAJOR`, and `wait_ready.py --only opensearch3`.
+6. **Docs.** Updated CONFIGURATION, ARCHITECTURE, the services README, the generated backend
+   tables, CHANGELOG 2.0.0a3 (Added, Fixed) and VALIDATION.
+
+Deviations:
+- (a) The server major is not recorded in the generation identity or the manifest. The layout is
+  identical, and the BM25 scale is a property of the serving server, not of the index: a 2.x index
+  served by 3.x scores the 3.x way. Every fusion and ordering policy is invariant to a constant
+  factor. This is documented in CONFIGURATION ("OpenSearch semantics").
+- (b) `knn.method` names no engine, so there is no configured engine to validate. The guard checks
+  the engine the adapter writes, at probe time (`doctor --probe`). The adapter does not probe
+  automatically before writes (unchanged).
+- (c) The coordinator asked for the result-window fix mid-task. It refuses with a typed error
+  beyond 10000 lexical hits. It does not enumerate further with search_after/PIT. A structured text
+  condition matching more than 10000 chunks on Lucene engines is therefore refused, not counted.
+- (d) Fixed a pre-existing hygiene failure at `cf242ce`: an origin service name in an earlier log
+  entry.
+
+Tests:
+- `not external`: 1224 passed + 1 failed at `cf242ce` → **1237 passed**.
+- Bare `pytest -q` (2.19.1 and ES up): 1278 passed, 86 skipped.
+- OpenSearch external: 20 passed, 8 skipped on each major. Base on 2.19.1: 4 failed.
+- ES external: 18 passed, 8 skipped. Base: 4 failed.
+- ruff is clean. The schema is unchanged (Config not touched).
+
+Follow-ups:
+- Enumeration beyond 10000 lexical hits on Lucene engines (search_after with PIT), if structured
+  text counts need it.
+- Not yet tested:
+  - 3.x with the multi-backend engine test, which needs PostgreSQL and Neo4j;
+  - an in-place 2.x → 3.x upgrade;
+  - security-enabled clusters.
+- CI (`services.yml`) still starts only the default profile. Adding a 3.x leg is a CI-cost decision.

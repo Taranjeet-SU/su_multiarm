@@ -81,6 +81,14 @@ GRAMMAR_WORDS = frozenset(
 )
 
 
+# Qualifiers the residual check skips as grammar vocabulary; flagged when no operation consumed them.
+_FREE_ORDINAL = re.compile(r"(?<![\w-])(?:" + "|".join(sorted((o for o in _ORDINALS if _ORDINALS[o] > 1), key=len, reverse=True)) + r")(?![\w-])")
+_STATE_WORDS = re.compile(r"(?<![\w-])(?:in)?active(?![\w-])")
+_FREE_COMPARISON = re.compile(
+    r"(?:>=|<=|>|<|=|(?<![\w-])(?:at\s+least|at\s+most|more\s+than|fewer\s+than|less\s+than|greater\s+than|higher\s+than|lower\s+than|above|below|over|under))\s*\d+(?:\.\d+)?(?![\w.])"
+)
+
+
 @dataclass
 class GrammarResult:
     draft: ScopeDraft
@@ -210,6 +218,7 @@ class QueryGrammar:
         label_words = {w for spec in self.temporal for w in WORD.findall((spec.time_basis or "").casefold())}
         from .rules import STOP_WORDS  # the agent's stop list (shared)
 
+        self._dropped_qualifiers(text, result)
         for _, word in text.residual_words():
             if word in STOP_WORDS or word in GRAMMAR_WORDS or word in units or word in field_words or word in label_words:
                 continue
@@ -217,6 +226,26 @@ class QueryGrammar:
                 continue
             result.residual.append(word)
         return result
+
+    # --- qualifiers no operation consumed ------------------------------------------------------------
+
+    def _dropped_qualifiers(self, text: _Text, result: GrammarResult) -> None:
+        """Qualifier words that the residual check would otherwise skip as grammar vocabulary but
+        that no recognised operation consumed (2.0.0a3 parity fix: the rules path returned an
+        ``exact`` count that ignored them). Each is ``qualifier_not_applied``; the agent refuses the
+        scope instead of counting a wider population:
+
+        * an ordinal other than ``first`` ("who is second for X") outside a ranking;
+        * a state word (``active``, ``inactive``) that is not a declared state or value;
+        * a comparison with a number ("with >= 20 records", "at least 5") bound to no field."""
+        for match in text.finditer(_FREE_ORDINAL):
+            result.unsupported.append(_flag(match.group(0), "qualifier_not_applied", "an ordinal outside a group ranking ('second most common <field>'); the scope would ignore it"))
+        for match in text.finditer(_STATE_WORDS):
+            result.unsupported.append(
+                _flag(match.group(0), "qualifier_not_applied", "a state word that is not a declared state or value of any field; declare it under the field's states")
+            )
+        for match in text.finditer(_FREE_COMPARISON):
+            result.unsupported.append(_flag(match.group(0), "qualifier_not_applied", "a numeric comparison bound to no declared field; the scope would ignore it"))
 
     # --- share ------------------------------------------------------------------------------------
 
@@ -262,10 +291,23 @@ class QueryGrammar:
             self._set_text(result, TextMatch(kind="phrase", text=phrase.strip(), role=role), phrase)  # type: ignore[arg-type]
 
     def _topic(self, text: _Text, result: GrammarResult, numerator_from: int | None) -> None:
+        # "<word>-mention <unit>" (2.0.0a3 parity fix): the word before the hyphen is the topic; the
+        # cue below never starts inside a hyphenated word ("invoice-mention rate" is not "mention rate").
+        compound = re.compile(r"(?<![\w-])(?P<w>[^\W_]+)-(?:mention(?:s|ed|ing)?|related|containing)(?![\w-])")
+        for match in text.finditer(compound):
+            word = match.group("w")
+            if word in GRAMMAR_WORDS or word in self.units or self._is_value(word):
+                continue
+            text.take(match.start(), match.end())
+            role = "numerator" if numerator_from is not None and match.start() >= numerator_from - 1 else "scope"
+            self._set_text(result, TextMatch(kind="all_terms", text=text.raw[match.start("w") : match.end("w")], role=role), word)  # type: ignore[arg-type]
+            return
         cue = re.compile(
-            r"\b(?:that\s+|which\s+|who\s+)?(?:mention(?:s|ed|ing)?|contain(?:s|ed|ing)?|about|regarding|referencing|"
+            r"(?<![\w-])(?:that\s+|which\s+|who\s+)?(?:mention(?:s|ed|ing)?|contain(?:s|ed|ing)?|about|regarding|referencing|"
             r"refer(?:s|red|ring)?\s+to|related\s+to|relating\s+to|involving)\s+"
         )
+        from .rules import STOP_WORDS  # the agent's stop list (shared)
+
         for match in text.finditer(cue):
             words: list[tuple[int, int, str]] = []
             for word in WORD.finditer(text.low, match.end()):
@@ -276,8 +318,8 @@ class QueryGrammar:
                 if len(words) >= 6:
                     break
             content = [w for w in words if w[2] not in _TOPIC_STOP]
-            if not content:
-                continue
+            if not content or all(w[2] in GRAMMAR_WORDS or w[2] in STOP_WORDS or w[2] in self.units for w in content):
+                continue  # "contain the most active records": grammar words, not a topic
             text.take(match.start(), words[-1][1])
             role = "numerator" if numerator_from is not None and match.start() >= numerator_from - 1 else "scope"
             phrase = " ".join(text.raw[a:b] for a, b, _ in content)

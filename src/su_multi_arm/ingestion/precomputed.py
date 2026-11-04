@@ -140,27 +140,48 @@ class PrecomputedVectors:
         return self.audit
 
 
-def spot_check(imported: "PrecomputedVectors", chunks: list[Any], encode: Any, sample: int, min_cosine: float, seed: int) -> dict[str, Any]:
+def spot_check(
+    imported: "PrecomputedVectors",
+    chunks: list[Any],
+    encode: Any,
+    sample: int,
+    min_cosine: float,
+    seed: int,
+    compose: Any = None,
+    input_name: str = "chunk_text",
+) -> dict[str, Any]:
     """Re-embed up to ``sample`` matched chunks (seeded choice) with ``encode(texts)`` and compare each
-    with its imported row. Raises ``PrecomputedVectorError`` when any cosine is below ``min_cosine``."""
+    with its imported row. ``compose(chunk)`` builds the embedder input the producer used (the
+    engine template for ``verify.input: engine_template``); ``None`` re-embeds the bare chunk text.
+    ``input_name`` is recorded in the report. Raises ``PrecomputedVectorError`` when any cosine is
+    below ``min_cosine``."""
     import random
 
     matched = [c for c in chunks if (c.document_id, c.field, text_sha256(c.text)) in imported.index]
     if not matched:
-        return {"sample": 0, "min_cosine_required": min_cosine, "checked": 0}
+        return {"sample": 0, "min_cosine_required": min_cosine, "checked": 0, "input": input_name}
     picked = random.Random(seed).sample(matched, min(sample, len(matched)))
-    fresh = np.asarray(encode([c.text for c in picked]), dtype=np.float32)
+    fresh = np.asarray(encode([compose(c) if compose is not None else c.text for c in picked]), dtype=np.float32)
     rows = np.vstack([np.asarray(imported.matrix[imported.index[(c.document_id, c.field, text_sha256(c.text))]], dtype=np.float32) for c in picked])
     fresh /= np.linalg.norm(fresh, axis=1, keepdims=True)
     rows /= np.linalg.norm(rows, axis=1, keepdims=True)
     cosines = (fresh * rows).sum(axis=1)
     worst = int(np.argmin(cosines))
-    report = {"checked": len(picked), "min_cosine_required": min_cosine, "min": round(float(cosines.min()), 6), "median": round(float(np.median(cosines)), 6), "below": int((cosines < min_cosine).sum())}
+    report = {
+        "checked": len(picked),
+        "input": input_name,
+        "min_cosine_required": min_cosine,
+        "min": round(float(cosines.min()), 6),
+        "median": round(float(np.median(cosines)), 6),
+        "below": int((cosines < min_cosine).sum()),
+    }
     if report["below"]:
         bad = picked[worst]
         raise PrecomputedVectorError(
             "vector",
             f"{bad.document_id}/{bad.field}",
-            f"spot check: {report['below']} of {len(picked)} re-embedded chunks fall below cosine {min_cosine} (min {report['min']}); the vectors and keys files are not paired or not from the configured model",
+            f"spot check: {report['below']} of {len(picked)} re-embedded chunks fall below cosine {min_cosine} (min {report['min']}, "
+            f"re-embedded input {input_name}); the vectors and keys files are not paired, not from the configured model, "
+            "or the producer embedded a different input (verify.input)",
         )
     return report

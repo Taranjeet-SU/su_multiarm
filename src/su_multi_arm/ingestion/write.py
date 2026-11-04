@@ -672,9 +672,17 @@ class WritePath:
                 imported = PrecomputedVectors(role.precomputed, role.dimensions)
                 check = role.precomputed.verify
                 if check.sample:
-                    reservations = meter.reserve_embedding(sum(len(c.text) for c in chunks[: check.sample]), role.price_key())
+                    # Re-embed what the producer embedded (verify.input): the engine's own composed
+                    # input (title + field + text) by default, or the bare keyed chunk text.
+                    if check.input == "engine_template":
+                        compose = lambda c: self.embedding_input(titles[c.document_id], c)  # noqa: E731
+                    else:
+                        compose = None
+                    reservations = meter.reserve_embedding(sum(len(compose(c) if compose else c.text) for c in chunks[: check.sample]), role.price_key())
                     try:
-                        imported.audit.verify = spot_check(imported, chunks, self.embedder.encode, check.sample, check.min_cosine, check.seed)
+                        imported.audit.verify = spot_check(
+                            imported, chunks, self.embedder.encode, check.sample, check.min_cosine, check.seed, compose=compose, input_name=check.input
+                        )
                     finally:
                         meter.commit_embedding(reservations, getattr(getattr(self.embedder, "provider", None), "last_usage", None))
             except PrecomputedVectorError as exc:

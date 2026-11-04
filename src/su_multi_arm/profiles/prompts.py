@@ -20,7 +20,7 @@ are listed, a measure only when its requirements are met. Never put an aggregate
 Never invent field names, values or identifiers; if a qualifier in the question has no field,
 omit the structured step rather than counting a wider population. Preserve the request filters
 exactly. A structured scope can also rank groups (group_by with order, top_n, or nth for "second
-most"), group by a date field with a granularity, compare periods (periods: calendar expressions on
+most"; sort by "count" or by the measure ranks groups the same way), group by a date field with a granularity, compare periods (periods: calendar expressions on
 one date field), restrict to a time window (windows: a calendar expression such as "last 7 days",
 "this month" or "2026-10", read against time_anchor), give each group's share (with_share) or a
 share with a numerator, count distinct values (count_distinct), list records (limit, sort), and

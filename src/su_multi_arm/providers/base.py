@@ -65,6 +65,20 @@ class ProviderRequestError(ProviderError):
     category = "bad_request"
 
 
+class ProviderSchemaTooComplex(ProviderRequestError):
+    """HTTP 400 because the server cannot compile the reply schema into a grammar (Anthropic
+    ``output_config.format``: "compiled grammar is too large" / "schema is too complex"). The
+    request was refused before generation. The role should use prompt mode for this schema
+    (``structured_output: none``); see ``output_format_complexity``."""
+
+    category = "schema_too_complex"
+
+
+# Fragments of a 400 body that identify a grammar the server could not compile. Matched
+# case-insensitively; the body itself is never echoed into the error.
+SCHEMA_TOO_COMPLEX_MARKERS: tuple[str, ...] = ("grammar is too large", "schema is too complex", "too complex for compilation")
+
+
 class ProviderTimeout(ProviderError):
     category = "timeout"
 
@@ -129,7 +143,20 @@ def map_http_error(response: httpx.Response, stage: str) -> ProviderError:
         return ProviderRateLimited(message, stage=stage, status=status, retry_after=response.headers.get("retry-after"))
     if status >= 500:
         return ProviderServerError(message, stage=stage, status=status)
+    if status == 400 and _body_mentions(response, SCHEMA_TOO_COMPLEX_MARKERS):
+        return ProviderSchemaTooComplex(f"{message}: the reply schema is too large for the provider's grammar compiler", stage=stage, status=status)
     return ProviderRequestError(message, stage=stage, status=status)
+
+
+def _body_mentions(response: httpx.Response, markers: tuple[str, ...]) -> bool:
+    """Whether the error body contains one of ``markers`` (case-insensitive). The body is only
+    inspected (first 64 KiB), never returned or logged."""
+    try:
+        response.read()
+        text = response.text[:65536].casefold()
+    except Exception:  # noqa: BLE001 - an unreadable body is simply not a match
+        return False
+    return any(marker in text for marker in markers)
 
 
 # --- usage and metering -----------------------------------------------------------------------
@@ -232,6 +259,9 @@ class RoleSpec:
     reasoning_effort: str | None = None
     pricing_key: str | None = None
     streaming: bool = False  # the role declares ``capabilities.streaming``
+    # ``structured_output`` came from the registry default, not the config: only then may a native
+    # call refused as ``ProviderSchemaTooComplex`` be switched once, recorded, to prompt mode.
+    structured_output_defaulted: bool = False
 
     @classmethod
     def of(cls, config: Any) -> "RoleSpec":
@@ -250,6 +280,7 @@ class RoleSpec:
             reasoning_effort=getattr(config, "reasoning_effort", None),
             pricing_key=pricing or config.model or None,
             streaming=bool(getattr(caps, "streaming", False)),
+            structured_output_defaulted=getattr(config, "structured_output_defaulted", False) is True,
         )
 
 
@@ -437,6 +468,65 @@ def output_format_schema(schema: dict[str, Any], name: str = "schema") -> dict[s
     if problems:
         raise StrictSchemaError(name, problems, hint="declare structured_output: none for this role")
     return converted
+
+
+# Complexity ceilings of Anthropic structured outputs (the documented schema complexity limits; above
+# them the API answers HTTP 400 "compiled grammar is too large"). Counted on the wire schema that
+# ``output_format_schema`` produces, each ``$defs`` entry once: properties not listed in their
+# object's ``required`` and properties whose value is a union (``anyOf`` or a ``type`` list,
+# including ``X | None``). The estimate is deterministic and conservative; a schema over a ceiling is
+# never sent natively (2.0.0a3 parity finding: the planner's ``LlmPlan`` is over both).
+OUTPUT_FORMAT_LIMITS: dict[str, int] = {"optional_properties": 24, "union_properties": 16}
+
+
+def output_format_complexity(wire: dict[str, Any]) -> dict[str, int]:
+    """``{"properties", "optional_properties", "union_properties"}`` counted over a wire schema."""
+    counts = {"properties": 0, "optional_properties": 0, "union_properties": 0}
+
+    def union(node: Any) -> bool:
+        return isinstance(node, dict) and ("anyOf" in node or isinstance(node.get("type"), list))
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            required = set(node.get("required") or [])
+            counts["properties"] += len(properties)
+            counts["optional_properties"] += sum(1 for name in properties if name not in required)
+            counts["union_properties"] += sum(1 for child in properties.values() if union(child))
+            for child in properties.values():
+                walk(child)
+        for key, value in node.items():
+            if key != "properties":
+                walk(value)
+
+    walk(wire)
+    return counts
+
+
+def output_format_problems(schema: dict[str, Any], name: str = "schema") -> list[str]:
+    """Why ``schema`` cannot be sent as Anthropic ``output_config.format``: a free-form mapping
+    (``StrictSchemaError``) or a complexity count over ``OUTPUT_FORMAT_LIMITS``. Empty when it can
+    be sent. Deterministic; never calls the network."""
+    try:
+        wire = output_format_schema(schema, name)
+    except StrictSchemaError as error:
+        return [str(error)]
+    return output_format_limit_problems(wire, name)
+
+
+def output_format_limit_problems(wire: dict[str, Any], name: str = "schema") -> list[str]:
+    """Complexity counts of a wire schema over ``OUTPUT_FORMAT_LIMITS`` (empty when it fits)."""
+    counts = output_format_complexity(wire)
+    over = [f"{key} {counts[key]} > {limit}" for key, limit in OUTPUT_FORMAT_LIMITS.items() if counts[key] > limit]
+    if not over:
+        return []
+    return [f"{name} is too complex for output_config.format ({', '.join(over)}); the provider refuses it with HTTP 400 (declare structured_output: none for this role)"]
 
 
 class HttpCall:

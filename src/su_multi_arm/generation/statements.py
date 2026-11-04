@@ -57,7 +57,7 @@ from ..models import StrictModel
 
 LANGUAGE = "en"
 StatementKind = Literal["count", "exhaustive_list", "absence"]
-__all__ = ["COUNT_NOUNS", "LANGUAGE", "Statement", "StatementKind", "detect_statements", "stated_number", "units_for"]
+__all__ = ["COUNT_NOUNS", "LANGUAGE", "Statement", "StatementKind", "detect_statements", "population_frame", "stated_number", "units_for"]
 _NUMBER_WORDS = (
     "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
     "sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|a dozen|dozens of|hundreds of"
@@ -147,6 +147,24 @@ def stated_number(text: str) -> int | None:
         return _WORD_VALUES[token]
     digits = token.replace(",", "")
     return int(digits) if digits.isdigit() else None
+
+
+# A number stated as the population of a ratio, not as a count (2.0.0a3 parity fix): "out of 2048
+# records", "a denominator of 2,048", "denominator: 2048", "12 of 36 tickets", "12/36 tickets",
+# "40% of 2048 records", "2,048 records as the denominator". The contract does not compare such a
+# number with the cited aggregate's count; the count in the same sentence is still compared.
+_POPULATION_BEFORE = re.compile(
+    r"(?:\bout\s+of|\bdenominator(?:\s+(?:is|was|of|reported\s+is))?\s*[:=]?|\b(?:ratio|share|proportion|fraction|percentage)\s+of|"
+    r"(?:%|\bpercent|\bper\s*cent)\s+of|\b(?:\d{1,3}(?:,\d{3})+|\d+)\s+(?:out\s+)?of|\bper|/)"
+    r"\s*(?:(?:a|an|the|all|its|their)\s+)?(?:(?:total|reported|stated)\s+)?(?:denominator\s+of\s+)?(?:(?:about|roughly|approximately|nearly)\s+)?$",
+    re.I,
+)
+_POPULATION_AFTER = re.compile(r"^\s*(?:[\w'-]+\s+){0,4}?(?:as|in|for)\s+(?:the|its|a|their)\s+(?:[\w'-]+\s+){0,2}?denominator\b", re.I)
+
+
+def population_frame(answer: str, start: int, end: int) -> bool:
+    """The count statement ``answer[start:end]`` names a ratio's population (see ``_POPULATION_BEFORE``)."""
+    return bool(_POPULATION_BEFORE.search(answer[max(0, start - 64) : start]) or _POPULATION_AFTER.match(answer[end : end + 96]))
 
 
 def _number_is_label(answer: str, match: re.Match[str], kind: StatementKind, fields: re.Pattern[str] | None = None) -> bool:

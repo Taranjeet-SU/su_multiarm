@@ -31,6 +31,7 @@ SORT = [{"_score": "desc"}, {"chunk_id": "asc"}]
 MAX_DIMENSIONS = 16000
 ANN_OVERSAMPLE = 4
 MAX_WINDOW = 10000
+HNSW_ENGINE = "lucene"  # supported on OpenSearch 2.x and 3.x (nmslib index creation is blocked on 3.x)
 EXACT_SCRIPT = "Math.max(0.0, 1.0 + cosineSimilarity(params.query_value, doc[params.field]))"
 
 
@@ -80,21 +81,33 @@ class OpenSearchLexical:
         window = min(size, max(0, k - offset))
         if window == 0:
             return PageResult(items=[], next_cursor=None)
+        if offset + window > MAX_WINDOW:
+            # from + size above index.max_result_window: the engine cannot serve this page; refuse
+            # instead of returning a silently shortened ranking.
+            raise BackendError(self._b.kind, "search", f"page {offset}..{offset + window} is beyond the result window {MAX_WINDOW}; narrow the query or scope")
         filters: list[dict[str, Any]] = [{"term": {"lexical": True}}, *scope_filter(scope, "document_id")]
         if query.fields:
             filters.append({"terms": {"field": list(query.fields)}})
+        # One look-ahead hit tells whether another page exists, unless it would cross the window.
+        lookahead = offset + window < MAX_WINDOW
+        compound = {"bool": {"must": [text_query], "filter": filters}}
         body: dict[str, Any] = {
             "from": offset,
-            "size": window + 1,
+            "size": window + 1 if lookahead else window,
             "_source": HIT_SOURCE,
             "sort": SORT,
             "track_total_hits": False,
-            "query": {"bool": {"must": [text_query], "filter": filters}},
+            "query": compound,
             "highlight": {"fields": {"text": {}, "title": {}}, "number_of_fragments": 3},
         }
         name = self._b.require_index(gen, "chunks", "search")
         hits = self._b.call("search", "POST", f"/{name}/_search", body=body)["hits"]["hits"]
         rows = hits[:window]
+        more = len(hits) > len(rows)
+        if not lookahead and len(rows) == window and offset + window < k:
+            # The page ends at the window edge: an exact count says whether more hits exist (the
+            # next page is then refused above rather than reported as the end of the ranking).
+            more = int(self._b.call("search", "POST", f"/{name}/_count", body={"query": compound})["count"]) > offset + window
         items = [
             ScoredChunk(
                 chunk_id=h["_source"]["chunk_id"],
@@ -104,7 +117,7 @@ class OpenSearchLexical:
             )
             for h in rows
         ]
-        more = len(hits) > len(rows) and offset + len(rows) < k
+        more = more and offset + len(rows) < k
         return PageResult(items=items, next_cursor=str(offset + len(rows)) if more else None)
 
 
@@ -123,7 +136,7 @@ class OpenSearchVector:
     def _field_mapping(self, dimension: int) -> dict[str, Any]:
         mapping: dict[str, Any] = {"type": "knn_vector", "dimension": dimension}
         if self._b.knn_method == "hnsw":
-            mapping["method"] = {"name": "hnsw", "space_type": "cosinesimil", "engine": "lucene", "parameters": {"ef_construction": 128, "m": 16}}
+            mapping["method"] = {"name": "hnsw", "space_type": "cosinesimil", "engine": HNSW_ENGINE, "parameters": {"ef_construction": 128, "m": 16}}
         return mapping
 
     def _dimension(self, gen: GenerationId, namespace: str, operation: str) -> int | None:

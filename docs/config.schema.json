@@ -2290,7 +2290,7 @@
     },
     "PrecomputedVerify": {
       "additionalProperties": false,
-      "description": "Optional content check of imported rows: re-embed ``sample`` matched chunks (seeded, chunk\ntext exactly as keyed, through the configured provider with its ``document_prefix``) and require\ncosine ``>= min_cosine`` against the imported row for every sampled chunk. This is the only\ncheck that can detect a vector row paired with the wrong key.",
+      "description": "Optional content check of imported rows: re-embed ``sample`` matched chunks (seeded, through\nthe configured provider with its ``document_prefix``) and require cosine ``>= min_cosine``\nagainst the imported row for every sampled chunk. This is the only check that can detect a\nvector row paired with the wrong key.\n\n``input`` is what the producer embedded for a keyed chunk, and so what is re-embedded:\n``engine_template`` (default) is the input the package's own embedder uses (``{title}\\n{field}:\n{text}``, ``ingestion.write.EMBEDDING_INPUT``; also what ``on_missing: embed`` embeds);\n``chunk_text`` is the bare chunk text as keyed. A producer that used another template cannot be\nspot-checked (set ``sample: 0``); the check never guesses.",
       "properties": {
         "sample": {
           "default": 0,
@@ -2310,6 +2310,15 @@
           "default": 0,
           "title": "Seed",
           "type": "integer"
+        },
+        "input": {
+          "default": "engine_template",
+          "enum": [
+            "engine_template",
+            "chunk_text"
+          ],
+          "title": "Input",
+          "type": "string"
         }
       },
       "title": "PrecomputedVerify",

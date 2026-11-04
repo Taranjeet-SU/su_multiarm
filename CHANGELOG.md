@@ -100,9 +100,23 @@ compiler, the Kuzu graph backend and the BM25 lexical engine.
 - Lexical arm options `verbatim_boost` and `pin_identifiers` (both off by default; `verbatim_boost`
   needs `lexical_engine: bm25`). A selection `Candidate.leads` flag keeps an arm's front records ahead
   of `source_slots`.
+- **OpenSearch 3.x support** for the `opensearch` backend; 2.x keeps working. `probe` accepts 2.x
+  and 3.x, reports the `major`, and refuses an HNSW engine the detected major cannot create (3.0
+  blocks new `nmslib` indices; the adapter writes `lucene`, which both accept). The index layout,
+  mappings and query DSL are unchanged, so generation identities and golden fingerprints are the
+  same. On 3.x, BM25 scores are the 2.x scores divided by 2.2 (`BM25Similarity` replaces
+  `LegacyBM25Similarity`); rankings and every fusion policy are unaffected. The conformance suite
+  passed against `opensearchproject/opensearch:2.19.1` and `3.9.0`. `tests/services/docker-compose.yml`
+  gains an `opensearch3` service (profile `opensearch3`, port 19202), and `SU_TEST_OPENSEARCH_MAJOR`
+  pins which major the tests expect.
 
 ### Fixed
 
+- OpenSearch and Elasticsearch lexical paging no longer asks for more than the 10000-hit result
+  window. The structured arm's text conditions page with 10000-hit pages, and the look-ahead hit
+  made the request 10001, an HTTP 400 on every records check against a real server. A page at the
+  window edge now decides `next_cursor` from an exact `_count`, and a page beyond the window is a
+  typed `BackendError`, never a shortened ranking.
 - A number directly after a declared field name ("priority 3 tickets") is no longer read as a count.
   Before, such a number made a correct exact answer fail `answer_number_mismatch` (QQ-02).
 - A count whose nearest following word was a question noun read as a label was missed ("111 open
@@ -121,6 +135,46 @@ compiler, the Kuzu graph backend and the BM25 lexical engine.
 - Vector search applies scope as a document bitset (Faiss `IDSelectorBitmap`). Arms no longer parse
   whole documents to build hits, and selection no longer deep-copies candidates (lower retrieval
   latency).
+
+The following fixes address findings from the final parity run. Evidence is synthetic and mocked
+only; no paid call was made.
+
+- **Native structured output on oversized schemas.** Anthropic refused the planner's plan schema as
+  `output_config.format` with HTTP 400 "compiled grammar is too large".
+  - A deterministic pre-flight counts the wire schema against `OUTPUT_FORMAT_LIMITS` (24 optional
+    and 16 union-typed properties).
+  - A role whose `native` is only the registry default now resolves to prompt mode for an oversized
+    schema at config time, with a `structured_output_fallback` warning. A declared `native` is a
+    validation error.
+  - The 400 is the typed `ProviderSchemaTooComplex` (`schema_too_complex`). A registry-default role
+    makes one explicit switch to prompt mode, recorded as `structured_output_fallback` in the call
+    record and the `model_call` trace event. A declared `native` fails.
+  - `examples/v2/hosted_models.yaml` declares `structured_output: none` for its Sonnet 5.x planner.
+- **`answer_number_mismatch` misread populations.** A number that names a ratio's population is no
+  longer compared with the count:
+  - "out of 2048 records", "a denominator of 2,048", "denominator: 2048", "2,048 records as the
+    denominator";
+  - "12/36", "40% of 2048", and the 50 in "12 of 50".
+  
+  The cited denominator also matches after a preposition ("among 2,048 records"), and so does the
+  sum of the group counts. A wrong count beside a population, or the denominator stated alone as
+  the count, still abstains.
+- **The rules path dropped qualifiers but labelled the result `exact`.** It now abstains with
+  `qualifier_not_applied` for:
+  - an ordinal other than `first` outside a ranking ("who is second for X");
+  - `active`/`inactive` when no field declares it;
+  - a numeric comparison bound to no field ("with >= 20 records").
+  
+  A topic cue no longer starts inside a hyphenated word: "X-mention <unit>" is the topic X, and
+  "invoice-mention rate" is no longer "mention rate". A topic made only of grammar words ("contain
+  the most active records") is not a text match.
+- **Sorting a group ranking by count was refused.** A planner scope that sorts a grouped scope by
+  `count` (or by its measure or the measure's field) compiles to the group ranking (`order`). Without
+  `group_by`, or with a contradicting `order`, it is `measure_unsupported`. The planner prompt says so.
+- **The precomputed `verify` spot check re-embedded the wrong text.** `verify.input` now defaults to
+  `engine_template` and re-embeds the engine's own `{title}\n{field}: {text}` input (`chunk_text`
+  keeps the bare text). The manifest's spot-check report records the input. The index identity is
+  unchanged.
 
 ## [2.0.0a2] - 2026-11-04
 

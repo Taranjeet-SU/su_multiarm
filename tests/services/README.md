@@ -36,6 +36,7 @@ a service already listening on the standard port. Set them before `up` and befor
 | Neo4j (Bolt) | `SU_TEST_NEO4J_BOLT_PORT` | 17687 | `SU_TEST_NEO4J_URI`, `SU_TEST_NEO4J_PASSWORD` | `bolt://127.0.0.1:17687`, `su_test_password` (user `neo4j`) |
 | Neo4j (HTTP browser) | `SU_TEST_NEO4J_HTTP_PORT` | 17474 | — (debugging only) | `http://127.0.0.1:17474` |
 | OpenSearch | `SU_TEST_OPENSEARCH_PORT` | 19200 | `SU_TEST_OPENSEARCH_URL` | `http://127.0.0.1:19200` (security plugin disabled) |
+| OpenSearch 3.x (profile `opensearch3`) | `SU_TEST_OPENSEARCH3_PORT` | 19202 | `SU_TEST_OPENSEARCH_URL` (+ optional `SU_TEST_OPENSEARCH_MAJOR=3`) | `http://127.0.0.1:19202` (security plugin disabled) |
 | Elasticsearch | `SU_TEST_ES_PORT` | 19201 | `SU_TEST_ELASTICSEARCH_URL` | `http://127.0.0.1:19201` (xpack security disabled) |
 | MongoDB | `SU_TEST_MONGO_PORT` | 27018 | `SU_TEST_MONGO_URI` | `mongodb://su_test:su_test_password@127.0.0.1:27018/?authSource=admin` |
 
@@ -59,6 +60,30 @@ and defaults to `http://127.0.0.1:19201`.
 The credentials (`su_test` / `su_test_password`) are defined only in `docker-compose.yml` and are not
 secrets. Change them there if you change them anywhere.
 
+## OpenSearch 2.x and 3.x
+
+The default `opensearch` service is 2.19.1. A second service, `opensearch3`
+(`opensearchproject/opensearch:3.9.0`, port 19202), sits behind the compose profile `opensearch3`
+so a plain `up` starts the same stack as before. The OpenSearch tests address one server at a time
+through `SU_TEST_OPENSEARCH_URL`; `SU_TEST_OPENSEARCH_MAJOR` (optional, `2` or `3`) makes
+`test_probe_reports_a_supported_major` assert which major answered, so a run cannot silently hit the
+wrong container.
+
+```bash
+docker compose -p su-multi-arm-tests -f tests/services/docker-compose.yml --profile opensearch3 up -d --wait opensearch3
+python tests/services/wait_ready.py --only opensearch3
+SU_TEST_OPENSEARCH_URL=http://127.0.0.1:19202 SU_TEST_OPENSEARCH_MAJOR=3 \
+  PYTHONDONTWRITEBYTECODE=1 pytest -q -m external -k opensearch -p no:cacheprovider \
+  --basetemp="$HOME/su_mutliarm_tests/<agent>/pytest_tmp" \
+  tests/services/test_opensearch_adapter.py tests/conformance
+docker compose -p su-multi-arm-tests -f tests/services/docker-compose.yml --profile opensearch3 rm -sfv opensearch3
+```
+
+Both images run with `DISABLE_SECURITY_PLUGIN=true` and `DISABLE_INSTALL_DEMO_CONFIG=true`, so
+neither needs `OPENSEARCH_INITIAL_ADMIN_PASSWORD` (required since 2.12 only when the demo security
+configuration is installed). Both bundle their JDK (3.x needs JDK 21). `wait_ready.py` checks
+`opensearch3` only when it is named with `--only`.
+
 ## Running the external tests
 
 ```bash
@@ -78,7 +103,8 @@ Keep pytest temporary paths outside the repository, as `AGENTS.md` requires. In 
 
 ## What the compose file does and does not do
 
-- Pinned image tags: `opensearchproject/opensearch:2.19.1`,
+- Pinned image tags: `opensearchproject/opensearch:2.19.1`, `opensearchproject/opensearch:3.9.0`
+  (profile `opensearch3`; digest recorded in the compose file),
   `docker.elastic.co/elasticsearch/elasticsearch:8.17.4`, `pgvector/pgvector:0.8.0-pg17`,
   `neo4j:5.26.0-community`, `mongo:7.0.16`. Record the resolved digests in `docs/VALIDATION.md`
   when you report results (`docker compose ... images --format json`).

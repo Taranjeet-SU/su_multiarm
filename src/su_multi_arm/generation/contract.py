@@ -48,12 +48,14 @@ from pydantic import Field, create_model
 from ..core.types import ScopeResult, UnsupportedConstraint
 from ..decision.intent import Intents, untargeted_constraint
 from ..models import Answer, Claim, ClaimKind, ContractRule, Coverage, StrictModel, Violation
-from .statements import Statement, detect_statements, stated_number, units_for
+from .statements import Statement, detect_statements, population_frame, stated_number, units_for
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..runtime.trace import Trace
 
 AGGREGATE_CLAIMS: frozenset[str] = frozenset({"count", "exhaustive_list", "absence"})
+# A preposition that introduces a population ("of", "among", "over" ...) right before a stated number.
+_POPULATION_PREPOSITION = re.compile(r"(?<!\btotal )\b(?:of|among|over|across|within|from)\s+(?:(?:a|an|the|all|its|their|this|these)\s+)?$", re.I)
 CLAIM_KINDS: tuple[str, ...] = ("narrative", "count", "exhaustive_list", "absence")
 Rule = ContractRule
 OnViolation = Literal["abstain_with_reason", "strip", "fail"]
@@ -165,6 +167,12 @@ class AnswerContract:
         stated = statement.amount if statement.amount is not None else stated_number(statement.text)
         if stated is None:
             return True
+        number_at = statement.start
+        if statement.amount is not None:  # a total statement ends with its amount ("sum ... out of 5000")
+            runs = list(re.finditer(r"\d[\d,]*(?:\.\d+)?", statement.text))
+            number_at = statement.start + (runs[-1].start() if runs else 0)
+        if population_frame(answer.answer, number_at, statement.end):
+            return True  # "out of 2048 records", "a denominator of 2048": the population, not the count
         values: set[float] = set()
         for claim in answer.claims:
             if claim.kind != "count":
@@ -189,6 +197,8 @@ class AnswerContract:
                     if isinstance(group.value, (int, float)) and not isinstance(group.value, bool):
                         values.add(float(group.value))
                         numbers.append(float(group.value))
+                if result.groups:
+                    values.add(float(sum(g.count for g in result.groups)))  # "these sum to 1400"
                 # Query-compiler results (2.0.0a3): the matched total ("showing 10 of 42"), a share's
                 # numerator, the records listed, null counts and a two-period difference.
                 values.update(float(n) for n in (result.total, result.numerator) if n is not None)
@@ -197,8 +207,12 @@ class AnswerContract:
                     values.add(float(len(result.listed)))
                 if len(numbers) >= 2 and all(g.key.keys() == {"period"} for g in result.groups[:2]):
                     values.add(abs(numbers[1] - numbers[0]))
-                if re.search(r"\bof\s+(?:the\s+|all\s+)?$", answer.answer[: statement.start], re.I):
-                    values.add(float(aggregate.result.denominator))  # "12 of 36 records": the population
+                # The population the aggregate reports, restated after a preposition ("12 of 36
+                # records", "among 2,048 records", "over 2,048 records in the snapshot"; 2.0.0a3
+                # parity fix). A bare "there are 36 records" equal to the denominator stays a
+                # mismatch: it states the population as the count.
+                if _POPULATION_PREPOSITION.search(answer.answer[max(0, statement.start - 48) : statement.start]):
+                    values.add(float(result.denominator))
         return not values or float(stated) in values
 
     def _findings(

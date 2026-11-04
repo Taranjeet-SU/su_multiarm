@@ -199,7 +199,7 @@ def strict_schema_problems(provider: str, model: str, structured_output: str, ro
     strict json_schema, Anthropic ``output_config.format``); empty when the role is not native in
     such a mode or every schema converts. Consults the provider capability registry, never the
     network."""
-    from ..providers.base import StrictSchemaError, output_format_schema, strict_schema
+    from ..providers.base import StrictSchemaError, strict_schema
     from ..providers.capabilities import lookup
 
     if structured_output != "native":
@@ -208,15 +208,35 @@ def strict_schema_problems(provider: str, model: str, structured_output: str, ro
         native_kind = lookup(provider, model).native_kind
     except KeyError:
         return []
-    convert = {"json_schema_strict": strict_schema, "output_format": output_format_schema}.get(native_kind or "")
-    if convert is None:
+    if native_kind == "output_format":
+        return output_format_role_problems(provider, model, role)
+    if native_kind != "json_schema_strict":
         return []
     problems: list[str] = []
     for schema in role_schemas().get(role, []):
         try:
-            convert(schema.model_json_schema(), schema.__name__)
+            strict_schema(schema.model_json_schema(), schema.__name__)
         except StrictSchemaError as exc:
             problems.append(str(exc))
+    return problems
+
+
+def output_format_role_problems(provider: str, model: str, role: str) -> list[str]:
+    """Why the schemas ``role`` sends cannot go out as Anthropic ``output_config.format`` for
+    ``(provider, model)``: free-form mappings or complexity over ``OUTPUT_FORMAT_LIMITS`` (the API
+    answers HTTP 400 "compiled grammar is too large"). Empty when the pair does not use
+    ``output_format`` or every schema fits. Registry and schemas only; never the network."""
+    from ..providers.base import output_format_problems
+    from ..providers.capabilities import lookup
+
+    try:
+        if lookup(provider, model).native_kind != "output_format":
+            return []
+    except KeyError:
+        return []
+    problems: list[str] = []
+    for schema in role_schemas().get(role, []):
+        problems.extend(output_format_problems(schema.model_json_schema(), schema.__name__))
     return problems
 
 
@@ -231,6 +251,8 @@ def _strict_schema_diagnostics(config: Config) -> list[Diagnostic]:
                     problem,
                 )
             )
+        if spec.structured_output_note:
+            out.append(_warning(f"models.roles.{role}.capabilities.structured_output", "structured_output_fallback", spec.structured_output_note))
     return out
 
 
@@ -343,6 +365,8 @@ def probe_report(engine: Any) -> dict[str, Any]:
             entry["error"] = str(exc)
         strict = strict_schema_problems(spec.provider, spec.model, spec.capabilities.structured_output, role)
         entry["strict_schemas"] = strict or "ok"
+        if spec.structured_output_note:
+            entry["structured_output_fallback"] = spec.structured_output_note
         if strict:
             entry["error"] = "; ".join(strict)
         models[role] = entry

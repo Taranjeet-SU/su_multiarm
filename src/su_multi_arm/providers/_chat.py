@@ -31,14 +31,28 @@ from .base import (
     MeteredCall,
     ProviderError,
     ProviderLimitIgnored,
+    ProviderSchemaTooComplex,
     RoleSpec,
+    StrictSchemaError,
     T,
     Usage,
     timeout_for,
     user_content,
+    output_format_limit_problems,
+    output_format_schema,
     validate_reply,
 )
 from .capabilities import ModelCapabilities, check_role, lookup
+
+
+def _complexity_problems(schema: type[BaseModel]) -> list[str]:
+    """``output_format`` complexity problems of ``schema`` (free-form mappings are left to
+    ``_request``, which refuses them with ``StrictSchemaError`` before any call)."""
+    try:
+        wire = output_format_schema(schema.model_json_schema(), schema.__name__)
+    except StrictSchemaError:
+        return []
+    return output_format_limit_problems(wire, schema.__name__)
 
 
 class MissingSecret(ProviderError, ValueError):
@@ -82,16 +96,21 @@ class HttpChatProvider:
         if problems:
             raise CapabilityMismatch("; ".join(f"{key}: {message}" for key, message in problems))
         self.http = HttpCall(transport)
+        self._prompt_fallback: dict[str, dict[str, str]] = {}  # schema name -> {from, reason} of a recorded switch to prompt mode
 
     # --- public API ----------------------------------------------------------------------------
 
     def capabilities(self) -> ModelCapabilities:
         return self.caps
 
-    def structured_mode(self) -> str:
-        """Wire mode for schema calls: ``native:<kind>``, ``json_schema``, ``json_mode`` or ``prompt``."""
+    def structured_mode(self, schema: type[BaseModel] | None = None) -> str:
+        """Wire mode for schema calls: ``native:<kind>``, ``json_schema``, ``json_mode`` or ``prompt``.
+        ``prompt`` for a schema this provider already switched away from native (see
+        ``_schema_exchange``)."""
         declared = self.role.structured_output
         if declared == "native":
+            if schema is not None and schema.__name__ in self._prompt_fallback:
+                return "prompt"
             return f"native:{self.caps.native_kind}"
         return "prompt" if declared == "none" else declared
 
@@ -100,7 +119,51 @@ class HttpChatProvider:
         return validate_reply(schema, raw, ctx.stage), usage
 
     def complete_json_raw(self, system: str, payload: Any, schema: type[BaseModel], budget: CallMeter, ctx: CallContext) -> tuple[str, Usage]:
-        return self._exchange(system, user_content(payload), schema, self.structured_mode(), budget, ctx)
+        return self._schema_exchange(system, user_content(payload), schema, budget, ctx)
+
+    def _schema_exchange(
+        self,
+        system: str,
+        user: str,
+        schema: type[BaseModel],
+        budget: CallMeter,
+        ctx: CallContext,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> tuple[str, Usage]:
+        """One schema call, with the structured-output fallback of the 2.0.0a3 parity fix.
+
+        * Pre-flight (no network): a native ``output_format`` schema over the provider's complexity
+          ceilings (``output_format_problems``) is sent in prompt mode when the role's ``native`` is
+          only the registry default, recorded as ``structured_output_fallback`` (reason
+          ``schema_too_complex_preflight``); a declared ``native`` is a ``CapabilityMismatch``
+          before any call.
+        * At run time: a native call refused as ``ProviderSchemaTooComplex`` (HTTP 400, nothing
+          generated) is sent **once** more in prompt mode, again only for a registry-default
+          ``native``: an explicit, recorded mode switch (reason ``schema_too_complex``), never a
+          retry of the same request. A declared ``native`` fails with the typed error.
+
+        The record is in the call record and the ``model_call`` trace event; later calls of this
+        provider with the same schema go straight to prompt mode and carry it too."""
+        mode = self.structured_mode(schema)
+        if mode == "prompt" and self.role.structured_output == "native":
+            return self._exchange(system, user, schema, mode, budget, ctx, on_delta=on_delta, extra=self._fallback_record(schema))
+        if mode == "native:output_format":
+            problems = _complexity_problems(schema)
+            if problems and not self.role.structured_output_defaulted:
+                raise CapabilityMismatch("; ".join(problems), stage=ctx.stage)
+            if problems:
+                self._prompt_fallback[schema.__name__] = {"from": mode, "reason": "schema_too_complex_preflight"}
+                return self._exchange(system, user, schema, "prompt", budget, ctx, on_delta=on_delta, extra=self._fallback_record(schema))
+        try:
+            return self._exchange(system, user, schema, mode, budget, ctx, on_delta=on_delta)
+        except ProviderSchemaTooComplex:
+            if not (mode.startswith("native:") and self.role.structured_output_defaulted):
+                raise
+        self._prompt_fallback[schema.__name__] = {"from": mode, "reason": ProviderSchemaTooComplex.category}
+        return self._exchange(system, user, schema, "prompt", budget, ctx, on_delta=on_delta, extra=self._fallback_record(schema))
+
+    def _fallback_record(self, schema: type[BaseModel]) -> dict[str, Any]:
+        return {"structured_output_fallback": {**self._prompt_fallback[schema.__name__], "to": "prompt", "schema": schema.__name__}}
 
     def complete_text(self, system: str, payload: Any, budget: CallMeter, ctx: CallContext) -> tuple[str, Usage]:
         return self._exchange(system, user_content(payload), None, "text", budget, ctx)
@@ -108,7 +171,7 @@ class HttpChatProvider:
     def complete_json_stream(
         self, system: str, payload: Any, schema: type[T], budget: CallMeter, ctx: CallContext, on_delta: Callable[[str], None]
     ) -> tuple[T, Usage]:
-        raw, usage = self._exchange(system, user_content(payload), schema, self.structured_mode(), budget, ctx, on_delta=self._require_streaming(on_delta, ctx))
+        raw, usage = self._schema_exchange(system, user_content(payload), schema, budget, ctx, on_delta=self._require_streaming(on_delta, ctx))
         return validate_reply(schema, raw, ctx.stage), usage
 
     def complete_text_stream(self, system: str, payload: Any, budget: CallMeter, ctx: CallContext, on_delta: Callable[[str], None]) -> tuple[str, Usage]:
@@ -132,6 +195,7 @@ class HttpChatProvider:
         budget: CallMeter,
         ctx: CallContext,
         on_delta: Callable[[str], None] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> tuple[str, Usage]:
         path, headers, body = self._request(system, user, schema, mode)  # CapabilityMismatch before any call
         if on_delta is not None:
@@ -141,6 +205,7 @@ class HttpChatProvider:
         url = (self.role.base_url or self.default_base_url).rstrip("/") + path
         estimate = CallEstimate.of(len(system) + len(user) + len(str(body.get("tools") or body.get("response_format") or body.get("output_config") or "")), self.role.max_tokens)
         with MeteredCall(self, budget, ctx, mode, estimate) as call:
+            call.extra.update(extra or {})
             if on_delta is None:
                 data = self.http.post(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage)
             else:

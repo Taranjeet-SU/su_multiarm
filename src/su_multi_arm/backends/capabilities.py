@@ -158,7 +158,7 @@ MATRIX: dict[str, AdapterCapabilities] = {
                 "records": _c("contracts", exactness="exact", date_buckets=False, top_n=True, max_matched=10000),
             },
             notes=(
-                "backends/opensearch/ on the frozen contracts (OpenSearch 2.x, opensearch-py). Generation-named indices "
+                "backends/opensearch/ on the frozen contracts (OpenSearch 2.x and 3.x, opensearch-py; same index layout on both, 3.x BM25 scores are the 2.x scores / 2.2, rankings unchanged). Generation-named indices "
                 "+ dataset aliases; BM25 over the standard analyzer; exact cosine by default, HNSW (lucene engine) opt-in "
                 "with exact rescore; records exact through native filter pushdown and a bounded scan (max_matched). "
                 "graph/cache/ledger/session are not served (plan §3.5 table)."

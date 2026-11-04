@@ -90,4 +90,6 @@ class RunBudgetMeter:
             prompt_caching=item.get("prompt_caching"),
             reasoning_effort=item.get("reasoning_effort"),
             max_tokens=item.get("max_tokens"),
+            # A recorded native -> prompt mode switch after ``ProviderSchemaTooComplex`` (else None).
+            structured_output_fallback=item.get("structured_output_fallback"),
         )

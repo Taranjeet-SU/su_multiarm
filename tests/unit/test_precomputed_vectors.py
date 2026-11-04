@@ -221,13 +221,58 @@ def test_permuted_keys_file_passes_the_file_audit_but_fails_the_spot_check(tmp_p
     (tmp_path / "keys.jsonl").write_text("".join(json.dumps(k) + "\n" for k in permuted))
     unchecked, _, _ = build(tmp_path / "u", spec(tmp_path))
     assert unchecked.ingest(docs)["precomputed_vectors"]["matched"] == len(chunks)  # undetectable without verify
-    checked, _, _ = build(tmp_path / "c", spec(tmp_path, verify={"sample": 5, "min_cosine": 0.99}))
+    verify = {"sample": 5, "min_cosine": 0.99, "input": "chunk_text"}  # these rows embed the bare chunk text
+    checked, _, _ = build(tmp_path / "c", spec(tmp_path, verify=verify))
     with pytest.raises(IngestError, match="spot check"):
         checked.ingest(docs)
     (tmp_path / "keys.jsonl").write_text("".join(json.dumps(k) + "\n" for k in keys))  # correct pairing
-    good, _, _ = build(tmp_path / "g", spec(tmp_path, verify={"sample": 5, "min_cosine": 0.99}))
+    good, _, _ = build(tmp_path / "g", spec(tmp_path, verify=verify))
     report = good.ingest(docs)["precomputed_vectors"]["verify"]
-    assert report["checked"] == 5 and report["below"] == 0 and report["min"] >= 0.99
+    assert report["checked"] == 5 and report["below"] == 0 and report["min"] >= 0.99 and report["input"] == "chunk_text"
+
+
+def titled_corpus(n: int = 8) -> list[Document]:
+    return [
+        Document(id=f"t{i}", dataset="demo", title=f"Synthetic guide {i}", fields={"body": f"Widget calibration note {i}: reset the dial to step {i}."}, metadata={"source": "kb"})
+        for i in range(n)
+    ]
+
+
+def test_spot_check_re_embeds_the_composed_input_the_producer_used(tmp_path):
+    """2.0.0a3 parity fix: rows produced from the engine's own input recipe (title + field + text)
+    pass the default spot check (``verify.input: engine_template``), which re-embeds that composed
+    input; re-embedding the bare chunk text instead fails them, and rows of the bare text fail the
+    default. The re-embedded input is recorded in the manifest."""
+    docs = titled_corpus()
+    titles = {d.id: d.title for d in docs}
+    chunks = [c for d in docs for c in chunk_document(d, 400, 20, [])]
+    cfg = validate_config(base())
+    embedder = Embedder(cfg.models.roles.embedder)
+    composed = embedder.encode([WritePath.embedding_input(titles[c.document_id], c) for c in chunks])
+    keys = [{"document_id": c.document_id, "field": c.field, "text_sha256": text_sha256(c.text)} for c in chunks]
+    np.save(tmp_path / "vec.npy", composed)
+    (tmp_path / "keys.jsonl").write_text("".join(json.dumps(k) + "\n" for k in keys))
+    good, _, counting = build(tmp_path / "g", spec(tmp_path, verify={"sample": 6, "min_cosine": 0.99}))
+    report = good.ingest(docs)["precomputed_vectors"]["verify"]
+    assert report["input"] == "engine_template" and report["checked"] == 6 and report["below"] == 0
+    assert counting.texts and all(t.startswith("Synthetic guide ") and ("\nbody: " in t or "\ntitle: " in t) for t in counting.texts)  # composed, as the engine embeds
+    bare, _, _ = build(tmp_path / "b", spec(tmp_path, verify={"sample": 6, "min_cosine": 0.99, "input": "chunk_text"}))
+    with pytest.raises(IngestError, match="re-embedded input chunk_text"):
+        bare.ingest(docs)
+    np.save(tmp_path / "vec.npy", embedder.encode([c.text for c in chunks]))  # rows of the bare text
+    wrong, _, _ = build(tmp_path / "w", spec(tmp_path, verify={"sample": 6, "min_cosine": 0.99}))
+    with pytest.raises(IngestError, match="re-embedded input engine_template"):
+        wrong.ingest(docs)
+
+
+def test_verify_input_is_not_part_of_the_index_identity(tmp_path):
+    docs = titled_corpus(2)
+    write_vectors(tmp_path, docs)
+    first, _, _ = build(tmp_path / "a", spec(tmp_path, verify={"sample": 1}))
+    other, _, _ = build(tmp_path / "a", spec(tmp_path, verify={"sample": 1, "input": "chunk_text"}))
+    assert first.index_fingerprint() == other.index_fingerprint() and first.embedding_recipe() == other.embedding_recipe()
+    with pytest.raises(Exception, match="input"):
+        validate_config(base(spec(tmp_path, verify={"input": "title_only"})))
 
 
 def cand(record_id, arm, score, source, pinned=False):

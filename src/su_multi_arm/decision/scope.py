@@ -105,8 +105,22 @@ class ScopeCompiler:
                 unsupported.append(self._flag(f"group by {field}", "measure_unsupported", "a datetime/date group needs a calendar granularity (day/month/year)"))
         if granularity is not None and not any(self._temporal(f) for f in draft.group_by):
             unsupported.append(self._flag(f"by {granularity}", "measure_unsupported", "a calendar granularity needs a datetime/date group_by field"))
-        if draft.sort is not None and draft.sort.field not in self.schema.sortable():
-            unsupported.append(self._flag(f"sort by {draft.sort.field}", "field_not_filterable", f"declare {draft.sort.field!r} as sortable"))
+        sort, order = draft.sort, getattr(draft, "order", None)
+        grouped_by_measure = sort is not None and bool(draft.group_by) and sort.field not in draft.group_by and self._sorts_by_measure(sort, draft.measure)
+        if sort is not None and (grouped_by_measure or (sort.field not in self.schema.sortable() and self._sorts_by_measure(sort, draft.measure))):
+            # "sort by count" (or by the aggregate's measure) on a group_count / top_n: the group
+            # ranking (``order``), the same operation the grammar's "most common <field>" compiles to.
+            wanted = "desc" if sort.descending else "asc"
+            if not draft.group_by:
+                unsupported.append(
+                    self._flag(f"sort by {sort.field}", "measure_unsupported", "sorting by a count or measure ranks groups: it needs group_by (records have no count)")
+                )
+            elif order is not None and order != wanted:
+                unsupported.append(self._flag(f"sort by {sort.field}", "measure_unsupported", f"sort direction {wanted} contradicts order {order}"))
+            else:
+                sort, order = None, wanted
+        elif sort is not None and sort.field not in self.schema.sortable():
+            unsupported.append(self._flag(f"sort by {sort.field}", "field_not_filterable", f"declare {sort.field!r} as sortable"))
         time_basis = draft.time_basis
         if time_basis is not None:
             spec = self.schema.field(time_basis)
@@ -168,11 +182,11 @@ class ScopeCompiler:
                 predicates=predicates,
                 group_by=list(draft.group_by),
                 top_n=draft.top_n,
-                sort=draft.sort,
+                sort=sort,
                 measure=measure,
                 time_basis=time_basis,
                 population=draft.population,  # type: ignore[arg-type]
-                order=getattr(draft, "order", None),
+                order=order,
                 nth=getattr(draft, "nth", None),
                 granularity=granularity,
                 periods=periods,
@@ -185,6 +199,20 @@ class ScopeCompiler:
             problem = "; ".join(e["msg"] for e in error.errors())
             return CompiledScope(spec=None, unsupported=[self._flag("scope", "measure_unsupported", f"incoherent scope: {problem}")], zero_match_fields=resolved_filters.zero_match_fields)
         return CompiledScope(spec=spec, zero_match_fields=resolved_filters.zero_match_fields)
+
+    def _sorts_by_measure(self, sort: Sort, measure: Measure | None) -> bool:
+        """``sort.field`` names the group's count or the aggregate measure rather than a declared
+        field: ``count`` (count and count_distinct measures, or none), the measure kind
+        (``sum``, ``avg`` ...), the measure's numeric field, ``measure`` or ``value``. A declared
+        sortable field of that name wins (the caller checks ``sortable()`` first)."""
+        name = sort.field.casefold()
+        kind = measure.kind if measure is not None else "count"
+        names = {"measure", "value", kind}
+        if kind in {"count", "count_distinct"}:
+            names |= {"count", "record_count", "group_count", "records"}
+        if measure is not None and measure.field and kind in NUMERIC_MEASURES:
+            names.add(measure.field.casefold())
+        return name in names
 
     def _temporal(self, field: str) -> bool:
         spec = self.schema.field(field)

@@ -88,6 +88,24 @@ drops `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`/`multipleOf`/`ma
 the full schema; a free-form mapping is refused with `StrictSchemaError` before any call), forced tool
 use elsewhere (`$defs`/`$ref` are sent as they are; the real API accepts them).
 
+**Oversized schemas and `output_config.format`.** The API refuses a schema whose compiled grammar is
+too large (HTTP 400 "compiled grammar is too large"; the planner's plan schema is one). A deterministic
+pre-flight counts the wire schema against the documented ceilings (`providers.base.OUTPUT_FORMAT_LIMITS`:
+24 optional properties, 16 union-typed properties, each `$defs` entry once):
+
+- a role whose `native` is only the **registry default** resolves to `none` (prompt mode) at config
+  time for a schema over a ceiling. `validate` and `doctor` report it as a
+  `structured_output_fallback` warning. A config dump writes the resolved `none`.
+- a **declared** `structured_output: native` for such a schema is a validation error
+  (`schema_not_strict`). Declare `none` for that role instead; `examples/v2/hosted_models.yaml`
+  does this for its Sonnet 5.x planner.
+- at run time the 400 is the typed `ProviderSchemaTooComplex` (`schema_too_complex`). A
+  registry-default role sends that call once more in prompt mode. This is one explicit switch, not a
+  retry: it appears as `structured_output_fallback` (`from`, `to`, `reason`, `schema`) in the call
+  record and in the `model_call` trace event, and both calls are budgeted. Later calls with the same
+  schema go straight to prompt mode and carry the same record. A declared `native` fails with the
+  typed error.
+
 **Models that think by default.** Anthropic Haiku 5.x thinks before it answers; the thinking tokens
 count against `max_tokens` and are reported as `Usage.reasoning_tokens`
 (`usage.output_tokens_details.thinking_tokens`). The registry declares a minimum `max_tokens` of
@@ -230,7 +248,7 @@ names its own backend. In this release the engine wires these kinds on the froze
 | `postgres` (extra `postgres`, psycopg 3; pgvector for vectors) | `catalog`, `lexical`, `vector`, `records`, `cache`, `ledger`, `session` | `dsn_env` (environment variable holding the DSN; never the DSN itself), `table_prefix`, `text_search_config` (default `english`), `vector` (`index: exact\|hnsw`, `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `min_filter_recall`, default 0.95), `timeout_seconds` (connect timeout and `statement_timeout`). **One schema per generation**, `<prefix>_<dataset>_<generation>` when that fits PostgreSQL's 63-byte identifier limit and the dataset is a lowercase identifier, otherwise `<prefix>_g<sha256(dataset/generation)[:20]>`; it holds documents, chunks, typed field rows (native `double precision` and `timestamptz` columns), records, the FTS table and the pgvector tables, and `delete_generation` is one `DROP SCHEMA ... CASCADE`. Schema `<prefix>` holds `generations` (dataset, generation, schema name, text-search configuration, metadata schema), `meta` (the `CURRENT` pointer row, replaced by a single-row upsert only by `activate`; failed builds write `failure:<gen>` and never touch it; manifests), `cache`, `ledger`, `jobs`, `raw_replies`, `sessions`. The write lock is a session-level `pg_try_advisory_lock` (held = typed error, never a wait). Typed scope, ACL predicates and id allow/deny lists compile to bound-parameter `EXISTS` subqueries; temporal values compare as UTC instants (naive = UTC, dates by calendar day); `values` is `SELECT DISTINCT` under `max_values_cardinality` (10000; more is a typed error). Lexical: title and body `tsvector`s built with the generation's recorded configuration (`analyzer_id` `pg_ts_<config>`); terms = any term, `phrase` = `phraseto_tsquery` per column, `boolean` = terms plus `must` phrases minus `must_not` phrases; every user token is a bound parameter, never tsquery syntax; scores are `2*ts_rank_cd(title)+ts_rank_cd(body)`, **not BM25**; stop words never match and stemming conflates inflections (FTS5 differs). Vector: L2-normalised, inner product = cosine; **exact** by default (scope in the `WHERE` clause, order `(distance, chunk_id)`); `vector.index: hnsw` builds a partial HNSW index per namespace at `refresh` and then measures recall@10 of the forced index path against exact search (unfiltered and with an allow-list filter); below `min_filter_recall` the refresh fails with a typed error so that build never activates; HNSW searches use `hnsw.iterative_scan = strict_order` (pgvector >= 0.8). Up to 2000 dimensions with HNSW, 16000 exact. `graph` is `planned`. |
 | `sqlalchemy` (extra `sql`, SQLAlchemy 2 + driver) | `catalog`, `records`, `cache`, `ledger`, `session` | `url_env` (environment variable holding the SQLAlchemy URL, e.g. `sqlite:///state/rel.db` or `postgresql+psycopg://...`), `table_prefix`, `timeout_seconds`. SQLAlchemy Core only (portable types, delete+insert instead of dialect upserts). Per generation: tables `<prefix>_<token>_{docs,chunks,dfields,records,rfields}` with `token = sha256(dataset/generation)[:12]` (the readable name does not fit the 63/64-byte identifier limits; `<prefix>_generations` maps it); runtime tables `<prefix>_{generations,meta,cache,ledger,jobs,raw_replies,sessions}`; `CURRENT` pointer row replaced in one transaction only by `activate`; write lock = lease row (held = typed error; a lease older than 600 s is taken over). Temporal values are stored as UTC epoch seconds (no portable timezone-aware type). Ids are limited to 512 characters (typed error beyond). **Tested dialects: SQLite and PostgreSQL** (the conformance kit runs on both); any other dialect builds and `ping()` reports `dialect_tested: false` — MySQL/MariaDB in particular compare text with the column collation (usually case-insensitive), which would change `eq`. `lexical` and `vector` are dialect-specific and `planned`; configuration naming them is rejected. |
 | `mongodb` (extra `mongodb`, pymongo) | `catalog`, `lexical`, `records`, `cache`, `ledger`, `session` | `uri_env` (environment variable holding the connection URI; never the URI itself), `database`, `collection_prefix`, `timeout_seconds` (server selection, connect and socket timeouts). Per generation: `<prefix>_<dataset>_<generation>_{documents,chunks,lexical,records}` collections; `<prefix>_generations` lists known generations with their metadata schema; `<prefix>_{cache,ledger,jobs,raw_replies,sessions}` are prefix-wide; `<prefix>_meta` holds the generation pointer (`_id: CURRENT`, replaced atomically only by `activate`; failed builds write `failure:<gen>` and never touch it), manifests and the write lease. Typed scope, ACL predicates and id allow/deny lists are pushed down as query predicates over typed field rows (temporal values stored as UTC instants under the shared rule: aware stamps converted, naive `assume_utc` stamps and dates read as UTC, `date` fields compared by UTC calendar day); `exists` is one `find_one`; `values` groups distinct values server-side under `max_values_cardinality` (default 10000, exceeding it is a typed error, never a truncated list). Lexical search uses the server's `english` text index (`analyzer_id: mongo_text_english`): phrase and `must`/`must_not` are supported, scores are MongoDB `textScore` values and **not BM25**, so no score parity with other engines is claimed. The cache has a server-side TTL index on top of the clock-based expiry; sessions get a TTL index only when the backend is built with `session_ttl_seconds` (Python API). No `graph`; `vector` stays `planned` because MongoDB vector search exists only on Atlas and is not verified here, so a config naming `(mongodb, vector)` is rejected. |
-| `opensearch` | `catalog`, `lexical`, `vector`, `records` | `hosts_env` (environment variable holding one or more comma-separated `http(s)://host:port` URLs), `index_prefix`, `knn: {method: exact|hnsw, exact_rescore: true}`, `timeout_seconds`. Needs `pip install 'su-multi-arm[opensearch]'` (`opensearch-py`); OpenSearch 2.x. Per generation three indices `<index_prefix>_<dataset>_<generation>_{docs,chunks,records}` (one shard, strict mappings tagged with the adapter's mapping version); dataset aliases `<index_prefix>_<dataset>_{docs,chunks,records}` are switched atomically by `OpenSearchBackend.activate(gen)`, and `delete_generation` refuses the generation an alias serves. Datasets must match `[a-z0-9][a-z0-9_-]*` (index names are never mangled). See "OpenSearch semantics" below. |
+| `opensearch` | `catalog`, `lexical`, `vector`, `records` | `hosts_env` (environment variable holding one or more comma-separated `http(s)://host:port` URLs), `index_prefix`, `knn: {method: exact|hnsw, exact_rescore: true}`, `timeout_seconds`. Needs `pip install 'su-multi-arm[opensearch]'` (`opensearch-py`); OpenSearch 2.x or 3.x (`probe` refuses other majors and other distributions; tested on 2.19.1 and 3.9.0). Per generation three indices `<index_prefix>_<dataset>_<generation>_{docs,chunks,records}` (one shard, strict mappings tagged with the adapter's mapping version); dataset aliases `<index_prefix>_<dataset>_{docs,chunks,records}` are switched atomically by `OpenSearchBackend.activate(gen)`, and `delete_generation` refuses the generation an alias serves. Datasets must match `[a-z0-9][a-z0-9_-]*` (index names are never mangled). See "OpenSearch semantics" below. |
 | `elasticsearch` | `catalog`, `lexical`, `vector`, `records` | Same options as `opensearch` (`hosts_env`, `index_prefix`, `knn`, `timeout_seconds`); needs `pip install 'su-multi-arm[elasticsearch]'` (official `elasticsearch` 8.x client) and an Elasticsearch 8.x server (other majors and OpenSearch are refused by `probe`). The adapter is the OpenSearch adapter's classes over `backends/_lucene_common.py` with the engine-specific parts replaced: transport, probe, `dense_vector` fields (exact: `index: false` + `script_score` cosine; `knn.method: hnsw`: float HNSW without quantisation, candidates from the top-level `knn` search with the scope as pre-filter, then the same exact rescore), and no `index.knn` setting. Same three indices per generation, same dataset aliases switched atomically by `activate(gen)`, same typed-field pushdown, lexical and records semantics as the section below. `generation_registry()` (what the write path needs to own `storage.catalog`) keeps manifests, failure records and the ingestion lock in `<index_prefix>__registry` and resolves `CURRENT` through the `docs` alias. |
 | `neo4j` (extra `neo4j`, official driver) | `graph` (with `memberships`) | `uri`, `user`, `password_env` (environment variable holding the password; never the password itself), `database`, `namespace` (default `su_multi_arm`; letters, digits, `_`, `.`, `-`), `timeout_seconds` (connection, pool acquisition and per-transaction timeout). Fixed labels; every node and edge carries the generation key `g = <namespace>\|<dataset>\|<generation>`, so namespaces and generations never touch each other. Mentions are `SuGraphMention` nodes (span offsets, quote, match level, canonical id, aliases), entities `SuGraphEntity` nodes, relations one relationship type per edge kind (`SU_FACT`, `SU_CO_OCCURRENCE`, ...) carrying predicate, `edge_kind`, `support`, status, span, provenance and every occurrence; communities are `SuGraphCommunity` nodes with their report, memberships `SuGraphMembership` nodes. Loads are `MERGE`-idempotent and one explicit transaction per call (a dangling relation endpoint or any server error rolls the whole call back; never retried). Traversal runs only fixed parameterised Cypher templates, one statement per hop, `fact` edges unless other kinds are requested, the hop bound a validated integer 0..3. Eligibility is pushed down as a document-id allow/deny list only (`predicate_scope: false`): the graph and community arms first resolve request filters and ACL predicates to document ids through the catalog (at most 10000 eligible documents; more is a typed error, never a truncated list). `<namespace>\|<dataset>` has one `SuGraphPointer` node naming the active generation; the write path moves it just before the authoritative `CURRENT` switch, moves it back if that switch fails, and a failed load never reaches it; `delete_generation` refuses the generation it names. Needs Neo4j 5.23 or later (scoped `CALL` subqueries); tested on 5.26 community. No catalog: `storage.catalog` must name another backend. |
 | `kuzu` (extra `kuzu`, embedded) | `graph` (with `memberships`) | `path` (database file, relative to the config; default `state/graph.kuzu`), `mode: native\|attach`, `namespace`, `timeout_seconds` (per-query timeout), `buffer_pool_mb`. **`native`**: the package's own embedded store with the same contract and semantics as `neo4j` (fixed tables `SuGraphEntity`/`SuGraphMention`/`SuGraphMembership`/`SuGraphCommunity`/`SuGraphGeneration`/`SuGraphPointer`, one relationship table per edge kind, every row keyed by `g = <namespace>\|<dataset>\|<generation>`; `MERGE`-idempotent loads in one explicit transaction; fixed parameterised Cypher only; `fact` edges unless other kinds are requested; document-id allow/deny eligibility, `predicate_scope: false`; a per-dataset pointer row moved by the write path with compare-and-set). The conformance kit runs in-process (no service). **`attach`** (`attach: {mapping: <file>}`): an **existing** Kuzu database opened read-only and mapped onto the contract by a declared mapping file (`backends/kuzu/attach.py::AttachMapping`): `dataset`, `generations` (or `any_generation: true`), `nodes` (`table`, `type`, `key`, `name`, `lookup`, `document: {column, pattern, template}`, `mention_text`), `edges` (`table`, `predicate`, `edge_kind`, `support`, `quote`, `source`, `document_pattern`/`document_template`, `verified`, `status`, `provenance` columns), optional `communities` (`table`, `label`, `level`, `summary`, `quote`, `quote_source`, `member_edge`) and `require_verified` (default true). Every table and column is checked against the store's catalog when the backend opens; only statements built from the validated mapping run; an edge without a quote, without a document id, or (with `require_verified`) without a verified quote is never surfaced; the edge span anchors the stored quote (`field: <REL>.<quote column>`), not package catalog offsets. Writes (`upsert`, `put_communities`, `delete_generation`) are refused. Keep private mappings outside the repository. |
@@ -258,7 +276,11 @@ backend; no request loads the corpus.
   Lucene*. `kind: boolean` adds `must`/`must_not` phrase clauses. User text is never parsed as query
   syntax (no `query_string`); it is bounded to 128 whitespace-separated words. Hits carry Lucene
   highlight fragments. Ordering is `_score` then `chunk_id`, so results are deterministic; scores and
-  ranks are not comparable with other engines (plan §3.5).
+  ranks are not comparable with other engines (plan §3.5). OpenSearch 3.x scores with Lucene
+  `BM25Similarity` where 2.x used `LegacyBM25Similarity`: the same index gives 3.x scores equal to
+  the 2.x scores divided by `k1 + 1 = 2.2`, with identical rankings (measured on a synthetic corpus,
+  docs/VALIDATION.md). Every fusion and ordering policy (`rrf`, `minmax`, `zscore`, rank-based) is
+  invariant to that factor; raw lexical scores shown in `arm_hits` are not comparable across majors.
 - **Vector**: vectors are L2-normalised on write and stored in `knn_vector` fields (one per
   namespace, dimension fixed by the first write, up to 16000). `knn.method: exact` (default,
   plan decision 5) scores every eligible chunk with an exact cosine `script_score`, so results are
@@ -267,7 +289,10 @@ backend; no request loads the corpus.
   the native `knn` query with the eligibility filter applied inside the graph search, then rescores
   those candidates exactly; `exact_rescore: false` is refused (ANN scores are never returned). The
   method is recorded in the chunks index mapping; opening a generation built with the other method
-  is a typed error.
+  is a typed error. The HNSW engine is always `lucene`, which both majors accept for new indices
+  (OpenSearch 3.0 blocks index creation with `nmslib`); `probe` (`doctor --probe`) refuses an engine
+  the detected major cannot create. The exact path and the index layout are the same on 2.x and 3.x,
+  so the server major is reported by `probe` and not recorded in the generation identity.
 - **Eligibility pushdown**: `Scope` (allow-list, exclusions, typed predicates incl. range/date and
   `missing`) compiles to a native `bool.filter` on typed fields denormalised onto every chunk
   (`s.*` keyword with a `lowercase`-normalized `.fold` sub-field for `casefold_match`, `n.*` double,
@@ -284,6 +309,11 @@ backend; no request loads the corpus.
   constructor argument) is a typed `BackendError`, never a truncated result; approximate
   `cardinality` aggregations are not used. `values()` is a key-ordered `terms` aggregation capped at
   10000 (`limit` above the cap is an error); `exists()` is a `_count`.
+- **Result window**: lexical pages stay within `index.max_result_window` (10000, `from + size`). A
+  page that ends at the window edge decides whether more hits exist from an exact `_count`; a page
+  beyond the window is a typed `BackendError`, never a shortened ranking. A structured text
+  condition matching more than 10000 chunks on these engines is therefore refused ("narrow the query
+  or scope") rather than counted.
 - **Consistency**: catalog `get`/`get_chunks` are real-time; `iter_scope` and the counts refresh the
   generation's indices first; records are written with `refresh=true`; lexical/vector writes become
   visible on `refresh(gen)` (the write path calls it). No retries: an unreachable server, a refused
@@ -750,10 +780,25 @@ enum/observed values): `by|per|for each <field>`, `by month`, `which <field> has
 most common <field>`, `top N <fields>`, `average|min|max|total <numeric field>` (`median` is refused),
 `distinct <field>`, `what percentage of X are Y`, `X vs Y` periods, `between X and Y`, `N most recent
 <unit>`, `top N <unit> by <field>`, `not|excluding <value>`, `A or B`, `<numeric field> above N`,
-`mentioning|containing|about <words>` and quoted phrases. Anything left over is still an
-`UnsupportedConstraint`. The `llm` planner's scope draft carries the same operations plus calendar
-`windows`/`periods` as expressions (resolved by `ValueResolver.window`); the plan schema stays
-strict-expressible.
+`mentioning|containing|about <words>`, `<word>-mention <unit>` and quoted phrases. Anything left over
+is still an `UnsupportedConstraint`. Some qualifier words are grammar vocabulary, so the residual check
+does not catch them. When no operation consumes one of them, it is `qualifier_not_applied` and the agent
+abstains (2.0.0a3 parity fix; before, the count came back labelled `exact`):
+
+- an ordinal other than `first` outside a ranking ("who is second for X");
+- `active`/`inactive` when no field declares it as a state or value;
+- a numeric comparison bound to no field ("with >= 20 records", "at least 3").
+
+A topic cue never starts inside a hyphenated word, and a topic made only of grammar words
+("contain the most active records") is not a text match.
+
+The `llm` planner's scope draft carries the same operations plus calendar `windows`/`periods` as
+expressions (resolved by `ValueResolver.window`); the plan schema stays strict-expressible. A draft
+that sorts a grouped scope by `count` or by its measure is compiled to the group ranking
+(`order: desc|asc` from `sort.descending`; 2.0.0a3 parity fix). The names accepted are `count`,
+`record_count`, `group_count`, `records`, `measure`, `value`, the measure kind, or a numeric measure's
+field, unless a sortable field of that name exists. Without `group_by` (records have no count), or with
+an `order` that contradicts the direction, the draft is `measure_unsupported`.
 
 Qualifier coverage (every agent, 2.0.0a2): a structured step an agent compiled from the question must
 account for every qualifier in it. Candidates are found deterministically (English): an observed value
@@ -827,8 +872,14 @@ unit by a function word ("2 decimal places for invoices"), and number-and-unit p
 from a supplied passage are not statements. Every statement needs a typed claim of the same kind (an
 absence statement may use a `count` claim) backed by an exact scope; otherwise the violation is
 `answer_text_without_exact_scope`. A backed count statement must also state the value of the exact
-aggregate its count claim cites (a scalar value, a group count, or the population after "of" as in
-"12 of 36 records"); a different number is `answer_number_mismatch`. Precision exclusions: a number
+aggregate its count claim cites: a scalar value, a group count or value, the sum of the group counts,
+the matched total, or the denominator when a preposition introduces it ("12 of 36 records", "among
+2,048 records", "over 2,048 records in the snapshot"). A different number is `answer_number_mismatch`.
+A number that names the population of a ratio is not compared at all (2.0.0a3 parity fix). This covers
+"out of 2048 records", "a denominator of 2,048", "denominator: 2048", "2,048 records as the
+denominator", "12/36 records", "40% of 2048 records" and "12 of 50 records" (for the 50). The count in
+the same sentence is still compared, and "there are 36 records" stated alone with the denominator 36
+is still a mismatch. Precision exclusions: a number
 other than one directly before a singular unit is a label ("a 404 error"); a number right after a
 product-like capitalised name is a version ("Windows 10 users"); a unit followed by a head noun it
 modifies is not the counted population ("there is no error message"); "the only <unit>" needs a

@@ -30,7 +30,10 @@ models:
       provider: anthropic
       model: claude-sonnet-5-5
       api_key_env: ANTHROPIC_API_KEY
-      capabilities: {structured_output: native}
+      # The plan schema is over Anthropic's output_config.format complexity limits (the API answers
+      # HTTP 400 "compiled grammar is too large"), so the planner uses prompt mode: the schema goes in
+      # the system prompt and the reply is validated strictly. `validate` refuses native here.
+      capabilities: {structured_output: none}
     reviewer:
       provider: anthropic
       model: claude-haiku-5-5

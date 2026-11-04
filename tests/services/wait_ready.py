@@ -41,6 +41,11 @@ def check_opensearch() -> str:
     return _http_health(f"http://{HOST}:{port}/_cluster/health?wait_for_status=yellow&timeout=1s")
 
 
+def check_opensearch3() -> str:
+    port = _port("SU_TEST_OPENSEARCH3_PORT", 19202)
+    return _http_health(f"http://{HOST}:{port}/_cluster/health?wait_for_status=yellow&timeout=1s")
+
+
 def check_elasticsearch() -> str:
     port = _port("SU_TEST_ES_PORT", 19201)
     return _http_health(f"http://{HOST}:{port}/_cluster/health?wait_for_status=yellow&timeout=1s")
@@ -92,16 +97,20 @@ def check_mongo() -> str:
 
 CHECKS = {
     "opensearch": check_opensearch,
+    "opensearch3": check_opensearch3,
     "elasticsearch": check_elasticsearch,
     "postgres": check_postgres,
     "neo4j": check_neo4j,
     "mongo": check_mongo,
 }
+# Services behind a compose profile: waited for only when named with --only.
+PROFILE_ONLY = {"opensearch3"}
 
 
 def endpoint(name: str) -> str:
     ports = {
         "opensearch": _port("SU_TEST_OPENSEARCH_PORT", 19200),
+        "opensearch3": _port("SU_TEST_OPENSEARCH3_PORT", 19202),
         "elasticsearch": _port("SU_TEST_ES_PORT", 19201),
         "postgres": _port("SU_TEST_POSTGRES_PORT", 15432),
         "neo4j": _port("SU_TEST_NEO4J_BOLT_PORT", 17687),
@@ -114,10 +123,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds to wait per run (default 300)")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between probes (default 2)")
-    parser.add_argument("--only", nargs="*", choices=sorted(CHECKS), help="subset of services to wait for")
+    parser.add_argument("--only", nargs="*", choices=sorted(CHECKS), help="subset of services to wait for (opensearch3 only when named)")
     args = parser.parse_args(argv)
 
-    pending = dict(CHECKS) if not args.only else {k: CHECKS[k] for k in args.only}
+    pending = {k: v for k, v in CHECKS.items() if k not in PROFILE_ONLY} if not args.only else {k: CHECKS[k] for k in args.only}
     results: dict[str, tuple[str, str, float]] = {}
     started = time.monotonic()
     last_error: dict[str, str] = {}

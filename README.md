@@ -191,7 +191,7 @@ pages: [backends](docs/backends.md), [providers](docs/providers.md).
 | `sqlite` | yes | yes | yes | yes | yes | yes | yes | yes | in-process conformance kit, default test run (`tests/conformance/test_backend_conformance.py`) |
 | `postgres` | yes | yes | yes | yes | planned | yes | yes | yes | real-service conformance suite `tests/conformance/test_postgres_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 | `sqlalchemy` | yes | planned | planned | yes | — | yes | yes | yes | real-service conformance suite `tests/conformance/test_sql_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
-| `opensearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/services/test_opensearch_adapter.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| `opensearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/services/test_opensearch_adapter.py` (passed against OpenSearch 2.19.1 and 3.9.0 in the 2.0.0a3 run, see VALIDATION.md) |
 | `elasticsearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/conformance/test_elasticsearch_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 | `neo4j` | — | — | — | — | yes | — | — | — | real-service conformance suite `tests/conformance/test_neo4j_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 | `kuzu` | — | — | — | — | yes | — | — | — | in-process conformance kit, default test run (`tests/conformance/test_kuzu_conformance.py`) |

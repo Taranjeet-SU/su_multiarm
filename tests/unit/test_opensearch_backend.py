@@ -216,6 +216,30 @@ def test_lexical_search_request_and_paging(backend, fake):
     assert backend.lexical.search(GEN, LexicalQuery(text="x"), None, 1, Page(cursor="1")).items == []
 
 
+def test_lexical_paging_never_crosses_the_result_window(backend, fake):
+    """from + size must stay within index.max_result_window (10000): a page ending at the window edge
+    asks for no look-ahead hit and decides ``next_cursor`` from an exact ``_count``; a page beyond the
+    window is a typed refusal, never a silently shortened ranking (structured text counts page with
+    k = 50001, size = 10000)."""
+    hit = {"_score": 1.0, "_source": {"chunk_id": "c", "document_id": "d"}}
+    fake.handlers[("POST", f"/{CHUNKS}/_search")] = lambda params, body: {"hits": {"hits": [hit] * min(body["size"], 10000)}}
+    fake.handlers[("POST", f"/{CHUNKS}/_count")] = {"count": 10001}
+    page = backend.lexical.search(GEN, LexicalQuery(text="x"), None, 50001, Page(size=10000))
+    body = fake.bodies("_search")[-1]
+    assert body["from"] == 0 and body["size"] == 10000 and len(page.items) == 10000 and page.next_cursor == "10000"
+    assert fake.bodies("_count")[-1] == {"query": body["query"]}
+    fake.handlers[("POST", f"/{CHUNKS}/_count")] = {"count": 10000}
+    assert backend.lexical.search(GEN, LexicalQuery(text="x"), None, 50001, Page(size=10000)).next_cursor is None
+    with pytest.raises(BackendError, match="beyond the result window 10000"):
+        backend.lexical.search(GEN, LexicalQuery(text="x"), None, 50001, Page(size=10000, cursor="10000"))
+    with pytest.raises(BackendError, match="beyond the result window"):
+        backend.lexical.search(GEN, LexicalQuery(text="x"), None, 50001, Page(size=2, cursor="9999"))
+    # Below the edge the single look-ahead hit is still used and no count is issued.
+    counts = len(fake.bodies("_count"))
+    page = backend.lexical.search(GEN, LexicalQuery(text="x"), None, 50001, Page(size=2, cursor="9997"))
+    assert fake.bodies("_search")[-1]["size"] == 3 and page.next_cursor == "9999" and len(fake.bodies("_count")) == counts
+
+
 def test_error_mapping(backend, fake):
     fake.handlers[("POST", f"/{DOCS}/_mget")] = lc.TransportError(None, "ConnectionError", "refused")
     with pytest.raises(BackendError, match="opensearch.get: server unavailable: ConnectionError: refused"):
@@ -256,6 +280,43 @@ def test_index_creation_mapping_and_probe(fake):
     fake.handlers[("GET", "/")] = {"version": {"number": "8.17.4"}}
     with pytest.raises(BackendError, match="expected an OpenSearch 2.x"):
         backend.probe()
+
+
+@pytest.mark.parametrize("number, major", [("2.19.1", 2), ("2.0.0", 2), ("3.0.0", 3), ("3.9.0", 3)])
+def test_probe_accepts_opensearch_2_and_3(fake, number, major):
+    fake.handlers[("GET", "/")] = {"version": {"distribution": "opensearch", "number": number, "lucene_version": "x"}}
+    for method in ("exact", "hnsw"):
+        info = OpenSearchBackend(index_prefix="su", transport=fake, knn_method=method).probe()
+        assert info == {"distribution": "opensearch", "version": number, "major": major, "lucene_version": "x"}
+
+
+@pytest.mark.parametrize("number", ["1.3.20", "4.0.0", "", "x.y", "30.1.0"])
+def test_probe_refuses_other_opensearch_majors(fake, number):
+    fake.handlers[("GET", "/")] = {"version": {"distribution": "opensearch", "number": number}}
+    with pytest.raises(BackendError, match=r"expected an OpenSearch 2\.x or 3\.x server"):
+        OpenSearchBackend(index_prefix="su", transport=fake).probe()
+
+
+def test_probe_refuses_an_hnsw_engine_the_server_major_blocks(fake, monkeypatch):
+    """nmslib index creation is blocked on 3.x: an adapter writing it must fail at probe time, not silently."""
+    from su_multi_arm.backends.opensearch import adapter
+
+    monkeypatch.setattr(adapter, "HNSW_ENGINE", "nmslib")
+    fake.handlers[("GET", "/")] = {"version": {"distribution": "opensearch", "number": "2.19.1"}}
+    assert OpenSearchBackend(index_prefix="su", transport=fake, knn_method="hnsw").probe()["major"] == 2
+    fake.handlers[("GET", "/")] = {"version": {"distribution": "opensearch", "number": "3.9.0"}}
+    with pytest.raises(BackendError, match="knn engine 'nmslib' cannot create indices on OpenSearch 3.9.0"):
+        OpenSearchBackend(index_prefix="su", transport=fake, knn_method="hnsw").probe()
+    # The exact method writes no ANN engine, so it is unaffected.
+    assert OpenSearchBackend(index_prefix="su", transport=fake).probe()["major"] == 3
+
+
+def test_hnsw_mapping_uses_an_engine_both_majors_accept(fake):
+    from su_multi_arm.backends.opensearch import adapter
+
+    backend = OpenSearchBackend(index_prefix="su", transport=fake, knn_method="hnsw")
+    engine = backend.vector._field_mapping(4)["method"]["engine"]
+    assert engine == "lucene" and all(engine in engines for engines in adapter.KNN_ENGINES.values())
 
 
 def test_activation_is_one_alias_request_and_delete_guards(backend, fake):

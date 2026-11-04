@@ -274,6 +274,73 @@ def test_grammar_refuses_what_it_cannot_express(grammar_setup, question, reason)
     assert reason in {u.reason for u in decision.unsupported}, decision.unsupported
 
 
+@pytest.mark.parametrize(
+    ("question", "dropped"),
+    [
+        # 2.0.0a3 parity fix: each of these returned an ``exact`` number that ignored a qualifier.
+        ("Who is second for project Alpha?", "second"),  # an ordinal outside a ranking
+        ("How many records are currently active?", "active"),  # a state word no field declares
+        ("How many invoice-mention records are active?", "active"),
+        ("Which projects contain the most active records?", "active"),  # not a text topic of grammar words
+        ("Which project has the most records among projects with >= 2 records?", ">= 2"),  # a threshold bound to no field
+        ("How many records have at least 3 tags?", "at least 3"),
+    ],
+)
+def test_grammar_refuses_a_dropped_qualifier_instead_of_an_exact_count(grammar_setup, question, dropped):
+    decision, _ = grammar_setup(question)
+    assert decision.outcome == "abstain" and decision.scope is None, decision
+    flagged = {u.constraint_text for u in decision.unsupported if u.reason == "qualifier_not_applied"}
+    assert dropped in flagged, decision.unsupported
+
+
+def test_grammar_hyphenated_mention_is_a_topic_and_the_cue_never_starts_inside_a_word(grammar_setup):
+    decision, _ = grammar_setup("How many invoice-mention records are open?")
+    assert decision.outcome == "decided" and decision.scope.text == TextMatch(kind="all_terms", text="invoice")
+    assert decision.scope.predicates[0].field == "status"
+    decision, _ = grammar_setup("Which project has the highest invoice-mention rate?")
+    assert decision.outcome == "abstain" and "rate" in " ".join(u.constraint_text for u in decision.unsupported)  # never "mention rate"
+    # what still works: the ordinal inside a ranking, a bound state, a bound comparison
+    _, result = grammar_setup("What is the second most common project?")
+    assert keys(result) == [(("Gamma",), 1)]
+    decision, _ = grammar_setup("Which project is the most active?")
+    assert decision.outcome == "abstain"  # "most active" without a group noun after it is not a ranking
+    _, result = grammar_setup("How many records with amount above 6?")
+    assert result.value == 3
+
+
+def test_planner_sort_by_count_ranks_groups(monkeypatch):
+    schema = v2_schema_model()
+    schema = schema.model_copy(update={"fields": [s.model_copy(update={"groupable": True}) if s.name == "project" else s for s in schema.fields]})
+    backend = MemoryBackend()
+    backend.records.upsert(V2_GEN, v2_records(), schema)
+    caps = Capabilities(arms=["dense", "structured"], metadata_schema=schema)
+    agent = LlmAgent(LlmConfig(role={"provider": "openai_compatible", "model": "fake"}), Dependencies(backends={"records": backend.records}))
+    plan: dict = {}
+    monkeypatch.setattr(LlmAgent, "call_model", lambda self, ctx, payload: LlmPlan.model_validate(plan))
+
+    def decide(scope: dict, question: str = "Which projects have the most records?"):
+        plan["steps"] = [{"arm": "structured", "scope": scope}]
+        return agent.decide(new_context(V2_GEN), DecisionRequest(query=question, as_of=ANCHOR), detect_intents(question, [], caps.structured_targets()), caps)
+
+    decision = decide({"group_by": ["project"], "sort": {"field": "count", "descending": True}, "top_n": 1})
+    assert decision.outcome == "decided" and (decision.scope.sort, decision.scope.order, decision.scope.top_n) == (None, "desc", 1)
+    result = backend.records.execute(V2_GEN, decision.scope, [])
+    assert [(g.key["project"], g.count) for g in result.groups] == [("Alpha", 2)] and [g.key["project"] for g in result.ties] == ["Beta"]
+    ascending = decide({"group_by": ["project"], "sort": {"field": "count"}, "nth": 1, "measure": {"kind": "count"}})
+    assert ascending.scope.order == "asc" and [g.key["project"] for g in backend.records.execute(V2_GEN, ascending.scope, []).groups] == ["Gamma"]
+    by_measure = decide({"group_by": ["project"], "measure": {"kind": "avg", "field": "amount"}, "sort": {"field": "amount", "descending": True}, "top_n": 1}, "Which project has the highest average amount?")
+    assert by_measure.scope.order == "desc" and by_measure.scope.sort is None  # the measure's field ranks the groups
+    assert [(g.key["project"], g.value) for g in backend.records.execute(V2_GEN, by_measure.scope, []).groups] == [("Alpha", 15.25)]
+    # not well-defined: records have no count; a direction contradicting order
+    no_groups = decide({"sort": {"field": "count", "descending": True}, "limit": 2}, "List the records with the most records")
+    assert no_groups.outcome == "abstain" and no_groups.unsupported[0].reason == "measure_unsupported"
+    contradiction = decide({"group_by": ["project"], "sort": {"field": "count", "descending": True}, "order": "asc", "nth": 1})
+    assert contradiction.outcome == "abstain" and "contradicts" in contradiction.unsupported[0].suggestion
+    # an undeclared sort field is still refused as before
+    unknown = decide({"group_by": ["project"], "sort": {"field": "region", "descending": True}, "top_n": 1})
+    assert unknown.outcome == "abstain" and unknown.unsupported[0].reason == "field_not_filterable"
+
+
 def test_new_intent_operators_need_a_structured_target():
     targets = ["record", "records", "project", "status", "month"]
     assert "rank" in detect_intents("Which project has the most records?", [], targets).kinds()
