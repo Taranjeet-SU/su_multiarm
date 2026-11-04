@@ -26,12 +26,19 @@ def _resolve(schema: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def normalise_schema(schema: dict[str, Any], defs: dict[str, Any] | None = None) -> Any:
-    """Shape of a JSON schema node: optionality (``null``), titles, defaults and descriptions removed."""
+def normalise_schema(schema: dict[str, Any], defs: dict[str, Any] | None = None, _seen: frozenset[str] = frozenset()) -> Any:
+    """Shape of a JSON schema node: optionality (``null``), titles, defaults and descriptions removed.
+    A recursive definition (``Measure.of``) is expanded once and then named."""
     defs = defs or {}
+    ref = schema.get("$ref")
+    if ref:
+        name = ref.rsplit("/", 1)[-1]
+        if name in _seen:
+            return {"$recursive": name}
+        _seen = _seen | {name}
     schema = _resolve(schema, defs)
     if "anyOf" in schema:
-        options = [normalise_schema(o, defs) for o in schema["anyOf"] if o.get("type") != "null"]
+        options = [normalise_schema(o, defs, _seen) for o in schema["anyOf"] if o.get("type") != "null"]
         if len(options) == 1:
             return options[0]
         return {"anyOf": sorted(options, key=repr)}
@@ -41,9 +48,9 @@ def normalise_schema(schema: dict[str, Any], defs: dict[str, Any] | None = None)
             continue
         value = schema[key]
         if key in {"items", "additionalProperties"} and isinstance(value, dict):
-            value = normalise_schema(value, defs)
+            value = normalise_schema(value, defs, _seen)
         elif key == "properties":
-            value = {name: normalise_schema(sub, defs) for name, sub in value.items()}
+            value = {name: normalise_schema(sub, defs, _seen) for name, sub in value.items()}
         shape[key] = value
     return shape
 

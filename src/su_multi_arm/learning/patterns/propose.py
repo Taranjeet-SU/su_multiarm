@@ -187,7 +187,10 @@ def proposal_entry(
             return ProposalEntry(None, reason=f"fix target {target.entry.id!r} is {target.status}; a human decision or edit wins", outcome="invalid")
     elif reply.target_pattern_id:
         return ProposalEntry(None, reason="target_pattern_id is only for action 'fix'", outcome="invalid")
-    kind = target.entry.kind if target is not None else ("noise" if reply.action == "noise" else "message")
+    # A model that labels its own pattern as noise gets a noise entry (a human decides), never an
+    # auto-promotable message (real-run fix, 2026-11-04).
+    noise = reply.action == "noise" or reply.issue_category == "noise"
+    kind = target.entry.kind if target is not None else ("noise" if noise else "message")
     if kind not in {"message", "noise"}:
         return ProposalEntry(None, reason=f"the learner proposes message and noise patterns, not {kind}", outcome="invalid")
     applies: dict[str, Any]

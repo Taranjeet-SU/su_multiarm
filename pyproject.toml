@@ -32,6 +32,8 @@ patterns = ["google-re2>=1.1"]
 patterns-lite = ["regex>=2023.0"]
 api = ["fastapi>=0.115", "uvicorn>=0.30"]
 mcp = ["mcp>=1.10,<2"]
+# The web UI: static assets in a separate wheel built from ui/ (addendum A2 §4.4.1); not in `all`.
+ui = ["su-multi-arm-ui==2.0.0a3", "fastapi>=0.115", "uvicorn>=0.30"]
 # The OpenAI and Anthropic providers speak the HTTP APIs through httpx (a core dependency); these
 # extras are intentionally empty so `pip install su-multi-arm[openai]` / `[anthropic]` resolve.
 openai = []
@@ -45,6 +47,10 @@ su-multi-arm = "su_multi_arm.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/su_multi_arm"]
+
+[tool.hatch.build.targets.sdist]
+# the UI is its own distribution (ui/python): the core sdist never carries it or node_modules
+exclude = ["/ui", "/.claude"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

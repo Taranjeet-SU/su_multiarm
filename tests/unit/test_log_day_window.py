@@ -48,6 +48,20 @@ def test_window_keys_and_cutoff():
     assert cutoff(date(2026, 1, 11), 10) == "2026-01-02"
 
 
+def test_keep_days_is_the_n_most_recent_complete_days():
+    """``keep_days: 10`` keeps exactly 10 index dates, ``today - 10`` .. ``today - 1``; today (not
+    complete) is not counted. Day 1 is expired by the run on day 12, and the window retention keeps
+    is the window the daily run for yesterday composes."""
+    from su_multi_arm.ingestion.logs_compose import expiry_cutoff
+
+    today = date(2026, 1, 12)
+    kept = [k for k in (date(2026, 1, d).isoformat() for d in range(1, 13)) if expiry_cutoff(today, 10) <= k < today.isoformat()]
+    assert kept == [date(2026, 1, d).isoformat() for d in range(2, 12)] and len(kept) == 10
+    assert expiry_cutoff(date(2026, 1, 11), 10) == "2026-01-01"  # day 1 still kept on day 11
+    assert window_keys(today - (today - date(2026, 1, 11)), 10) == kept
+    assert expiry_cutoff(today, 1) == "2026-01-11"  # keep_days: 1 keeps yesterday only
+
+
 def test_event_time_partition_counts_exactly_its_local_day(tmp_path):
     engine_or_skip(ENGINE)
     days = [date(2026, 1, 4), date(2026, 1, 5), date(2026, 1, 6)]

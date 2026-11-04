@@ -91,7 +91,9 @@ def compare(value: Any, bound: Any, spec: Any = None) -> int | None:
 
 
 def truncate(moment: datetime, granularity: str, zone: tzinfo = timezone.utc) -> datetime:
-    """Start of the calendar day/month/year containing ``moment`` in ``zone`` (UTC by default)."""
+    """Start of the calendar hour/day/month/year containing ``moment`` in ``zone`` (UTC by default)."""
+    if granularity == "hour":
+        return moment.astimezone(zone).replace(minute=0, second=0, microsecond=0)
     moment = moment.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
     if granularity == "month":
         return moment.replace(day=1)
@@ -235,6 +237,7 @@ def measure_of(scope: ScopeSpec, rows: list[StructuredRecord], population: int, 
         return {"value": chosen[0].isoformat(), "record_id": chosen[1]}, len(stamped) - len(valid)
     if measure.kind == "bucket":
         counts: Counter[str] = Counter()
+        members: dict[str, list[StructuredRecord]] = {}
         invalid = 0
         zone = zone_of(schema)
         for r in rows:
@@ -242,8 +245,18 @@ def measure_of(scope: ScopeSpec, rows: list[StructuredRecord], population: int, 
             if moment is None:
                 invalid += 1
             else:
-                counts[truncate(moment, measure.granularity or "day", zone).isoformat()] += 1
-        return dict(sorted(counts.items())), invalid
+                label = truncate(moment, measure.granularity or "day", zone).isoformat()
+                counts[label] += 1
+                members.setdefault(label, []).append(r)
+        if measure.of is None or measure.of.kind == "count":
+            return dict(sorted(counts.items())), invalid
+        # bucket of an inner measure (B3): e.g. the sum of ``lines`` per day
+        inner = scope.model_copy(update={"measure": measure.of})
+        values: dict[str, Any] = {}
+        for label in sorted(members):
+            values[label], inner_missing = measure_of(inner, members[label], population, schema)
+            invalid += inner_missing
+        return values, invalid
     numbers = [r.values.get(field) for r in rows]
     valid_numbers = [n for n in numbers if _number(n)]
     invalid = len(numbers) - len(valid_numbers)
@@ -256,6 +269,22 @@ def measure_of(scope: ScopeSpec, rows: list[StructuredRecord], population: int, 
     if measure.kind == "sum":
         return sum(valid_numbers), invalid
     return sum(valid_numbers) / len(valid_numbers), invalid
+
+
+def non_additive(scope: ScopeSpec, schema: MetadataSchema) -> UnsupportedConstraint | None:
+    """A ``sum``/``avg`` over a field declared ``additive: false`` (a per-row percentile): the value
+    would be a meaningless number, so it is refused (``measure_unsupported``), never computed."""
+    measure = scope.measure
+    if measure is None or measure.kind not in {"sum", "avg"} or not measure.field:
+        return None
+    spec = schema.field(measure.field)
+    if spec is None or spec.additive:
+        return None
+    return _flag(
+        f"{measure.kind} of {measure.field}",
+        "measure_unsupported",
+        f"{measure.field} is not additive across records (a per-row value such as a percentile); read it per row, or use min/max",
+    )
 
 
 # Upper bound on the records one typed scope may match on the request path (plan §2.1 principle 7).
@@ -288,6 +317,8 @@ def _key_repr(group: GroupRow) -> str:
 def calendar_label(moment: datetime, granularity: str, zone: tzinfo) -> str:
     """``2024``, ``2024-03`` or ``2024-03-05``: the calendar bucket of ``moment`` in ``zone``."""
     local = moment.astimezone(zone)
+    if granularity == "hour":
+        return local.replace(minute=0, second=0, microsecond=0).isoformat()
     if granularity == "year":
         return f"{local.year:04d}"
     if granularity == "month":
@@ -491,8 +522,11 @@ def scope_result(
             count = sum(1 for r in matched if r.values.get(predicate.field) is None)
             if count:
                 unknown[predicate.field] = unknown.get(predicate.field, 0) + count
+    exactness, applied_basis, applied_extraction = row_semantics(schema, matched)
     return ScopeResult(
-        exactness="bounded" if unsupported else "exact",
+        exactness="bounded" if unsupported else exactness,
+        applied_basis=applied_basis,
+        applied_extraction=applied_extraction,
         denominator=population,
         value=value,
         groups=groups,
@@ -508,6 +542,31 @@ def scope_result(
         numerator=numerator,
         basis=_basis(scope, schema, applied, unknown),
     )
+
+
+def role_fields(schema: MetadataSchema, role: str) -> list[str]:
+    return [f.name for f in schema.fields if getattr(f, "role", None) == role]
+
+
+def row_semantics(schema: MetadataSchema, matched: list[StructuredRecord]) -> tuple[str, list[str], list[str]]:
+    """Count semantics over the matched rows (A1 §3.9.1, B2): ``exact`` unless a ``role:
+    exactness`` field of some matched row says ``approximate`` (worst row wins); the distinct
+    values of the ``role: basis`` and ``role: extraction`` fields."""
+    exactness = "exact"
+    for name in role_fields(schema, "exactness"):
+        if any(r.values.get(name) == "approximate" for r in matched):
+            exactness = "approximate"
+
+    def distinct(role: str) -> list[str]:
+        out: set[str] = set()
+        for name in role_fields(schema, role):
+            for r in matched:
+                value = r.values.get(name)
+                if isinstance(value, str) and value:
+                    out.update(v for v in value.split(",") if v)
+        return sorted(out)
+
+    return exactness, distinct("basis"), distinct("extraction")
 
 
 MAX_HOPS = 3

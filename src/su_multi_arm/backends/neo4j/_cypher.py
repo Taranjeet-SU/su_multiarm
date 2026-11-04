@@ -37,6 +37,7 @@ REL_TYPES: dict[str, str] = {
     "mention": "SU_MENTION",
     "native_link": "SU_NATIVE_LINK",
     "derived": "SU_DERIVED",
+    "co_firing": "SU_CO_FIRING",
 }
 assert set(REL_TYPES) == set(get_args(EdgeKind)), "every EdgeKind needs a fixed relationship type"
 

@@ -2,7 +2,7 @@
 
 * **free text** (no graph intent): seeds are stored entities whose name tokens all occur in the
   query and that have a mention inside the scope; a minimal ``TraversalSpec`` follows ``fact`` edges
-  only (co-occurrence is never traversed); evidence is the mention passages of reached entities with
+  only by default (``edge_kinds``; co-occurrence is never traversed unless configured); evidence is the mention passages of reached entities with
   depth and edge provenance;
 * **typed intent** (``step.graph = {template, seeds}``): a declared traversal template
   (``pipeline.arms.graph.templates``) is run through ``arms/traversal.py``; evidence is the documents
@@ -59,7 +59,7 @@ class GraphArm(BaseArm):
             hops=self.cfg.hops,
             predicates=list(self.cfg.predicates),
             direction=self.cfg.direction,
-            edge_kinds=["fact"],
+            edge_kinds=list(getattr(self.cfg, "edge_kinds", None) or ["fact"]),
             limit=inputs.candidates,
         )
         paths = graph.traverse(ctx.generation, spec, scope) if self.cfg.hops else []

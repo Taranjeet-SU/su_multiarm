@@ -22,6 +22,7 @@ from ..core.config_graph import GraphIntent
 from ..core.types import JsonScalar, Measure, MetadataSchema, ScopeSpec, UnsupportedConstraint
 from ..models import StrictModel
 from .intent import Intents, detect_intents
+from .log_intents import LogIntentCall
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..runtime.context import RunContext
@@ -82,6 +83,9 @@ class StructuredStep(StrictModel):
     # Question qualifiers this scope does not express (``decision/qualifiers.py``); the engine
     # reports the step's aggregate as ``bounded`` with these attached.
     unapplied: list[UnsupportedConstraint] = Field(default_factory=list)
+    # A typed log question (addendum A2 §4.1.5, review B5): the engine runs the intent through
+    # ``runtime/log_tools.py`` and ``scope`` is only the compiled main scope, for the trace.
+    intent: LogIntentCall | None = None
 
 
 PlanStep = Annotated[Union[RetrievalStep, StructuredStep], Field(discriminator="arm")]
@@ -108,6 +112,9 @@ class Capabilities(StrictModel):
     id_patterns: list[str] = Field(default_factory=list)  # exact-identifier regexes from the alias map
     # Declared graph traversal templates (name -> description) a plan may select on the graph arm.
     graph_templates: dict[str, str] = Field(default_factory=dict)
+    # Logs profile (``logs.intents.enabled``): log questions go through a typed intent step, and a
+    # free structured scope that could span several log kinds is refused (``intent_required``).
+    log_intents: bool = False
 
     @model_validator(mode="after")
     def known_arms(self):
@@ -289,6 +296,44 @@ class DecisionAgent:
     def attempt(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision:
         raise NotImplementedError
 
+    def log_step(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision | None:
+        """The typed log-intent step every agent goes through first (review B5): a recognised log
+        question is decided here, deterministically, for ``rules``, ``classifier``, ``llm`` and
+        ``cascade`` alike; ``None`` lets the agent plan."""
+        if not capabilities.log_intents or "structured" not in capabilities.arms or request.scope is not None or request.aggregate is not None:
+            return None
+        from .log_intents import detect
+
+        records = (getattr(self.deps, "backends", None) or {}).get("records")
+        schema = capabilities.metadata_schema
+
+        def values(field: str) -> list[str]:
+            spec = schema.field(field)
+            if records is None or spec is None or not spec.listable:
+                return []
+            return [str(v) for v in records.values(ctx.generation, field, list(ctx.constraints()), 5000)]
+
+        try:
+            call = detect(request.query, as_of=request.as_of, values=values)
+        except ValueError as error:
+            ctx.trace.event("log_intent_unrecognised", message=str(error))
+            return None
+        if call is None:
+            return None
+        return log_decision(call, intents, agent=self.name)
+
+    def require_intent(self, request: DecisionRequest, capabilities: Capabilities, decision: Decision) -> Decision:
+        """Under the logs profile a structured step without an intent must pin one document kind
+        (``log_guard``); otherwise the plan is refused with ``intent_required``."""
+        if not capabilities.log_intents or decision.plan is None or request.scope is not None or request.aggregate is not None:
+            return decision
+        from .log_guard import log_scope_guard
+
+        for step in decision.plan.structured_steps():
+            if step.intent is None and (refused := log_scope_guard(step.scope)) is not None:
+                raise DecisionFailure("invalid_step", "a free structured scope over the log rollups needs a log intent", [refused])
+        return decision
+
     def check_qualifiers(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities, decision: Decision) -> Decision:
         """Qualifier coverage of every agent-compiled structured step (QA-01, ``qualifiers.py``).
         Unapplied qualifiers are attached to the step and the decision; nothing is re-planned."""
@@ -308,7 +353,7 @@ class DecisionAgent:
         added: list[UnsupportedConstraint] = []
         steps: list[RetrievalStep | StructuredStep] = []
         for step in decision.plan.steps:
-            if isinstance(step, StructuredStep):
+            if isinstance(step, StructuredStep) and step.intent is None:
                 missing = unapplied(candidates, step.scope, request.filters, schema)
                 if not intents.aggregate():
                     # QQ-04: a list of an undeclared record noun is an operator, just not a typed one.
@@ -332,8 +377,11 @@ class DecisionAgent:
         on_failure = getattr(self.config, "on_failure", "fail_closed")
         with ctx.trace.span("decision", agent=self.name, policy=on_failure) as span:
             try:
-                decision = self.attempt(ctx, request, intents, capabilities)
-                decision = self.check_qualifiers(ctx, request, intents, capabilities, decision)
+                decision = self.log_step(ctx, request, intents, capabilities)
+                if decision is None:
+                    decision = self.attempt(ctx, request, intents, capabilities)
+                    decision = self.require_intent(request, capabilities, decision)
+                    decision = self.check_qualifiers(ctx, request, intents, capabilities, decision)
             except DecisionFailure as failure:
                 span.event("decision_failed", category=failure.category, message=str(failure))
                 if on_failure == "raw_all_arms":
@@ -373,3 +421,16 @@ class DecisionAgent:
     def run(self, ctx: RunContext, inputs: Any) -> Decision:
         request, capabilities = inputs
         return self.decide(ctx, request, None, capabilities)
+
+
+def log_decision(call: LogIntentCall, intents: Intents, *, agent: str, policy: str = "log_intent") -> Decision:
+    """A decided plan of one typed log intent. The step's scope is the compiled main scope (for the
+    trace); the engine executes the intent itself, never this scope."""
+    from datetime import date as _date
+
+    from .log_intents import CompileContext, compile_intent
+
+    compiled = compile_intent(call, CompileContext(today=_date.fromisoformat(call.args["as_of"]) if call.args.get("as_of") else _date.today()))
+    scope = compiled.scopes.get("main") or ScopeSpec()
+    step = StructuredStep(arm="structured", scope=scope, intent=call)
+    return Decision(plan=Plan(steps=[step]), scope=scope, outcome="decided", agent=agent, policy_applied=policy, intents=intents)

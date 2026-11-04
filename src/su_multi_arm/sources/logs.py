@@ -6,11 +6,12 @@ optional deployment prefixes, segment vocabularies, date suffix); no user regula
 compiled here. An index that does not fit the grammar exactly once is ``unparsed`` with a typed
 reason, ``unknown`` attributes and a diagnostic, never a guess.
 
-``LogMapping`` strips ANSI escapes and control characters, cuts the message at ``max_line_bytes``
-(on a UTF-8 boundary, flagged ``truncated``) and applies an injected ``redactor``. **This slice has no
-redactor**: the safe redaction contract is slice B11. ``LogMapping.redaction`` says ``"none"`` until
-one is injected, and a consumer that persists or sends records (partitions L3a, prompts L4b) must
-refuse a mapping whose redaction is ``"none"``.
+``LogMapping`` strips ANSI escapes and control characters, applies the ``redactor`` to the message,
+the stack and string ``extra`` values, then cuts the message at ``max_line_bytes`` (on a UTF-8
+boundary, flagged ``truncated``). The redactor is the configured safe one (``privacy.engine: safe``,
+``privacy/redactors.py``) or any injected callable. ``LogMapping.redaction`` is ``"none"`` without one,
+the safe redactor's stamp (``safe:<sha16>``) with it, or ``"injected"``; a consumer that persists or
+sends records (partitions, prompts) refuses a mapping whose redaction is ``"none"``.
 """
 
 from __future__ import annotations
@@ -109,10 +110,12 @@ class IndexNameParser:
             re.compile("".join("[0-9]+" if piece == "{n}" else re.escape(piece) for piece in re.split(r"(\{n\})", item) if piece) + re.escape(self.sep))
             for item in ordered
         ]
+        # the same prefixes without the trailing separator, for ``deployment_position: before_service``
+        self._deployment_words = [re.compile(p.pattern[: -len(re.escape(self.sep))]) for p in self._deployments]
 
     def fields(self) -> list[str]:
         out = [*self.config.prefix_fields, "service", "index_date"]
-        return ["deployment", *out] if self.config.deployment_prefixes else out
+        return ["deployment", *out] if self.config.deployment_prefixes or self.config.deployment_position == "after_env" else out
 
     def _unparsed(self, name: str, reason: UnparsedReason, why: str, day: date | None = None) -> ParsedIndexName:
         attrs = {key: UNKNOWN for key in self.fields()}
@@ -120,17 +123,21 @@ class IndexNameParser:
             attrs["index_date"] = day.isoformat()
         return ParsedIndexName(attrs, day, f"index {name!r}: {why}", reason)
 
-    def _segments(self, body: str) -> tuple[dict[str, str] | None, UnparsedReason, str]:
-        """``body`` (no prefix, deployment or date) into the prefix fields and the service."""
+    def _segments(self, body: str, service: str | None = None) -> tuple[dict[str, str] | None, UnparsedReason, str]:
+        """``body`` (no prefix, deployment or date) into the prefix fields and the service. With
+        ``service`` the service segment is that vocabulary entry; otherwise the longest one that ends
+        the body (or the last token without a vocabulary). With ``deployment_position:
+        before_service`` a declared deployment prefix may stand between the prefix fields and the
+        service; it is returned as ``deployment``."""
         sep = self.sep
-        service = None
-        if self.services:
+        if service is None and self.services:
             for candidate in self.services:  # longest first
                 if body == candidate or body.endswith(sep + candidate):
                     service = candidate
                     break
             if service is None:
                 return None, "service", "no service vocabulary entry ends the name"
+        if service is not None:
             rest = body[: -len(service)].removesuffix(sep) if body != service else ""
         else:
             rest, _, service = body.rpartition(sep)
@@ -151,10 +158,40 @@ class IndexNameParser:
                     return None, "segments", f"empty {name} segment"
             values[name] = value
             rest = rest[len(value) + len(sep) :] if len(rest) > len(value) else ""
+        if rest and self.config.deployment_position == "before_service" and any(p.fullmatch(rest) for p in self._deployment_words):
+            values["deployment"] = rest
+            rest = ""
+        if rest and self.config.deployment_position == "after_env":
+            values["deployment"] = rest  # env-anchored: whatever sits between the env and the service
+            rest = ""
         if rest:
             return None, "segments", f"expected prefix fields {self.config.prefix_fields}; {rest!r} is left over"
         values["service"] = service
         return values, "segments", ""
+
+    def _parse_before_service(self, name: str, head: str, day: date) -> ParsedIndexName:
+        """Every service reading of ``head`` (each vocabulary entry that ends it, longest first; the
+        last token without a vocabulary). Exactly one must fit; a name that fits with and without a
+        deployment prefix (``ops-admin-kafka`` declared as a service *and* ``ops-admin`` as a
+        deployment) is ``ambiguous``."""
+        sep = self.sep
+        candidates = [c for c in self.services if head == c or head.endswith(sep + c)] if self.services else [None]
+        if not candidates:
+            return self._unparsed(name, "service", "no service vocabulary entry ends the name", day)
+        parses: list[dict[str, str]] = []
+        failure: tuple[UnparsedReason, str] | None = None
+        for service in candidates:
+            values, reason, why = self._segments(head, service)
+            if values is None:
+                failure = failure or (reason, why)
+                continue
+            parses.append({"deployment": values.pop("deployment", "none"), **values})
+        if not parses:
+            reason, why = failure  # type: ignore[misc]
+            return self._unparsed(name, reason, why, day)
+        if len(parses) > 1:
+            return self._unparsed(name, "ambiguous", "fits the grammar with more than one service/deployment split", day)
+        return ParsedIndexName({**parses[0], "index_date": day.isoformat()}, day)
 
     def parse(self, name: str) -> ParsedIndexName:
         match = self._date.search(name)
@@ -170,6 +207,8 @@ class IndexNameParser:
             if not head.startswith(lead):
                 return self._unparsed(name, "prefix", f"does not start with {lead!r}", day)
             head = head[len(lead) :]
+        if self.config.deployment_position == "after_env" or (self.config.deployment_prefixes and self.config.deployment_position == "before_service"):
+            return self._parse_before_service(name, head, day)
         # Every reading of the name: with the longest deployment prefix that matches, and without one.
         readings: list[tuple[str | None, str]] = []
         for pattern in self._deployments:
@@ -325,8 +364,14 @@ class LogMapping:
         self.config = config
         self.fields = config.mapping
         self.redactor = redactor
-        self.redaction: Literal["none", "injected"] = "none" if redactor is None else "injected"
+        stamp = getattr(redactor, "stamp", None)
+        self.redaction: str = "none" if redactor is None else (stamp if isinstance(stamp, str) else "injected")
         self.stats = MappingStats()
+
+    def redaction_report(self) -> dict[str, Any]:
+        """Content-free: mode/stamp and, for the safe redactor, replacements per redactor."""
+        report = getattr(self.redactor, "report", None)
+        return {"mode": self.redaction, **(report() if callable(report) else {})}
 
     def record(self, doc: SourceDoc, unit: SourceUnit, partition_key: str) -> LogRecord:
         source = doc.fields
@@ -354,10 +399,13 @@ class LogMapping:
         extra: dict[str, JsonScalar] = {}
         for path in self.fields.extra:
             value = lookup(source, path)
-            if value is None or isinstance(value, (str, int, float, bool)):
+            if isinstance(value, str) and self.redactor is not None:
+                extra[path] = self.redactor(value)
+            elif value is None or isinstance(value, (str, int, float, bool)):
                 extra[path] = value
             else:
-                extra[path] = cut_utf8(json.dumps(value, sort_keys=True, default=str), 1024)[0]
+                dumped = cut_utf8(json.dumps(value, sort_keys=True, default=str), 1024)[0]
+                extra[path] = self.redactor(dumped) if self.redactor is not None else dumped
         return LogRecord(
             id=stable_sha([doc.index, doc.source_id])[:32],
             ts=ts,

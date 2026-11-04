@@ -227,14 +227,20 @@ def check_vector(adapter: Any) -> None:
         pass
 
 
-def check_records(adapter: Any) -> None:
-    records = adapter.records
-    seed(adapter)
-    rows = [
+def record_rows() -> list[StructuredRecord]:
+    """The three typed records of ``check_records`` (adapters' native-type tests reuse them: the
+    later text-count check overwrites ``GEN``'s records with untyped rows)."""
+    return [
         StructuredRecord(schema_id="document", id="d1", values={"source": "case", "product": "CloudTax", "created_at": "2024-01-01T00:00:00+00:00", "size": 3, "secret_id": "s1", "touched_at": "2025-01-02T08:00:00", "day": "2024-03-05"}, provenance=PROV),
         StructuredRecord(schema_id="document", id="d2", values={"source": "case", "product": "SearchDesk", "created_at": "2024-01-02T00:00:00+00:00", "size": 5, "secret_id": "s2", "touched_at": "2025-01-02T09:00:00+01:00", "day": "2024-03-06"}, provenance=PROV),
         StructuredRecord(schema_id="document", id="d3", values={"source": "article", "product": "CloudTax", "created_at": None, "size": None, "secret_id": "s3", "touched_at": "2025-01-01T23:30:00-02:00", "day": None}, provenance=PROV),
     ]
+
+
+def check_records(adapter: Any) -> None:
+    records = adapter.records
+    seed(adapter)
+    rows = record_rows()
     records.upsert(GEN, rows, SCHEMA)
     for bad in ({"created_at": 12}, {"created_at": "not a date"}, {"created_at": "2024-01-01T00:00:00"}):
         try:

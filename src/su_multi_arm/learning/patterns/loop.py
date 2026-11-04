@@ -90,6 +90,7 @@ class LearnReport:
     stopped: str | None = None
     spend: dict[str, Any] | None = None
     git_commit: str | None = None
+    paused: bool = False  # a requested stop between calls: incomplete, not failed
 
     def written(self) -> dict[str, list[str]]:
         return {
@@ -110,6 +111,7 @@ class LearnReport:
             "miner": self.miner,
             "egress": self.egress,
             "stopped": self.stopped,
+            "paused": self.paused,
             "spend": self.spend,
             "git_commit": self.git_commit,
         }
@@ -121,6 +123,18 @@ def body_span(result: LineResult) -> tuple[int, int] | None:
         return 0, len(result.text)
     then = result.format.entry.entry.then
     return result.format.groups.get(then.field_from_group) if then else None
+
+
+def pending_for(library: Any, cluster: Cluster) -> str | None:
+    """Id of a proposed (not yet reviewed) entry written for the same template, service and level; a
+    changed template is a new cluster. Templates are compared as written (pseudonymised per run)."""
+    template = cluster.template()
+    for loaded in library.entries.values():
+        if loaded.status != "proposed" or (loaded.entry.provenance or {}).get("template") != template:
+            continue
+        if loaded.entry.selector("service") == ([cluster.service] if cluster.service else None) and loaded.entry.selector("level") == ([cluster.level] if cluster.level else None):
+            return loaded.entry.id
+    return None
 
 
 def _rank(cluster: Cluster) -> tuple[int, int]:
@@ -143,6 +157,8 @@ def learn(
     now: datetime | None = None,
     miner: MinerConfig | None = None,
     estimate_usd: Callable[[CallEstimate], float] | None = None,
+    stop: Callable[[], bool] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> LearnReport:
     """One loop. ``load`` (re)loads the compiled library from disk; ``proposer.propose(payload,
     meter)`` returns a ``PatternProposalReply``; ``meter`` is the ``LearnerMeter`` (run + day caps)."""
@@ -195,12 +211,23 @@ def learn(
     outcomes: list[ClusterOutcome] = []
     pending = []  # passing entries not (yet) approved: dry-run passes and proposals
     stopped: str | None = None
+    paused = False
+
+    def emit() -> None:  # the report so far (real-run fix: a stopped run keeps its report)
+        if progress is not None:
+            progress({"mode": mode, "partial": True, "clusters": [o.to_dict() for o in outcomes], "stopped": stopped, "paused": paused})
+
     for cluster in ranked:
+        emit()
         cluster_id = cluster.id
         members = [i for i in membership.get(cluster.seq, []) if i in queue]
         sent = members[: settings.max_lines_per_cluster]
         outcome = ClusterOutcome(cluster_id, cluster.size, cluster.service, cluster.level, "would_send", sent_lines=list(sent))
         outcomes.append(outcome)
+        waiting = pending_for(compiled.library, cluster)
+        if waiting is not None:  # real-run fix: no new call for a template already waiting for review
+            outcome.outcome, outcome.entry_id, outcome.reason = "pending_proposal", waiting, "a proposal for this template waits for review"
+            continue
         supplied = {i: queue[i][1] for i in sent}
         prompt_lines = [PromptLine(i, pseudo.text(supplied[i])) for i in sent]
         attributes = pseudo.attributes({k: v for k, v in (("service", cluster.service), ("level", cluster.level)) if v})
@@ -210,6 +237,10 @@ def learn(
             estimate = CallEstimate.of(outcome.prompt_chars, role.max_tokens)
             outcome.estimate_usd = estimate_usd(estimate) if estimate_usd is not None else None
             continue
+        if stop is not None and stop():  # a clean stop between calls (stop file or SIGTERM)
+            outcome.outcome, outcome.reason = "not_sent", "stop requested"
+            paused = True
+            break
         try:
             reply = proposer.propose(payload, meter)
         except BudgetExhausted as exc:
@@ -278,6 +309,7 @@ def learn(
         },
         stopped=stopped,
         spend=meter.summary() if meter is not None and not dry_run else None,
+        paused=paused,
     )
     if commit and any(report.written().values()):
         written = report.written()
@@ -300,7 +332,31 @@ class LearningSession:
     meter: Any = None
     estimate_usd: Callable[[CallEstimate], float] | None = None
 
-    def run(self, lines: Sequence[Any], *, mode: Mode = "learn", dry_run: bool = False, now: datetime | None = None) -> LearnReport:
+    stop_file: Path | None = None
+
+    def stop_requested(self) -> bool:
+        return self._term or (self.stop_file is not None and Path(self.stop_file).exists())
+
+    _term: bool = False
+
+    def run(
+        self, lines: Sequence[Any], *, mode: Mode = "learn", dry_run: bool = False, now: datetime | None = None, progress: Callable[[dict[str, Any]], None] | None = None
+    ) -> LearnReport:
+        """One loop. SIGTERM (main thread) or the stop file stops it cleanly between calls."""
+        import signal
+        import threading
+
+        previous = None
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_term", True))
+        try:
+            return self._run(lines, mode=mode, dry_run=dry_run, now=now, progress=progress)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
+            self._term = False
+
+    def _run(self, lines: Sequence[Any], *, mode: Mode, dry_run: bool, now: datetime | None, progress: Callable[[dict[str, Any]], None] | None) -> LearnReport:
         redacted = [line if isinstance(line, RedactedLine) else self.redactor.redact(line) for line in lines]
         return learn(
             redacted,
@@ -315,6 +371,8 @@ class LearningSession:
             dry_run=dry_run,
             now=now,
             estimate_usd=self.estimate_usd,
+            stop=self.stop_requested,
+            progress=progress,
         )
 
 
@@ -354,6 +412,7 @@ def session_from_config(config: Any, *, dry_run: bool = False, max_usd: float | 
         return PatternExtractor(ref, support).load()
 
     session = LearningSession(load, ref, settings, egress, role, redactor, estimate_usd=estimate)
+    session.stop_file = settings.stop_file or Path(ref.path) / ".learn.stop"
     if dry_run:
         return session
     ledger = DaySpendLedger(

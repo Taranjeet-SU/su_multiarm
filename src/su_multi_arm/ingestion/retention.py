@@ -1,6 +1,11 @@
 """Retention across every store (addendum A1 §3.8.3–3.8.4; slice L3b).
 
-**Rule (a).** A partition older than ``keep_days`` expires. ``gc`` deletes **every** non-active
+**Window.** ``as_of`` is the calendar day the run happens on ("today" in ``logs.timezone``).
+``keep_days: N`` keeps the N most recent **complete** days, ``as_of - N`` through ``as_of - 1``
+(``logs_compose.expiry_cutoff``); a partition with an older key expires. With ``keep_days: 10`` the
+run on day 12 deletes day 1, and 10 days (2–11) remain.
+
+**Rule (a).** A partition older than the window expires. ``gc`` deletes **every** non-active
 generation whose ``logs.partitions`` lists an expired day, whatever ``keep_generations`` says;
 ``keep_generations`` (the active one included) only bounds how many in-window generations stay for
 rollback, so a rollback can never resurrect expired data. The active generation never lists an
@@ -49,7 +54,7 @@ from typing import Any, Callable
 from ..backends import extras
 from ..core.errors import BackendError, ConfigError
 from ..core.types import Page
-from .logs_compose import cutoff
+from .logs_compose import derived_keys, expire_derived, expiry_cutoff
 from .partitions import FilePartitionStore, line_hash, source_id_hash
 from .pins import GenerationPinned, pin_registry
 from .release import generation_id
@@ -86,6 +91,9 @@ class Retention:
         self.sleep = sleep or time.sleep
         self.registry = write_path.registry
         self.pins = pins if pins is not None else pin_registry(self.registry)
+        from .raw_reparse import open_raw
+
+        self.raw: Any = open_raw(config)  # listing, expiry and mode checks only
         self.ledger = self.backends[config.storage.ledger].ledger
         if not isinstance(self.ledger, extras.LedgerRetention):
             raise ConfigError(f"the ledger on {config.storage.ledger!r} has no retention operations (tags, refs, purge)", "storage.ledger")
@@ -102,23 +110,40 @@ class Retention:
                 out[generation] = manifest
         return out
 
+    def cutoffs(self, as_of: date) -> dict[str, str | None]:
+        """The oldest key kept per data class on calendar day ``as_of`` (``None``: kept forever)."""
+        retention = self.logs.retention
+        span = retention.derived_days()
+        return {
+            "partitions": expiry_cutoff(as_of, retention.keep_days),
+            "derived": None if span is None else expiry_cutoff(as_of, span),
+            "raw": expiry_cutoff(as_of, retention.raw_days) if self.raw is not None else None,
+        }
+
     def plan(self, as_of: date) -> dict[str, Any]:
         """What ``run`` would delete (no side effects)."""
-        oldest = cutoff(as_of, self.logs.retention.keep_days)
+        oldest = expiry_cutoff(as_of, self.logs.retention.keep_days)
+        cuts = self.cutoffs(as_of)
+        derived_cut = cuts["derived"]
         active = self.registry.current()
         active_id = None if active is None else active["generation"]
         expired_keys = sorted(k for k in self.store.keys() if k < oldest)
         generations = self.log_generations()
         if active_id in generations and any(p["key"] < oldest for p in generations[active_id]["logs"]["partitions"]):
             raise ConfigError(f"the active generation {active_id} still lists a day before {oldest}; compose the window first (expiry is skipped)", "logs")
+        if derived_cut is not None and active_id in generations and any(d["key"] < derived_cut for d in generations[active_id]["logs"].get("derived", [])):
+            raise ConfigError(f"the active generation {active_id} still lists a derived day before {derived_cut}; compose first (expiry is skipped)", "logs")
         doomed, kept = [], []
         in_window = []
         for generation, manifest in generations.items():
             if generation == active_id:
                 continue
             keys = [p["key"] for p in manifest["logs"]["partitions"]]
+            derived = [d["key"] for d in manifest["logs"].get("derived", [])]
             if any(k < oldest for k in keys):
                 doomed.append({"generation": generation, "reason": "lists_expired_partition"})
+            elif derived_cut is not None and any(k < derived_cut for k in derived):
+                doomed.append({"generation": generation, "reason": "lists_expired_derived"})
             else:
                 in_window.append((manifest["logs"].get("as_of", ""), manifest["logs"].get("composed_at", ""), generation))
         room = max(0, self.logs.retention.keep_generations - (1 if active_id else 0))
@@ -128,7 +153,18 @@ class Retention:
                 room -= 1
             else:
                 doomed.append({"generation": generation, "reason": "beyond_keep_generations"})
-        return {"cutoff": oldest, "active": active_id, "expired_partitions": expired_keys, "delete_generations": doomed, "keep_generations": kept}
+        expired_derived = [k for k in derived_keys(self.store) if (derived_cut is not None and k < derived_cut)]
+        expired_raw = [k for k in self.raw.keys() if k < cuts["raw"]] if self.raw is not None else []
+        return {
+            "cutoff": oldest,
+            "cutoffs": cuts,
+            "active": active_id,
+            "expired_partitions": expired_keys,
+            "expired_derived": expired_derived,
+            "expired_raw": expired_raw,
+            "delete_generations": doomed,
+            "keep_generations": kept,
+        }
 
     # --- run -----------------------------------------------------------------------------------
 
@@ -169,6 +205,10 @@ class Retention:
                 continue
             tombstones.append(self.store.expire(key, self.logs.retention.verify_sample, keep).model_dump(mode="json", exclude={"verify_sample", "verify_source_ids"}))
         report["expired_partitions"] = tombstones
+        report["expired_derived"] = [] if blocked else [k for k in plan["expired_derived"] if expire_derived(self.store, k)]
+        # raw copies are referenced by no generation: they go on their own (shorter) clock
+        report["expired_raw"] = [k for k in plan["expired_raw"] if self.raw.expire(k)] if self.raw is not None else []
+        report["cutoffs"] = plan["cutoffs"]
         report["sessions"] = self._expire_sessions()
         report["not_applicable"] = {"proposals": "learning loop (L4b) not present", "trace_exports": "the package writes no trace files"}
         if blocked:
@@ -235,7 +275,12 @@ class Retention:
                 {"generation": g, "active": g == plan["active"], "days": [p["key"] for p in m["logs"]["partitions"]], "ledger_refs": m.get("ledger_refs_count")}
                 for g, m in sorted(generations.items(), key=lambda item: item[1]["logs"].get("as_of", ""))
             ],
-            "next_run": {"expire": plan["expired_partitions"], "delete_generations": plan["delete_generations"]},
+            "next_run": {"expire": plan["expired_partitions"], "expire_derived": plan["expired_derived"], "expire_raw": plan["expired_raw"], "delete_generations": plan["delete_generations"]},
+            "scopes": {
+                "partitions": {"keep_days": self.logs.retention.keep_days, "cutoff": plan["cutoffs"]["partitions"]},
+                "derived": {"scope": self.logs.retention.derived, "cutoff": plan["cutoffs"]["derived"], "days": derived_keys(self.store), "note": "masked exemplar lines in derived days are kept as long as the derived scope"},
+                "raw": None if self.raw is None else {"raw_days": self.logs.retention.raw_days, "cutoff": plan["cutoffs"]["raw"], **self.raw.report(), "note": "unredacted source documents"},
+            },
             "retained_beyond_window": self._o7(),
         }
 
@@ -260,10 +305,25 @@ class Retention:
     # --- verify --------------------------------------------------------------------------------
 
     def verify(self, as_of: date) -> dict[str, Any]:
-        oldest = cutoff(as_of, self.logs.retention.keep_days)
+        oldest = expiry_cutoff(as_of, self.logs.retention.keep_days)
+        cuts = self.cutoffs(as_of)
         problems: list[str] = []
         checks: dict[str, Any] = {}
-        tombstones = [t for t in self.store.tombstones() if t.key < oldest]
+        # Days whose partition expired but whose derived data the derived scope keeps: their masked
+        # lines (exemplars) are retained by configuration, reported, not counted as leaks.
+        retained = {t.key for t in self.store.tombstones() if t.key < oldest and (cuts["derived"] is None or t.key >= cuts["derived"])}
+        tombstones = [t for t in self.store.tombstones() if t.key < oldest and t.key not in retained]
+        checks["retained_derived_days"] = sorted(retained)
+        if cuts["derived"] is not None:
+            stale = [k for k in derived_keys(self.store) if k < cuts["derived"]]
+            if stale:
+                problems.append(f"derived snapshots {stale} are older than the derived cutoff {cuts['derived']}")
+        if self.raw is not None:
+            stale_raw = [k for k in self.raw.keys() if k < cuts["raw"]]
+            if stale_raw:
+                problems.append(f"raw copies {stale_raw} are older than the raw cutoff {cuts['raw']}")
+            problems.extend(f"raw store: {p}" for p in self.raw.mode_problems())
+            checks["raw"] = {"days": self.raw.keys(), "cutoff": cuts["raw"]}
         expired_keys = {t.key for t in tombstones}
         # 1. manifests and partitions
         generations = self.log_generations()
@@ -271,6 +331,10 @@ class Retention:
             old = sorted(p["key"] for p in manifest["logs"]["partitions"] if p["key"] < oldest)
             if old:
                 problems.append(f"generation {generation} still lists expired days {old}")
+            if cuts["derived"] is not None:
+                old_derived = sorted(d["key"] for d in manifest["logs"].get("derived", []) if d["key"] < cuts["derived"])
+                if old_derived:
+                    problems.append(f"generation {generation} still lists expired derived days {old_derived}")
         live_old = [k for k in self.store.keys() if k < oldest]
         if live_old:
             problems.append(f"partitions {live_old} are older than the cutoff {oldest} and not expired")
@@ -349,7 +413,7 @@ class Retention:
         if leaks:
             problems.append(f"manifests, audit records or run reports hold log-line text ({leaks[0]})")
         checks["content_free"] = {"documents_checked": len(manifests), "hits": len(leaks)}
-        return {"ok": not problems, "cutoff": oldest, "problems": problems, "checks": checks, "retained_beyond_window": {"decision": "O7", "reported_by": "retention report"}}
+        return {"ok": not problems, "cutoff": oldest, "cutoffs": cuts, "problems": problems, "checks": checks, "retained_beyond_window": {"decision": "O7", "reported_by": "retention report"}}
 
     def _cache_leftovers(self) -> list[str]:
         """Invalidate the prefix of every audited (deleted) generation again: removing anything means

@@ -6,11 +6,12 @@ A ``PrincipalResolver`` turns request headers into a ``runtime.acl.Principal`` o
 * ``LocalResolver`` — no credentials; for a loopback bind only (the CLI and ``serving.http``
   validation refuse a non-local bind without auth). The principal is ``anonymous`` (the same
   identity the CLI and the Python API use, so sessions created there are usable here) with the
-  ``search``, ``answer`` and ``tools`` scopes; no ``actions`` scope.
+  ``search``, ``answer``, ``tools`` and ``inspect`` (read-only inspect routes, addendum A2 §4.3)
+  scopes; no ``actions`` scope.
 * ``BearerTokenResolver`` — one shared token read from the environment variable named by
   ``serving.http.token_env`` (or ``serve --token-env``); the scheme is case-insensitive and the
   token is compared in constant time. The principal is ``bearer`` with ``search``, ``answer``,
-  ``tools`` and ``actions`` scopes (an action still needs ``serving.actions.allow``).
+  ``tools``, ``actions`` and ``inspect`` scopes (an action still needs ``serving.actions.allow``).
 
 OAuth2, OIDC, mTLS or per-client API keys are **outside the core**: implement ``resolve(headers)``
 in your own code and pass it as ``create_app(..., principal_resolver=...)`` /
@@ -25,8 +26,8 @@ from typing import Mapping, Protocol, runtime_checkable
 
 from ..runtime.acl import Principal
 
-LOCAL_PRINCIPAL = Principal(id="anonymous", scopes=["search", "answer", "tools"])
-BEARER_PRINCIPAL = Principal(id="bearer", scopes=["search", "answer", "tools", "actions"])
+LOCAL_PRINCIPAL = Principal(id="anonymous", scopes=["search", "answer", "tools", "inspect"])
+BEARER_PRINCIPAL = Principal(id="bearer", scopes=["search", "answer", "tools", "actions", "inspect"])
 
 
 class Unauthenticated(Exception):

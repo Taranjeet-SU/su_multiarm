@@ -527,6 +527,57 @@ same rules. IDs, URLs and unselected metadata are preserved. This is not full PI
 add broad digit/identifier rules that destroy error codes, tax rates, county IDs or technical field
 names. Review redacted samples and the manifest's counts. Patterns themselves are trusted config.
 
+### Safe redaction engine (`privacy.engine: safe`)
+
+```yaml
+privacy:
+  engine: safe                       # legacy (default): redact_emails + patterns with Python re
+  regex_engine: re2                  # re2 (extra `patterns`) or regex (development; per-call timeout)
+  redactors: [email, ipv4, ipv6, bearer_token, jwt, api_key, aws_key, url_credentials, uuid, request_id,
+              llm_text, content, query, tracking_id, record_payload, pg_row]
+  actions: {query: hash}             # per built-in: mask (default) or hash
+  record_fields_allow: [city]        # record_payload: drop names from the built-in entity field list
+  # record_fields: [customer_ref]    # ... or replace the list
+  custom:                            # user redactors, validated like library patterns
+    - {name: ticket, regex: '\bTKT-[0-9]{4,8}\b', action: hash}
+  hash_key_env: SU_REDACT_KEY        # optional key of the hash action (keyed sha256)
+```
+
+Every redactor, built-in or user, must be in the RE2 subset and pass the pattern library's ReDoS
+lint; a pattern that does not is a configuration error at load. The configured engine runs them;
+a missing engine is a typed error and a `regex`-engine timeout fails the redaction (the text is
+refused, never passed through). Built-ins run in a fixed order, then `custom`, then the legacy
+`patterns` (as case-insensitive masks).
+
+| Redactor | Replaces | With |
+|---|---|---|
+| `email`, `ipv4`, `ipv6`, `jwt`, `aws_key`, `hex_secret` (opt-in, flags hashes) | the shape | `[REDACTED_<NAME>]` |
+| `bearer_token`, `api_key` (`api_key=`, `password:`, `token=`, `sk-…`, `ghp_…`, `xoxb-…`), `url_credentials`, `query_values` | the value (the key and the URL scheme stay) | `[REDACTED_<NAME>]` |
+| `uuid`, `request_id` | the id | `[UUID:<hash>]`, `[REQUEST_ID:<hash>]` |
+| `llm_text` | `prompt=`, `completion=` … values (to the end of the line when unquoted) and JSON `messages`, `content`, `prompt`, `completion`, `choices` values | `<llm_text>` |
+| `content` | retrieved documents: JSON `_source`, `body`, `passage`, `snippet`, `page_content`, `highlight` … values (whole objects), `passage:` lines | `<content>` |
+| `query` | end-user query and spell-check words: `q=`, `query=`, `search_term=`, `didyoumean=`, `suggestion=` … | `<query>`, or a hash with `actions: {query: hash}` |
+| `tracking_id` | `Cookie:`/`Set-Cookie:` header values (to the end of the line), `_ga`, `sessionid`, `visitor_id`, `device_id` … | `[TRACKING_ID:<hash>]` |
+| `record_payload` | values of named JSON fields of structured records (names, tax ids, addresses, contact data; objects and arrays whole) | `<record>` |
+| `pg_row` | PostgreSQL row data: `Key (cols)=(values)`, `Failing row contains (values)`, logged parameters `$1 = '…'` | `<value>` (column names stay) |
+
+Quoted values are replaced inside their quotes, so JSON stays parseable. Redaction is idempotent:
+a token or marker is never redacted again. `<hash>` is 12 hex digits of a sha256 of the value
+(keyed with `hash_key_env` when set). Under `engine: safe` the same redactor runs on ingested
+documents (title, fields, `metadata_fields`), on log records before any partition write (message,
+stack, string `extra` values) and on every prompt line of the pattern learner. The redaction recipe
+has a stamp (`safe:<sha16>`) recorded in partition manifests with replacement counts per redactor;
+the learner's egress policy admits only lines with the current stamp. The new keys are omitted from
+the index fingerprint while they hold their defaults; changing the redaction changes the index
+identity. `engine: safe` has no schema_version 1 equivalent.
+
+**Leak scan.** `su-multi-arm --config c.yaml privacy scan PATH… [--redactors a,b] [--max-findings N]
+[--output report.json]` scans text files, `.gz` files and SQLite databases (every text column) with
+the configured safe redactors (or the named ones, or every built-in under `engine: legacy`) and
+exits 1 on any hit. The report lists path, location (line, or `table.column#rowid`) and redactor per
+finding, never the matched text. Known false positives: `api_key` flags the lease `"token"` in
+generation manifests, and `hex_secret` flags the package's own sha ids.
+
 ## Extraction and communities
 
 `extraction.extractors` combines `pattern`, `gazetteer`, `regex`, `spacy`, `gliner`, `llm` (v1 names
@@ -635,9 +686,14 @@ patterns:
     examples: {positive: ["db-client failed to connect redis after 30 ms"], negative: ["db-client connected to redis"]}
 ```
 
-**Stages per line.** `format` (first match by priority, then id) hands its `then` group to `message`
-(first match sets the signature). Every matching `annotate` pattern adds entities. Without a message
-match, a `noise` pattern marks the line benign. The resulting status is one of `parsed`, `noise`,
+**Stages per line**, in this fixed order (priority orders entries within a stage, never across
+kinds): `format` (first match by priority, then id) hands its `then` group to the next stages; a
+`noise` entry with `precedence: before_message` that matches marks the line benign and ends matching
+(no message, no annotations: health checks and heartbeats that a broad message pattern would
+otherwise sign); `message` (first match sets the signature); every matching `annotate` pattern adds
+entities; without a message match, a `noise` entry with the default precedence (`after_message`)
+marks the line benign. `precedence` is valid on `noise` entries only, and an unset value leaves the
+library identity unchanged. The resulting status is one of `parsed`, `noise`,
 `format_only`, `unparsed` or `timeout`; multiline assembly assigns `fragment` upstream. Coverage is
 `(parsed + noise) / (lines - fragments)`.
 
@@ -747,6 +803,14 @@ afterwards, with the author `system:pattern_learner` (or `system:cli` for human 
 
 **CLI.** `su-multi-arm --config c.yaml patterns lint` prints statuses, provenance and issues.
 `patterns coverage --input lines.txt [--attr service=x --attr level=error]` prints line status counts.
+`coverage` and `mine` measure what ingest measures: each input line (or JSONL row) is one log
+document, joined by the multiline rules of the configured source (`--source`, default the only one)
+plus the library's `continuation` entries; continuation lines join their head, head-less ones are
+`fragment`s (reported, excluded from the coverage target, never mined). A JSONL row may carry
+`ts` (ISO 8601 with offset) and `container`/`file` attributes, which order the rows and separate the
+streams; a `text` with embedded newlines is one record whose first line is the head.
+`--no-multiline` matches every line as a head. `patterns lint` prints every issue (also as
+structured `issue_rows`) and exits 1 when the library has errors.
 `patterns mine --input lines.txt` runs the deterministic template miner and synthesiser and prints the
 proposals (status `proposed`) with coverage before and after. These three write nothing. `--input` may
 also be a `.jsonl` file of `{"id", "text", "attributes"}` objects. The learning commands
@@ -853,6 +917,125 @@ passages with valid document IDs, chunk IDs and verbatim quotes. Reports expose 
 partial status when their input budget excludes evidence. These checks validate references, not every
 semantic inference. Hierarchical/global map-reduce reporting is not implemented.
 
+### LLM fallback extraction and accounted coverage (`learning.extraction`, `logs.accounting`)
+
+**Preview (addendum A2 rev 2–4, slices C1–C4).** Evidence so far: synthetic data and mocked
+providers only. The fallback runs **after** a day partition is sealed. It handles the heads the
+pattern library could not parse (residue) and the heads an approved pattern matched without a
+required field (field gaps). Its result is an **overlay** next to the sealed version; the sealed
+partition itself is never changed.
+
+```yaml
+logs:
+  accounting:
+    required_fields: {http: [status_code, endpoint, latency_ms]}   # per signature category
+    validators:                                                    # range_invalid when violated
+      status_code: {min: 100, max: 599}
+      endpoint: {regex: '^/'}
+    targets: {deterministic: 0.90, extracted: 0.99, info_tier: 0.80, core_services: []}
+learning:
+  patterns: {spend_ledger: state/spend.sqlite, max_calls_per_day: 150}   # cluster calls run here
+  extraction:
+    enabled: true
+    fields: {status_code: integer, endpoint: string, latency_ms: integer, dependency: string}
+    template: {max_clusters_per_day: 150, min_support: 3, max_lines_per_prompt: 8, write_proposals: true}
+    fill: {enabled: true, max_per_day: 200}
+    lines: {enabled: false, max_per_day: 200, batch_size: 8, max_line_chars: 2000}
+    grounding: {levels: [exact, normalised]}       # relocated is refused; no fuzzy matching
+    egress: {allow_hosted: false, max_refused_share: 0.01, pseudonymise: [tenant, host]}
+    budget: {max_usd_per_day: null, max_usd_per_run: null, max_calls_per_day: 400}
+    stop_file: null                                # default <ledger dir>/.fallback.stop
+models:
+  routes:                                          # ordered; empty = models.roles.<role> alone
+    pattern_learner:
+      - {name: local_a, role: {provider: openai_compatible, model: local-model, base_url: http://127.0.0.1:8000/v1}}
+      - {name: local_b, role: {provider: openai_compatible, model: local-model, base_url: http://gpu.localhost:8000/v1},
+         capacity_url: http://gpu.localhost:8000/capacity}
+      - {name: paid, role: {provider: anthropic, model: <model id>, api_key_env: ANTHROPIC_API_KEY}}
+    log_extractor:
+      - {name: local_a, role: {provider: openai_compatible, model: local-model, base_url: http://127.0.0.1:8000/v1}}
+    allow_paid_fallback: false                     # a paid route after a local one is used only when true
+budgets:
+  price_table: prices.yaml
+  providers: {anthropic: {max_usd_total: 2.00}}    # lifetime cap per provider key (persistent ledger)
+```
+
+- **Final status per head.** One of `parsed`, `parsed_filled`, `provisional`, `model_line`,
+  `noise` or `unresolved` with one reason: `format_only`, `no_cluster`, `budget_deferred`,
+  `below_rank`, `model_declined`, `gate_failed`, `grounding_failed`, `type_invalid`,
+  `range_invalid`, `egress_refused`, `timeout`, `truncated_unmatched`, `fallback_pending`,
+  `capacity_deferred`, `not_attempted`, `field_gap` or `provider_error`. With the fallback enabled,
+  residue heads are sealed `fallback_pending` until their overlay exists.
+- **Accounting.** The counting unit is the source document. The seal is refused
+  (`AccountingImbalance`) when the documents the puller handed over differ from the per-stratum
+  fetched counts (Q), from `malformed + heads + joined + fragments + overflow` (D), or when the heads
+  differ from the sum of final statuses (H). `rest` is derived in this release, so identity S is
+  reported, not enforced. Units stored before this release report `recorded: false`.
+- **Cluster first.** One `pattern_learner` call per residue cluster labels the synthesised
+  regex's groups (`v1…`, `<mask>1…`) or proposes a regex. Either goes through the full gate on the
+  current lines, and values are group spans. Per-line calls (`log_extractor`) return quotes that must
+  be located in their own line, or the field is dropped. A model value never overwrites a pattern
+  value.
+- **Spend.** Local (loopback) routes record calls and tokens at USD 0, and USD caps apply to paid
+  routes only. A paid route is refused at load unless `budgets.price_table`,
+  `budgets.providers.<provider>.max_usd_total` and finite daily and run USD caps for its scope are
+  all set. Reaching any cap stops the calls (`budget_deferred`); there is no fallback to another
+  provider. A route that fails its health or capacity probe is skipped. With no route available,
+  items are `capacity_deferred` and the next run retries them.
+- **Reply cache.** Replies are keyed by template sha (or line sha), service, level, provider, model,
+  prompt version and schema version. A hit reuses only labels, regex and quotes; the gate and the
+  grounding run again on the current lines. Replies tagged only with expired partitions are purged.
+- **Stop.** Creating the stop file, or sending SIGTERM, stops the run between calls. The rest is
+  `capacity_deferred` and the run state is `paused`.
+- **Coverage.** `su-multi-arm logs coverage --date D [--from D0]` prints the regex-only and
+  with-model numbers side by side, per service and tier, with fragment accounting and the owner
+  targets. It exits 1 when a day is open (for example a refused seal) or an identity fails.
+
+**Route tiers, windows and limits (rev 4).** Each `models.routes.<role>[]` entry can declare:
+
+- `tier`: `local` (must be loopback), `lan` (a self-hosted `openai_compatible` server on the
+  private network, which needs `egress.allow_lan: true`) or `paid`. When unset, the tier is `local`
+  for a loopback role and `paid` otherwise.
+- `windows`: a list of UTC `HH:MM-HH:MM` windows (a window may wrap midnight). Outside every
+  window the route is skipped (`outside_window`).
+- `max_invalid_replies`: default 3. After that many schema violations in a run the route is marked
+  down and later items go to the next route.
+
+`local` and `lan` calls record calls and tokens at USD 0. Every paid route is refused at load unless
+the provider has a finite `max_usd_total` and every scope that can reach it (`learning.patterns`,
+`learning.extraction`, `learning.bootstrap` when enabled) has finite daily caps.
+
+```yaml
+learning:
+  bootstrap:                       # off by default
+    enabled: false
+    require_measured_throughput: true   # refuse to start without `patterns measure-throughput`
+    days: 3
+    max_clusters_per_day: 150       # bounded further by measured calls/hour x hours_per_day
+    hours_per_day: 8
+    max_usd_per_day: null           # required (finite) when a paid pattern_learner route exists
+serving:
+  answers:                          # answer-time spend scope, off by default
+    enabled: false
+    max_usd_per_day: null           # required when a paid answer role's provider has a lifetime cap
+    max_calls_per_day: 10000
+```
+
+- **Bootstrap** sends cluster calls to self-hosted routes only; paid routes report
+  `bootstrap_self_hosted_only`. The cap counts only clusters that need a model call: a cluster with a
+  pending proposal or a cached reply never takes a slot.
+- **`su-multi-arm patterns measure-throughput --tier local|lan|paid --clusters 50 --date D`** makes
+  real calls on one tier over the residue of a sealed day, under every cap and the egress policy. It
+  records calls/hour and tokens/s in `throughput.json` next to the spend ledger. The replies go to
+  the reply cache, and nothing is written to the library.
+- **`serving.answers`**: planner, generator, reviewer and community calls reserve on a persistent
+  per-day ledger under scope `serving.answers`, and on `budgets.providers.<provider>.max_usd_total`
+  when the provider has one. A refusal comes before the request.
+- **`patterns learn|propose`** also stops cleanly between calls when
+  `learning.patterns.stop_file` (default `<library>/.learn.stop`) exists or SIGTERM arrives. The run
+  is then `paused` (exit 0). `--output` is rewritten after every cluster, and a template with a
+  pending proposal gets no new call.
+
 ## Requests, filters and context
 
 ```json
@@ -937,7 +1120,10 @@ question qualifier or an invalid request filter makes it `bounded`), `denominato
 population after filters and ACL), `zero_match`, `unsupported` constraints, `filters` (the typed
 request and step filters) and `predicates` (the compiled scope predicates actually counted; the same
 list is in `trace.steps[].predicates`, and the exported trace masks their values). Fields must be declared in
-`metadata_schema` (`id`, `source`, `dataset`, `kind` are always available). Missing/invalid timestamps
+`metadata_schema`. The record keys `id`, `source`, `dataset` and `kind` are always available, as
+request filters and in compiled scopes (string equality; a non-string value is `type_mismatch`).
+Each aggregate also names its `measure` (`{"kind": "count", "of": "records"}`, or e.g.
+`{"kind": "sum", "field": "lines"}` for a grouped sum, whose `operation` stays `group_count`). Missing/invalid timestamps
 are counted; valid timestamp values need an explicit timezone. A natural-language keyword does not
 secretly filter records. Unsupported filters/count scopes need clarification in the application.
 
@@ -1498,15 +1684,19 @@ sources:
     index_name:                        # [<prefix>-][<deployment>-]<tenant>-<env>-<service>-<YYYY.MM.DD>
       separator: "-"
       date_format: "%Y.%m.%d"
-      prefix: null                     # optional literal every name starts with (e.g. logs)
+      prefix: null                     # optional literal every name starts with (e.g. logs); stripped
       deployment_prefixes: [search-admin, os-data-{n}]   # optional, longest first; {n} = digits
+      deployment_position: leading     # or before_service: <tenant>-<env>-<deployment>-<service>;
+                                       # or after_env: env-anchored, the deployment is anything between
+                                       # the env (vocabulary) and the service (vocabulary)
+      unparsed: include                # or exclude: not a unit, counted as excluded_scope.unparsed_name
       prefix_fields: [tenant, env]     # one token each unless the field has a vocabulary
       vocabularies:                    # service and any prefix field; literal names, '_' allowed
         service: [ingest-worker, query-gateway, gateway, scheduler, slack_bot]
     counts:
       errors: {levels: [ERROR, FATAL], tokens: [error, fatal]}
     multiline:
-      continuation: [java_frame, python_frame, traceback_header, caused_by, ellipsis_more]
+      continuation: [java_frame, python_frame, traceback_header, python_traceback, caused_by, ellipsis_more, closing_bracket]
       max_gap_ms: 2000
       max_lines: 200
       max_bytes: 16384
@@ -1525,6 +1715,7 @@ sources:
       max_restarts: 1                  # an expired cursor restarts its stratum at most this often
     limits: {requests_per_second: 2, timeout_seconds: 30, max_response_bytes: 67108864, max_context_per_partition: 200}
     max_line_bytes: 8192
+    disallow: []                       # request families this deployment forbids: [pit]
 ```
 
 **What the source may send.** Every request is checked against an exact allow-list before any
@@ -1543,6 +1734,7 @@ nothing is sent. Further rules:
 - `DELETE` may only close a scroll or PIT that this source opened and that the cursor lists, and
   never `_all`.
 - Redirects are not followed, and there are no retries.
+- `disallow: [pit]` removes the PIT rows for this source: such a request is refused before any I/O.
 
 **Self-check.** `sources check` asks `_security/user/_has_privileges` whether the account holds
 `write`, `delete`, `index` or `manage` on the configured patterns, or `cluster:all`. A granted
@@ -1558,7 +1750,12 @@ right:
 2. the optional literal `prefix`, which every name must then start with;
 3. the optional deployment prefix: the longest entry of `deployment_prefixes` that matches, where
    `{n}` stands for digits (`os-data-{n}` matches `os-data-1-…`). It is recorded as the
-   `deployment` attribute, or `none` when the name has no deployment prefix;
+   `deployment` attribute, or `none` when the name has no deployment prefix. With
+   `deployment_position: leading` (default) it follows the literal prefix; with `before_service` it
+   sits between the prefix fields and the service (`logs-acme-prod-ops-admin-kafka-…` reads tenant
+   `acme`, env `prod`, deployment `ops-admin`, service `kafka`). Under `before_service` every
+   service vocabulary entry that ends the name is tried, and a name that fits more than one way is
+   `ambiguous`;
 4. the `service` segment at the end, and the `prefix_fields` segments in order. A segment with a
    vocabulary takes the longest entry that fits (`query-gateway` before `gateway`). A segment
    without one is exactly one token without the separator, so `slack_bot` is one token under `-`.
@@ -1591,9 +1788,20 @@ folded into the tenant.
 request is made. They never appear in a config value, an error, a request record or a report. The
 HTTP client ignores proxy environment variables.
 
-**Not in this release.** Redaction of pulled lines (`LogMapping` accepts an injected redactor and
-reports `redaction: none` without one). PIT-based pulls (PIT is probed only). Sliced scroll.
-Data-stream backing indices (skipped with a diagnostic). User-defined continuation patterns.
+**Multiline.** A continuation document joins the open head of the same `(container, file)` within
+`max_gap_ms`; a head-less one is a `fragment` (counted, sampled, excluded from coverage). Rules:
+`java_frame`, `python_frame` (indented or column 0), `traceback_header`, `caused_by`,
+`ellipsis_more`, `indented` (opt-in), `closing_bracket` (a line of only `}`, `]`, `)`, `});`, `},`)
+and `python_traceback`. The last is contextual: the chained-exception lines always continue, and
+inside an open traceback the source line after a frame, the `^~~~` marker lines and the final
+`SomeError: message` line continue too; outside a traceback such a line stays a head, so a lone
+`ValueError: …` log line is never hidden as a fragment. The approved `continuation` entries of the
+pattern library are applied in addition wherever the library is loaded (log pulls and `patterns
+coverage|mine`); they take no `applies_to` selectors. A library change does not re-join records
+already stored in a partition (reparse re-matches the stored heads).
+
+**Not in this release.** PIT-based pulls (PIT is probed only, on request). Sliced scroll.
+Data-stream backing indices (skipped with a diagnostic).
 
 **CLI.**
 
@@ -1602,15 +1810,23 @@ su-multi-arm --config c.yaml sources check                       # capabilities 
 su-multi-arm --config c.yaml sources discover --date 2026-01-05  # units and parsed attributes
 su-multi-arm --config c.yaml sources count --date 2026-01-05     # per-unit counts and bases
 su-multi-arm --config c.yaml sources probe --date 2026-01-05 --max-units 3 --max-docs 1000 --output probe.json
+su-multi-arm --config c.yaml sources probe --date 2026-01-05 --probe-pit --request-log requests.jsonl
 ```
 
 `probe` puts a bounded load on the cluster and writes an aggregate-only JSON report:
 
 - capabilities and the self-check;
 - per-unit counts and bases, field presence and index-name parse results;
-- PIT and `random_score` support;
+- `random_score` support (`--no-random-score` skips it) and, only with `--probe-pit`, PIT support:
+  the PIT check runs when the server's version supports PIT and `disallow` does not list `pit`
+  (an unknown version, e.g. after a 403 on `GET /`, counts as unsupported); `pit_check` says why it
+  was skipped;
 - scroll throughput on one unit of at most `--max-docs` documents;
 - request timings for each allow-list row.
+
+`--request-log PATH` (every `sources` command) appends one content-free JSON line per request
+(method, allow-list row, path template, status, milliseconds, bytes; never an index name, body or
+host) and a summary row with the number sent. The privilege endpoint is asked once per command.
 
 The report contains no log line or field value. Keep reports outside any repository. `sources`
 never builds an engine. Open cursors are closed on exit, on `SIGTERM` and on `SIGINT`. A context
@@ -1641,10 +1857,13 @@ logs:
   partitions:
     path: ./partitions                 # relative to this file; keep it outside any served directory
     clock: index_date                  # or event_time
+    raw: {enabled: false, path: ./raw-copies, compression: gzip}   # unredacted copies; see "Raw copies"
   parse: {workers: 1, batch_size: 2000, max_exemplars_per_signature: 3, max_unparsed: 2000}
   compose: {signature_hour: false, max_exemplars_per_signature: 3}
   retention:
-    keep_days: 10
+    keep_days: 10                      # (alias partition_days) masked partitions: N complete days
+    raw_days: 3                        # raw copies (only with partitions.raw.enabled); < keep_days
+    derived: window                    # window (default) | forever | <days >= keep_days>
     keep_generations: 2                # the active one included; rule (a) overrides it
     max_pin_wait_seconds: 900
     pin_retry_seconds: 15
@@ -1703,10 +1922,103 @@ without duplicates. A day that is already sealed with the same source query and 
 pulled nor composed again. Compose reparses any partition whose library identity is stale, from its
 retained records, before building.
 
-**Redaction is required.** Nothing is pulled without a redactor: `run-daily`, `backfill` and
-`settle` refuse with `RedactionRequired` before any request. The safe redaction contract (slice
-B11) is not in this release, so the CLI refuses these three commands today; the Python API
-(`LogsPipeline(..., redactor=...)`) accepts an injected redactor.
+**Redaction is required.** Nothing is pulled without a redactor. The CLI uses the safe redactor
+of `privacy.engine: safe` (see "Safe redaction engine"); under `engine: legacy` `run-daily`,
+`backfill` and `settle` refuse with `RedactionRequired` before any request. The Python API
+(`LogsPipeline(..., redactor=...)`) also accepts an injected redactor. The partition manifest
+records the redaction stamp and the replacements per redactor.
+
+**Window.** `keep_days: N` keeps the **N most recent complete days** before today (in
+`logs.timezone`): `today - N` through `today - 1`. Today is not counted. With `keep_days: 10` the
+run on day 12 deletes day 1 and serves days 2–11. `logs run-daily` composes exactly this window
+(ending yesterday), refuses a day older than `today - N`, and runs retention as of today;
+`retention report|verify|run --date D` takes D as "today".
+
+**Retention scopes.** Each data class has its own clock:
+
+| Class | Setting | What |
+|---|---|---|
+| raw copies | `raw_days` | unredacted pulled documents (`partitions.raw`, off by default) |
+| partitions | `keep_days` / `partition_days` | masked records, matches, unparsed queue |
+| derived | `derived` | the composed arm data: day and hour rollups, the signature catalog and its masked exemplar lines, graph nodes and edges, communities, every projection's documents |
+
+`derived: window` (default) is the single-window behaviour: derived data leaves with its
+partition. `derived: forever` keeps every composed day in the serving generation after its
+partition expired; `derived: <days>` keeps that many. Compose keeps a masked derived snapshot of
+each day (`<partitions>/derived/<source>/<day>.json.gz`: aggregates, hourly cells, exemplars) and
+builds every derived day from it; window rollups then cover every derived day. A derived day whose
+partition is gone cannot be reparsed under a new library: it is served as composed, listed under
+`logs.derived` in the manifest with its library identity. A downsampling hook (hourly cells to
+daily for old days) exists in `logs_compose.downsample` and keeps everything today.
+
+**A1 amendment (retention tiers).** Rule (a) of the addendum (a generation that lists an expired
+day is deleted) and the content-based `retention verify` apply to the **masked tier**: the
+partitions and the generations' `logs.partitions` lists. Under `derived: window` that is the whole
+generation, as before. Under `forever` or a day count, the days that only the derived scope keeps are
+listed under `logs.derived` and checked against the derived cutoff instead; their masked lines are
+reported (`retained_derived_days`), not counted as leaks. The raw tier has its own clock and checks.
+
+**Interim derived archive (A2 §4.8.6).** The per-day snapshots under
+`<partitions>/derived/<source>/<day>.json.gz` are the derived archive until the history tier (H1)
+lands, and its import source. Nothing refuses `derived ≠ window`, on any backend.
+
+- A snapshot has `derived_format: 2` and the identity `sha(partition key, version, library identity,
+  partition format, fallback identity, compose format)`. It holds the aggregates, hourly cells,
+  masked exemplars, every other aggregate-level artifact of the partition (typed-value aggregates
+  such as endpoint, exception and coverage data, when the partition format has them), the fallback
+  overlay's rows (`v<n>/fallback/<identity>/`), and a content-free accounting summary; never
+  line-level rows. Missing inputs are `source_unavailable`, never zero. It is rewritten whenever its
+  identity changes while the partition exists (a reparse, a new overlay).
+- Format-1 snapshots (written before the format field) are read and marked `derived_format: 1,
+  legacy: true`; their typed inputs, accounting and overlay are `source_unavailable`.
+- **Serving bound.** Compose serves the masked window plus derived days only within
+  `logs.history.serve_days` (default `keep_days`) and, optionally, `logs.history.max_serve_rows`
+  aggregate rows (the oldest derived days are left out first). Older snapshots stay archived but
+  unserved, so compose cost is bounded by `serve_days`, not by history: each day's documents are
+  cached by snapshot identity and only new or changed days are recomputed.
+- Window rollups (`signature_window`, `signature_tenant_window`, first/last seen) cover the masked
+  window only.
+- When the served days span more than one library identity, the manifest's `logs` section carries
+  `library_identities` and `identity_span` (`the served days span N library identities`) for
+  renderings.
+
+```yaml
+logs:
+  retention: {keep_days: 10, raw_days: 3, derived: forever}
+  history: {serve_days: 30, max_serve_rows: 2000000}
+```
+
+**Privacy note.** With `derived: forever`, masked exemplar lines (up to
+`compose.max_exemplars_per_signature` per signature and day) and the rollups are kept indefinitely;
+`retention verify` lists those days under `retained_derived_days` instead of treating their lines as
+leaks, and `retention report` lists them under `scopes.derived`.
+
+**Raw copies (`logs.partitions.raw`).** Off by default. When enabled, the puller writes every pulled
+unit **unredacted, exactly as the source returned it** to `raw.path` before redaction, so `logs
+reparse --date D --from-raw` can re-run redaction, multiline assembly and parsing without the
+source (for example after adding a redactor). This means raw log text (addresses, tokens, prompts,
+customer content) sits on disk for `raw_days`. Safeguards:
+
+- the directory is mode `0700` and the files `0600`; `retention verify` fails on any other mode
+  (wider or narrower) and on a raw day older than `raw_days`;
+- `raw_days` must be shorter than `keep_days`; `raw.path` must lie outside the partition store, the
+  backends, the pattern library and the served files (the installed package and the web UI
+  bundle), and its parent directory must not be group- or world-writable (`RawLocationUnsafe`);
+- every access goes through `ingestion/raw_reparse.py`, the only importer of the raw store: the
+  puller's write, `logs reparse --from-raw` and the re-derivation below (the only reads),
+  retention's listing and expiry, and the `privacy scan --raw` audit. `schedule.py` and `learning/`
+  never import the raw store; ingest, indexing, compose, egress and serving have no path to it (an
+  import-graph test asserts these rules);
+- **a redaction change re-derives only days still in the raw tier**: when the redaction stamp of the
+  current run differs from a sealed partition's, `run-daily` re-runs redaction and parsing from raw
+  for the days the raw tier still holds (step `rederive`), and lists the others as
+  `stale_redaction`; they keep their old redaction and are never re-pulled silently;
+- `privacy scan` skips the raw path; `privacy scan --raw` audits it on purpose;
+- `retention run` deletes days older than `raw_days`, `retention report` lists them.
+
+`logs reparse --date D` (without `--from-raw`) parses the retained redacted records again under the
+current library. `--from-raw` refuses with `RawUnavailable` when raw copies are disabled or a unit
+is missing; pull the units again with `logs settle`.
 
 **Retention.** When a day leaves the window:
 
@@ -1729,8 +2041,61 @@ hashes every text-bearing row of the remaining generations, the ledger and the l
 against the tombstones. `retention report` lists what is kept, what the next run deletes, and the
 approved pattern examples kept beyond the window (owner decision O7).
 
-**Not in this release.** The pull window (`limits.window`), learning-loop proposals and their
-`expire` records (L4b), co-firing communities and `issue_report` documents (L5).
+**Not in this release.** The pull window (`limits.window`) and learning-loop proposals with their
+`expire` records (L4b). Co-firing communities arrived with the logs analytics profile below
+(`incident` documents replace A1's `issue_report`).
+
+### Logs analytics profile (`profile: logs_example`; addendum A2 §4.1)
+
+The profile overlays the metadata schema, projections, extraction and tools of a daily log
+deployment. The deployment supplies `sources:`, `logs:` (source, partitions path), `backends`,
+`storage` and `extraction.pattern_library.path`; explicit values win over the overlay.
+
+```yaml
+profile: logs_example
+extraction: {pattern_library: {path: ./patterns, engine: re2}}   # log_links: true from the profile
+logs:
+  source: cluster
+  partitions: {path: ./partitions}
+  retention: {keep_days: 10, derived: forever}                    # derived: forever from the profile
+  compose:
+    kinds: {log_day: true, log_hour: true, endpoint_day: true, exception_day: true, coverage_day: true, incident: true}
+    exemplars: per_tenant            # signature documents hold the template; examples per tenant
+    endpoints: {normalise: path_template, max_per_service: 500}
+  communities:
+    co_firing: {min_support_cells: 3, min_lift: 2.0, unit: tenant_env_hour, split_above: 12, seed: 42}
+  intents: {enabled: true, default_window: today}
+  serving: {allow_adhoc_scopes: false}
+serving:
+  mcp: {transports: [stdio, streamable_http], log_tools: true, mount_on_http: false, token_env: null}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `logs.compose.kinds.*` | all `false` (profile: `true`) | the analytics kinds; their typed values come from format-2 partitions (older partitions are reparsed first) |
+| `logs.compose.exemplars` | `signature` (profile: `per_tenant`) | `per_tenant`: no document holds two tenants' lines |
+| `logs.compose.endpoints.max_per_service` | 500 | endpoint templates kept per (day, unit); the rest fold into `__other__` (row `approximate`) |
+| `logs.communities.co_firing` | as above | lift over cells, per tenant; components above `split_above` signatures are split by the deterministic Louvain constructor |
+| `logs.intents.enabled` | `false` | typed log intents for every decision agent, the log tools, and the scope guard; requires the analytics kinds and `exemplars: per_tenant` |
+| `logs.intents.default_window` | `today` | the window when a question or tool call names none |
+| `logs.serving.allow_adhoc_scopes` | `false` | `true` turns the `intent_required` guard off |
+| `extraction.pattern_library.log_links` | `false` | header ontology edges (`emits`, `runs`, `serves`, `raises`, `co_fires_with`); enters the extraction reuse salt |
+| `communities.strategy: declared` | — | one community per `community_id` metadata value (the incidents) |
+| `pipeline.arms.graph.edge_kinds` | `[fact]` | edge kinds the free-text graph mode traverses (`co_firing` only deliberately) |
+| `access.policy` | `none` | `tenant`: `StaticPolicy` on `access.field` with `unrestricted` operator ids; **refused** under the logs profile (single-tenant serving, A2 B4) |
+| `metadata_schema.fields[].role` | — | `exactness` (worst row wins), `basis`, `extraction` (distinct values returned) |
+| `metadata_schema.fields[].additive` | `true` | `false`: sum/avg refused (`measure_unsupported`), e.g. a per-row p95 |
+| `serving.mcp.log_tools` | `true` | the enabled log tools are MCP tools (`readOnlyHint: true`) |
+| `serving.mcp.mount_on_http` | `false` | MCP streamable HTTP at `/mcp` on the HTTP app (needs `streamable_http`; DNS-rebinding protection) |
+| `serving.mcp.token_env` | — | a separate bearer token for the mounted `/mcp` |
+| `logs.history.tier` | `false` (profile: `true`) | H1: day documents in append-only, content-addressed day shards; the generation holds the window shard and the shard refs |
+| `logs.history.backend` | — | a declared backend (records capability, e.g. `opensearch`) for the history rows; default a sqlite file under the partition store |
+
+The profile also declares `count_<query>` and `basis_<query>` fields for every count query of the
+logs source. Tools (`tools.enabled`): `log_top`, `log_new`, `log_affected`, `log_trend`,
+`log_compare`, `log_tenants`, `log_around`, `log_endpoints`, `log_signature`, `log_coverage`,
+`incidents`, `graph_neighbourhood`; each takes its typed input model on `POST /v2/tools/{name}` and
+on MCP, and returns rows, exactness, basis, `source_unavailable` days and a deterministic `rendering`.
 
 ## Serving
 
@@ -1744,16 +2109,41 @@ curl -sN http://127.0.0.1:8099/v2/answer/stream \
   -d '{"query":"exemption certificate"}'
 ```
 
+`serve` binds to `serving.http.bind` (and, under `auth: bearer_env`, takes `serving.http.token_env`)
+unless `--host`, `--port` or `--token-env` override them. The Host allow-list and Origin check
+(`421` for another Host, `403` for a cross-origin write) are active when the UI is enabled, when MCP
+is mounted on the HTTP app, or when `serving.allowed_hosts` is non-empty: an API-only process behind
+a LAN forwarder lists the forwarder's name there. The standalone MCP streamable-HTTP app applies the
+same guard when `allowed_hosts` is set. With a `logs:` section every request
+pins the generation it reads in the cross-process pin registry (`logs.pins`), so retention in
+another process does not delete it mid-request. A 503 logs its cause (exception class, adapter,
+operation; never request content) on the `su_multi_arm.serving` logger, and `/ready` reports
+`not_ready` with the cause when the active generation cannot be served (the same check a request
+makes: fingerprint and every backend pointer).
+
 ```yaml
 serving:
   http: {bind: "127.0.0.1:8099", auth: none, page_size_max: 50}  # auth: bearer_env + token_env off localhost
   mcp: {transports: [stdio, streamable_http]}                    # default [stdio]
   actions: {allow: [invalidate_cache]}                           # remote actions; subset of actions.allow
+  ui:                                                            # web UI at /ui (wheel su-multi-arm-ui)
+    enabled: false                                               # true needs auth: bearer_env or an injected resolver
+    mount: /ui
+    display_timezone: null                                       # IANA name; display only
+    session_storage_token: false                                 # token in sessionStorage (never localStorage/cookie)
+    allow_unauthenticated_loopback: false                        # explicit single-user opt-out (doctor warns)
+  allowed_hosts: []                                              # extra Host names for the allow-list (UI enabled)
 models:
   roles:
     generator: {provider: openai_compatible, model: my-local-model, base_url: "http://127.0.0.1:11434/v1",
                 capabilities: {streaming: true}}               # token deltas only when declared
 ```
+
+`serve` takes host and port from `serving.http.bind` unless `--host`/`--port` are given. With
+`serving.ui.enabled`, every request passes a Host allow-list (`127.0.0.1`, `localhost`, `[::1]`, the
+bind host, `serving.allowed_hosts`; otherwise 421) and a foreign `Origin` on a non-GET route or on the
+answer stream gets 403. Every `/v2/*` response carries `X-Content-Type-Options: nosniff`. The UI, its
+CSP and its views are described in [Serving → Web UI](serving.md#web-ui).
 
 HTTP routes (request bodies are the Python models; `/search` and `/answer` stay as the v1
 compatibility router):

@@ -95,6 +95,9 @@ def test_tracked_files_carry_no_origin_service_names():
         pytest.skip("not a git checkout")
     tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.split()
     this = Path(__file__).resolve().relative_to(ROOT).as_posix()  # carries the denylist itself
-    files = [f for f in tracked if not f.startswith("docs/plans/reviews/") and f != this]
+    # Built UI bundles are minified third-party code (the graph library's own "vertex"/"zoomIn"
+    # identifiers); the UI sources that produce them stay checked.
+    bundled = "ui/python/su_multi_arm_ui/static/assets/"
+    files = [f for f in tracked if not f.startswith(("docs/plans/reviews/", bundled)) and f != this]
     hits = subprocess.run(["grep", "-nIiE", DENYLIST, "--", *files], cwd=ROOT, capture_output=True, text=True)
     assert hits.stdout == "", hits.stdout

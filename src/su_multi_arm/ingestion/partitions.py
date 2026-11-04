@@ -10,6 +10,7 @@ A partition is one day (``YYYY-MM-DD``; what a day means is the partition clock,
     v0001/hourly_cells.json      signature x deployment x hour counts (co-firing substrate, N6)
     v0001/exemplars.json         up to k redacted records per signature
     v0001/unparsed.jsonl.gz      unparsed / format_only records and sampled fragments (redacted)
+    v0001/fallback/<identity>/   LLM fallback overlay derived after the seal (``ingestion/overlay.py``)
     tombstone.json               after ``expire``: content-free, with the verify sample hashes
 
 ``begin`` opens a version (or resumes the open one, only with the same ``source_query_sha``);
@@ -75,6 +76,10 @@ class UnitArtifacts(StrictModel):
     records_query: str | None = None  # the count query that selects the records tier (None: every line)
     records_levels: list[str] = Field(default_factory=list)
     records_basis: Literal["level_field", "token_match"] | None = None
+    # Accounting (A2 review B1): documents the puller handed over and the mapper's malformed count
+    # for this unit. ``None`` on units stored before accounting existed (identities "not recorded").
+    docs_pulled: int | None = None
+    malformed: int | None = None
 
 
 class PartitionManifest(StrictModel):
@@ -82,6 +87,9 @@ class PartitionManifest(StrictModel):
     key: str
     version: int = Field(ge=1)
     status: Literal["open", "sealed"] = "open"
+    # Parse-artefact format (``logs_parse.PARTITION_FORMAT``); manifests written before format 2
+    # carry no key and read as 1. Compose reparses an older format from the retained records.
+    format: int = Field(default=1, ge=1)
     reason: Literal["pull", "reparse", "repull"] = "pull"
     parent_version: int | None = None
     source_query_sha: str
@@ -97,6 +105,8 @@ class PartitionManifest(StrictModel):
     counts: dict[str, int] = Field(default_factory=dict)
     redaction: dict[str, Any] = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)  # name -> sha256
+    # Per-unit accounting and coverage (A2 §4.2.2): the identities are checked before the seal.
+    accounting: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     sealed_at: datetime | None = None
 
@@ -352,6 +362,9 @@ class FilePartitionStore:
         """Write the parse artifacts of the open version and freeze it. ``parsed`` is a
         ``logs_parse.ParsedPartition``."""
         manifest = self._open(key)
+        accounts = list(getattr(parsed, "accounting", None) or [])
+        for account in accounts:
+            account.check()  # AccountingImbalance: nothing is written, the version stays open
         folder = self._vdir(key, manifest.version)
         files = {
             "matches.jsonl.gz": _gz_jsonl(parsed.matches),
@@ -360,6 +373,8 @@ class FilePartitionStore:
             "exemplars.json": json.dumps(parsed.exemplars, sort_keys=True, ensure_ascii=False).encode(),
             "unparsed.jsonl.gz": _gz_jsonl(parsed.unparsed),
         }
+        if getattr(parsed, "patterns", None):  # format 2: library digest for the delta reparse
+            files["patterns.json"] = json.dumps(parsed.patterns, sort_keys=True).encode()
         artifacts = {}
         for name, data in files.items():
             _atomic_write(folder / name, data)
@@ -368,6 +383,11 @@ class FilePartitionStore:
             artifacts[f"units/{unit_id}.json.gz"] = _sha_file(folder / "units" / f"{unit_id}.json.gz")
         manifest.artifacts = artifacts
         manifest.counts = dict(parsed.counts)
+        manifest.format = int(getattr(parsed, "format", 1))
+        if accounts:
+            from .accounting import coverage_metrics
+
+            manifest.accounting = {"units": {a.unit_id: a.model_dump(mode="json") for a in accounts}, "coverage": coverage_metrics(accounts)}
         if provenance is not None:
             manifest.provenance = dict(provenance)
         if redaction is not None:
@@ -407,6 +427,7 @@ class FilePartitionStore:
                 "capped": False,
                 "counts": {},
                 "artifacts": {},
+                "accounting": {},
                 "created_at": self.clock(),
                 "sealed_at": None,
             }
@@ -437,6 +458,11 @@ class FilePartitionStore:
         child = self._derive(key, "reparse", base.units, provenance)
         parsed = parse(list(self.units(key, child.version)), library)
         return self.seal(key, parsed, provenance=provenance, redaction=base.redaction)
+
+    def restart(self, key: str, provenance: dict[str, Any]) -> PartitionManifest:
+        """``v+1`` (open, no units) of a sealed day, rebuilt by the caller from another input
+        (``logs reparse --from-raw``)."""
+        return self._derive(key, "reparse", [], provenance)
 
     def repull(self, key: str, units: list[str]) -> PartitionManifest:
         """``v+1`` (open) holding every unit of the sealed version except ``units``, which the

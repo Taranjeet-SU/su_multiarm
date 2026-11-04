@@ -65,6 +65,10 @@ class LlmStep(StrictModel):
     # graph arm only: a declared traversal template (``graph_templates`` in the payload) and its seeds
     template: str | None = Field(default=None, max_length=64)
     seeds: list[str] = Field(default_factory=list, max_length=10)
+    # structured arm, logs profile (review B5): a typed log intent instead of a scope; its
+    # arguments are name/value pairs (a repeated name makes a list), validated by the intent's model
+    log_intent: str | None = Field(default=None, max_length=32)
+    log_args: list[LlmFilter] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="before")
     @classmethod
@@ -76,9 +80,14 @@ class LlmStep(StrictModel):
 
     @model_validator(mode="after")
     def _coherent(self):
-        if self.arm == "structured":
+        if (self.log_intent is not None or self.log_args) and self.arm != "structured":
+            raise ValueError("only a structured step selects a log intent")
+        if self.arm == "structured" and self.log_intent is not None:
+            if self.scope is not None or self.filters or (self.query or "").strip():
+                raise ValueError("a log intent step carries its arguments in log_args only")
+        elif self.arm == "structured":
             if self.scope is None:
-                raise ValueError("a structured step needs a scope")
+                raise ValueError("a structured step needs a scope or a log intent")
             if self.filters or (self.query or "").strip():
                 raise ValueError("a structured step carries its constraints in scope, not query/filters")
         else:
@@ -174,6 +183,14 @@ class LlmAgent(DecisionAgent):
             "timezone": schema.timezone,
             "max_steps": min(capabilities.max_steps, self.config.max_steps),  # type: ignore[attr-defined]
         }
+        if capabilities.log_intents:
+            from .log_intents import INPUT_MODELS
+
+            payload["log_intents"] = {name: sorted(model.model_fields) for name, model in INPUT_MODELS.items()}
+            payload["log_intent_rule"] = (
+                "Log questions: a structured step names one of log_intents in `log_intent` and gives its arguments as "
+                "field/value pairs in `log_args` (repeat a field for a list); never write a scope over log documents."
+            )
         if capabilities.graph_templates and "graph" in capabilities.arms:
             payload["graph_templates"] = dict(capabilities.graph_templates)
             payload["graph_template_rule"] = (
@@ -219,6 +236,11 @@ class LlmAgent(DecisionAgent):
         for step in plan.steps:
             if step.arm not in capabilities.arms:
                 raise DecisionFailure("invalid_step", f"planner selected disabled arm {step.arm!r}")
+            if step.arm == "structured" and step.log_intent is not None:
+                if not capabilities.log_intents:
+                    raise DecisionFailure("invalid_step", "planner selected a log intent, which this deployment does not enable")
+                steps.append(self._log_step(step, request))
+                continue
             if step.arm == "structured":
                 assert step.scope is not None  # LlmStep._coherent
                 if request.aggregate is not None and step.scope.measure is not None and step.scope.measure != request.aggregate:
@@ -264,6 +286,31 @@ class LlmAgent(DecisionAgent):
             intents=intents,
             note=note,
         )
+
+    @staticmethod
+    def _log_step(step: LlmStep, request: DecisionRequest) -> StructuredStep:
+        """The planner's log intent as a typed step; the scope is compiled from the arguments
+        (any model-written scope is never used, review B5)."""
+        from .base import log_decision
+        from .log_intents import INPUT_MODELS, LogIntentCall
+
+        if step.log_intent not in INPUT_MODELS:
+            raise DecisionFailure("invalid_step", f"planner selected unknown log intent {step.log_intent!r}")
+        model = INPUT_MODELS[step.log_intent]
+        args: dict[str, Any] = {}
+        for pair in step.log_args:
+            annotation = str(model.model_fields[pair.field].annotation) if pair.field in model.model_fields else ""
+            if "list" in annotation:
+                args.setdefault(pair.field, []).append(pair.value)
+            else:
+                args[pair.field] = pair.value
+        if request.as_of is not None:
+            args.setdefault("as_of", request.as_of.isoformat())
+        try:
+            call = LogIntentCall(intent=step.log_intent, args=args)  # type: ignore[arg-type]
+        except (ValidationError, ValueError) as error:
+            raise DecisionFailure("invalid_step", f"log intent arguments are invalid: {error}") from error
+        return log_decision(call, Intents(), agent="llm").plan.structured_steps()[0]  # type: ignore[union-attr]
 
     @staticmethod
     def _step_filters(step: LlmStep, request: DecisionRequest, resolver: ValueResolver) -> dict[str, JsonScalar]:

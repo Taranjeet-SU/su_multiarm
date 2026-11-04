@@ -87,6 +87,7 @@ def test_egress_refuses_lines_the_configured_redaction_did_not_process(tmp_path)
 
 
 def test_egress_refuses_a_residual_pii_shape_rather_than_dropping_the_line(tmp_path):
+    engine_or_skip("regex")
     lines = learning_lines() + [line(90, "warn", "cache miss for key 10.0.0.1 in 3 ms")]
     with pytest.raises(EgressRefused, match="l090: unredacted ipv4"):
         run(tmp_path, lines=lines, privacy={"redact_emails": True})  # no IP redaction configured
@@ -109,6 +110,7 @@ def test_hosted_models_need_allow_hosted(tmp_path, monkeypatch):
 
 
 def test_redacted_and_pseudonymised_text_only_leaves_the_process(tmp_path):
+    engine_or_skip("regex")
     # A cluster whose lines name their own host and tenant and carry an e-mail address and an IP.
     lines = learning_lines() + [
         line(70 + i, "warn", f"notify ops.person@example.org about node-alpha-01 of tenant-alpha at 192.0.2.1{i}") for i in range(4)
@@ -189,6 +191,7 @@ def test_a_duplicate_of_a_disabled_pattern_fails_novelty(tmp_path, kind):
 
 
 def test_invalid_replies_are_recorded_not_repaired(tmp_path):
+    engine_or_skip("regex")
     def script(payload):
         if payload["template"].startswith("cache miss for key"):
             return reply(payload, cluster_id="c-other")
@@ -230,6 +233,7 @@ def test_auto_policy_learns_with_a_decision_record_and_reparses(tmp_path):
 
 def test_auto_on_the_regex_engine_still_waits_for_a_human(tmp_path):
     """Auto-promotion needs a gate run on RE2: on the development engine the proposal is not promoted."""
+    engine_or_skip("regex")
     report, _, library = run(tmp_path, engine="regex", promotion="auto")
     assert outcome(report, 12).outcome == "proposed" and "RE2" in outcome(report, 12).reason
     assert not (library / "learned.yaml").exists()
@@ -320,6 +324,7 @@ def test_human_promote_deprecate_disable(tmp_path, kind):
 
 
 def test_a_concurrent_human_save_between_read_and_rename_is_retried(tmp_path, monkeypatch):
+    engine_or_skip("regex")
     library = library_dir(tmp_path / "patterns")
     (library / "proposed.yaml").write_text("- {id: hand.placeholder, kind: noise, status: proposed, regex: '^placeholder line$'}\n")
     saves = []
@@ -353,16 +358,21 @@ def test_a_fixed_mock_gives_byte_identical_files_and_reports(tmp_path, kind):
 
 
 def test_the_day_cap_refuses_before_any_request_and_persists_across_runs(tmp_path):
+    engine_or_skip("regex")
     report, fake, library = run(tmp_path, learning={"max_calls_per_run": 2, "max_calls_per_day": 3}, promotion="manual")
     assert len(fake.requests) == 2 and report.stopped == "budget_exhausted:calls"  # the run cap
+    # Run 2: the two templates proposed in run 1 wait for review (no new call, real-run fix); the
+    # remaining cluster takes the day's third and last call.
     report, fake, _ = run(tmp_path, learning={"max_calls_per_run": 2, "max_calls_per_day": 3}, promotion="manual")
-    assert len(fake.requests) == 1 and report.stopped == "budget_exhausted:day_calls"
+    assert len(fake.requests) == 1 and [c.outcome for c in report.clusters].count("pending_proposal") == 2
+    # Run 3: the persisted day ledger refuses the declined cluster's call before its request.
     report, fake, _ = run(tmp_path, learning={"max_calls_per_run": 2, "max_calls_per_day": 3}, promotion="manual")
-    assert fake.requests == [] and report.stopped == "budget_exhausted:day_calls" and report.clusters[0].outcome == "not_sent"
+    assert fake.requests == [] and report.stopped == "budget_exhausted:day_calls" and any(c.outcome == "not_sent" for c in report.clusters)
     assert report.spend["day"]["calls"] == 3
 
 
 def test_usd_caps_refuse_before_the_request(tmp_path):
+    engine_or_skip("regex")
     # One call reserves (chars/4 input + 512 output tokens) at $1000 per million: about $1.0-1.15 here,
     # far above $0.10, so nothing is sent.
     report, fake, library = run(tmp_path, price_table=True, learning={"max_usd_per_run": 0.1, "max_usd_per_day": 1.6})
@@ -416,6 +426,7 @@ def test_two_ledgers_on_one_file_never_exceed_the_cap(tmp_path):
 
 
 def test_dry_run_sends_spends_and_writes_nothing(tmp_path):
+    engine_or_skip("regex")
     report, fake, library = run(tmp_path, dry_run=True, price_table=True, learning={"max_usd_per_run": 1, "max_usd_per_day": 2})
     assert fake.requests == [] and [c.outcome for c in report.clusters] == ["would_send"] * 3
     assert all(c.estimate_usd and c.prompt_chars for c in report.clusters) and report.spend is None
@@ -443,6 +454,7 @@ def repo(tmp_path):
 
 
 def test_git_commit_of_the_system_files(tmp_path, repo):
+    engine_or_skip("regex")
     report, _, _ = run(tmp_path, promotion="manual", learning={"git_commit": True})
     assert report.git_commit
     log = _git(repo, "log", "--format=%an|%s", "-1")
@@ -452,6 +464,7 @@ def test_git_commit_of_the_system_files(tmp_path, repo):
 
 
 def test_a_dirty_system_file_stops_the_writer(tmp_path, repo):
+    engine_or_skip("regex")
     run(tmp_path, promotion="manual", learning={"git_commit": True})
     before = (repo / "proposed.yaml").read_bytes() + b"# a hand edit\n"
     (repo / "proposed.yaml").write_bytes(before)

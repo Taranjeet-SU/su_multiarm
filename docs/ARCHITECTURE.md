@@ -571,6 +571,30 @@ The day ledger here covers only the `learning.patterns` scope on SQLite; the gen
 every ledger backend (B10), raw-reply tagging by partition, partitions, compose and the `line` chunk
 recipe (L3a) are not implemented in this slice.
 
+### Accounted coverage and the LLM fallback (addendum A2 rev 2–4, slices C1–C4; preview)
+
+- `ingestion/accounting.py`: final statuses and closed reasons, the identities checked before the
+  seal (Q, D and H; S is reported while `rest` is derived), `pattern_owner`, validators, and regex-only
+  versus with-model coverage, which are never merged. `logs_parse.match_records` adds `final_status`,
+  `reason`, `pattern_owner`, `extraction_source` and `gaps` to every match row.
+- `ingestion/overlay.py`: the post-seal **overlay** per partition version, keyed by
+  `fallback_identity` (partition key and version, library identity, proposed-set identity, route
+  models, prompt and schema versions, settings). It is written atomically per unit and sealed by its
+  manifest after H is re-checked. `OverlayStore.rows()` is the read API for compose and snapshots.
+  A stale overlay is rebuilt, from the reply cache when the replies are there.
+- `learning/extraction/`: `slots.py` (cluster tier: miner → synthesiser → one call → full gate →
+  provisional group-span values → the existing writer), `fill.py` (field gaps: gated `fix`, then
+  line quotes), `lines.py` (capped per-line tail, quotes grounded by `extraction/grounding.py`),
+  `cache.py` (reply cache), `common.py` (provider routes with health and capacity probes, and the
+  cache-first caller: no retry, no fallback to another provider after a cap), and `run.py` (residue
+  from stored units, per-line egress, tiers, overlay write and report).
+- `ingestion/schedule.py`: `run_daily` adds `fallback` (today plus earlier in-window days whose
+  overlay is deferred, missing or stale, ranked together) and `apply_decisions` (one reparse into
+  `v+1` when auto-approved entries changed the library, then an overlay rebuild with no model call).
+  A failed fallback is recorded (`ok: false`) and never blocks compose.
+- **Not yet wired:** compose does not read overlays yet (L5/B7 owns the arm mapping), so the arms
+  serve deterministic rows only, and `ScopeResult.applied_extraction` is not populated by this slice.
+
 ## Retrieval and selection semantics
 
 Selection order of stages: collapse, per-arm limits (optionally with `selection.source_slots`:
@@ -801,8 +825,11 @@ self-checking:
 The source contract does not cover the following. Each is a later slice of the addendum:
 
 - persistence (day partitions; see the next section, slice L3a, which refuses a mapping without a redactor);
-- redaction (`LogMapping` takes an injected redactor and reports `redaction: none` without one);
-- the pattern library, whose `format` and `continuation` kinds will replace the built-in rules;
+- redaction: `LogMapping` applies the safe redactor (`privacy/redactors.py`, `privacy.engine: safe`)
+  or an injected one, and reports `redaction: none` without one;
+- the pattern library's approved `continuation` entries join lines in addition to the built-in rules
+  (`assemble(..., library=)`); `closing_bracket` and the contextual `python_traceback` rule handle
+  JSON tails and column-0 Python tracebacks;
 - PIT-based pulls. A PIT search needs an index-less `/_search` path, which the allow-list does not
   contain.
 
@@ -843,10 +870,25 @@ health-check noise, synthetic PII shapes), the fake cluster used by the tests (a
   (`WritePath.delete_generation`), cache invalidation, ledger job entries, tag- and
   reference-based ledger purge, tombstones, session expiry, audit records; `report` and the
   content-based `verify`.
+- `raw_store.py` (optional, `logs.partitions.raw`): unredacted copies of pulled units, 0700/0600 under
+  a parent that is not group- or world-writable; written by the puller, expired by retention, read
+  only by `LogsPipeline._reparse_from_raw` (`reparse --from-raw` and the `rederive` step after a
+  redaction change, limited to days still in the raw tier) and audited by `privacy scan --raw`; an
+  import-graph test pins the importers (schedule, retention, CLI) and the readers.
+- Retention scopes: `raw_days`, `keep_days` (partitions) and `derived` (`window`, `forever` or days).
+  Compose keeps a masked derived snapshot per day under `<partitions>/derived/` and builds derived
+  days from it, so composed day data can outlive its partition; `logs_compose.downsample` is the hook
+  for a later hourly-to-daily policy.
 - `pins.py`: cross-process pins (`pin:<generation>:<holder>` rows with a TTL) on the file registry
   (sqlite sidecar), memory, SQL and PostgreSQL registries; `ProcessPins` keeps one heartbeat-renewed
   pin per serving process and generation with an in-process refcount. MongoDB and Elasticsearch
-  registries have no pins (`PinsUnsupported`), so `logs` is refused there.
+  registries have no pins (`PinsUnsupported`), so `logs` is refused there. With a `logs` section the
+  `Engine` holds a `ProcessPins` and pins the generation of every request (`_begin` to `_finish`:
+  search, answer, streams, tools, values), so HTTP, SSE and MCP requests are covered.
+
+`privacy/` holds the safe redaction engine (`redactors.py`: named built-ins and user redactors,
+validated and run by the pattern engine, payload extension in linear Python scans, stamp and counts)
+and the content-free leak scan (`scan.py`, `privacy scan`).
 
 Write-path additions used by compose (all inert unless configured): the `line` chunk recipe
 (`ingestion.line_recipe`: one chunk per record, never split), projection exclusions
@@ -855,3 +897,47 @@ generation uses goes to a side table; the manifest keeps only `ledger_refs_count
 `ledger_refs_sha`), and `manifest_extra`. The ledger's retention operations (`tag_raw`, `refs`,
 `purge`, `drop_job`, `raw_entries`) are the `extras.LedgerRetention` protocol, implemented on the
 memory, sqlite, sqlalchemy, postgres and mongodb ledgers and checked by the conformance kit.
+
+
+## Logs analytics profile (addendum A2, slices L5a–L5d, M1)
+
+The pattern extractor's output reaches every arm through compose; provenance runs from each
+document back to its template (`pattern_id`, library digest), its lines (match rows of the sealed
+partition) and its partition (day key and version in the generation manifest).
+
+| Arm | Documents | Mapping |
+|---|---|---|
+| dense | `signature` (masked template, category), `incident` (deterministic summary) | never line text (`embed_fields`; config validation refuses an embedded line field) |
+| lexical | `signature`, `signature_examples` (≤ k redacted lines per signature and tenant), `incident` | the opt-in raw `line` kind is not implemented |
+| structured | `log_day`, `log_hour` (day/hour × tenant × env × service × level × status × signature), `endpoint_day`, `endpoint_window`, `exception_day`, `coverage_day`, `signature_catalog`, A1 kinds | `row_exactness` (`role: exactness`: worst row wins; capped units are scaled and `approximate` with their method), `basis` (`level_field`, `format_group`, `token_match`), p95 per row `additive: false` |
+| graph | header links of `signature_day` (`emits`), `unit_day` (`runs`), `endpoint_day` (`serves`), `exception_day` (`raises`): `native_link`; exemplar facts of reviewed entries; `co_fires_with` from incident headers: `co_firing` | every edge spans both endpoint names; its occurrences name the day documents, whose `lines` are the per-day weights |
+| community | `incident` per co-firing community and tenant | lift over `(tenant, env, hour)` cells, components (deterministic), Louvain via `louvain_partitions` only above `split_above` |
+
+**One plan per question (review B5).** `DecisionAgent.log_step` runs before every agent's own
+planning (rules, classifier, llm and cascade): `decision/log_intents.detect` maps a recognised
+question to a `LogIntentCall`, and the plan is one `StructuredStep(intent=...)`. The llm planner may
+select an intent itself (`log_intent` + `log_args`); a free structured scope that could span several
+log kinds is refused (`intent_required`). The engine executes an intent step with
+`runtime/log_tools.run_intent`, the function behind `Engine.call_tool`, `POST /v2/tools/{name}` and
+the MCP tools, so every surface returns the same rows and rendering.
+
+**Answers state the aggregate's numbers.** Every aggregate record carries `rendering`; the
+generator is asked to quote it, and when the answer text states a number the cited exact aggregate
+does not back, the contract replaces the text with the rendering (plus the model's number-free
+sentences) instead of passing or abstaining.
+
+**History.** Days beyond the partition window are composed from the per-day derived snapshots
+(`logs.retention.derived`; the bug-fix slice's archive), whose aggregates include the format-2
+typed values; day documents are content-addressed and cached per snapshot identity, so the
+analytics kinds, the signature catalog and the incidents span all served days.
+
+**History tier (H1/H2).** With `logs.history.tier`, a served day's day documents are one
+content-addressed, append-only **day shard** (`ingestion/history.py`; sqlite, or a shard-tagged
+collection of a records backend such as OpenSearch). The generation is the **window shard** (its
+own build: signatures, examples, window rollups, catalog, `graph_link`, incidents, lineage and
+history rows) plus the list of day-shard refs in its manifest. `Engine.records_execute` sends a
+scope over day kinds to the shards of the pinned generation (a native shard filter), so a pinned
+older generation keeps reading its own shards while a new one is composed. Compose writes only new
+shards and builds the catalog, links and signature history from per-shard summaries; gc deletes
+shards no registry generation references. `signature_lineage` (supersede decisions) folds a retired
+signature into its successor in every log tool.

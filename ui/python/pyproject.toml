@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+# The static UI bundle as its own wheel (addendum A2 §4.4.1). Build the bundle first
+# (``npm ci && npm run build`` in ``ui/``, then ``node scripts/manifest.mjs``); the core wheel and
+# sdist never need Node. Installed through ``su-multi-arm[ui]``.
+[project]
+name = "su-multi-arm-ui"
+version = "2.0.0a3"
+description = "Static web UI assets for su_multi_arm (served at /ui by su-multi-arm serve)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{name = "su_multi_arm contributors"}]
+dependencies = []
+classifiers = ["Development Status :: 3 - Alpha", "Programming Language :: Python :: 3", "Framework :: FastAPI"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["su_multi_arm_ui"]
+# the bundle is gitignored (built in CI), so it must be included explicitly
+artifacts = ["su_multi_arm_ui/static/**"]
+
+[tool.hatch.build.hooks.custom]
+# hatch_build.py: the build fails when the static bundle is missing or empty (N11)
+
+[tool.hatch.build.targets.sdist]
+include = ["su_multi_arm_ui", "README.md", "pyproject.toml", "hatch_build.py"]
+artifacts = ["su_multi_arm_ui/static/**"]

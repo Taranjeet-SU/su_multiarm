@@ -1,3 +1,227 @@
+### 2026-11-04 — A2/H1 + H2: history tier and lineage — DONE except the overlay into the arms (synthetic/contract; OpenSearch real-service for the history rows)
+
+Branch `v2-logs-h1` from `dacd166`.
+
+**Done.**
+- `ingestion/history.py`: content-addressed append-only day shards (`<day>:<sha>` over the day's
+  documents; a `source_key` (snapshot identity + recipe) map makes unchanged days O(1) and a reparse
+  that changes no document a no-op); sqlite store (rows + EAV fields, indexed kind/day/shard) and a
+  records-backend store (OpenSearch: one shard-tagged collection, `terms` shard filter, delete-by-query
+  gc) with the shard index in a sqlite sidecar; `logs.history.tier`, `logs.history.backend`.
+- Compose with the tier: day documents go to shards (only new shards written), the generation is the
+  window shard (signatures, examples, window rollups, catalog, endpoint window, incidents,
+  `graph_link`, `signature_history`, `signature_lineage`) and lists `logs.history.shards`; the
+  catalog, links and history are built from shard summaries (no row reads for old days); gc by
+  reference after every compose. Imports from the bug-fix slice's derived snapshots (formats 1, 2).
+- Reads: `Engine.records_execute` routes day kinds to the shard set of the pinned generation (log
+  tools, `aggregate` tool, structured arm, `documents_in`); a scope mixing day and window kinds is
+  refused (bounded). Graph: `graph_link` edges carry the history; per-day weights from the shards,
+  bounded to `days` (default 30) from the generation's last day.
+- H2: `signature_lineage` from supersede decisions (the replay's `id` supersedes `target`),
+  `signature_history` per (signature, library identity, imported days included); log tools expand a
+  signature filter to its predecessors and fold rows into the successor, rendered "folds superseded
+  signatures: a -> b".
+- Latency: `log_compare` reads the union of its periods only; the population is the referenced
+  shards' row counts. Numbers in VALIDATION.
+
+**Deviations.**
+- The window shard is the generation's own build (not a separate store object).
+- OpenSearch history rows keep typed values only; `documents()` rebuilds day documents from them
+  (metadata, no header text).
+- Graph weights are bounded to the last 30 days by default (`graph_neighbourhood.days`); the
+  edges cover the whole history.
+- The sqlite 180/10-day ratio is over 2x for four log tools (2.1–2.25x) and for the graph
+  neighbourhood (3.2x); OpenSearch is within 2x. See VALIDATION for the data-volume confound.
+- `signature_lineage` uses the current library's decisions for every served day (a decision's
+  `decided_at` is kept on the row); per-day replays of older library versions are not stored.
+
+**Not done / follow-ups.**
+- Overlay into the arms (`model_line` -> `unknown` bucket, `extraction_source` per field): waits for
+  the fallback slice's merge.
+- Elasticsearch history rows were not run; the 4 GB / 10 min append bound was measured at 180 days
+  of the gold generator only (0.66–0.79 GiB, 1.6–12.9 s).
+
+### 2026-11-04 — A2/L5a–L5d + M1 + B2+B3: logs analytics profile, log intents and tools, MCP log tools — DONE except H1/H2 and overlay reading (synthetic/contract evidence)
+
+Branch `worktree-agent-af419a9d91385c4e2`, base `106d4b0`, merged `fdb7c4a` and `42627b0`. Built to
+A2 rev 1, then the rev 2/3/4 deltas (§11.0, §11.1, §11.R4) as they arrived.
+
+**Done.**
+- Arm mapping (profile `logs_example`): dense = `signature` (masked template, regex in metadata) and
+  `incident`; lexical = signatures, per-tenant `signature_examples`, incidents; structured = `log_day`,
+  `log_hour`, `endpoint_day`, `endpoint_window`, `exception_day`, `coverage_day`,
+  `signature_catalog` + A1 kinds; graph = header links (`emits`, `runs`, `serves`, `raises`) with
+  span provenance and per-day weights, reviewed-entry facts, `co_fires_with` (`co_firing`);
+  communities = per-tenant co-firing incidents (`communities.strategy: declared`).
+- Partition format 2 (typed values with spans and gaps, `pattern_owner`/`pattern_reviewed`,
+  `deployment` + exactness in cells, analytics aggregates, `patterns.json` digest); compose reparses
+  an older format. Delta reparse with change classes A–H (`ingestion/reparse.py`).
+- B2+B3: `FieldSpec.role`, `FieldSpec.additive`, `applied_basis`/`applied_extraction`, `$measure`,
+  `bucket.of`, `hour`. Lucene native path: roles via terms aggregation, `bucket.of` flagged.
+- B5: `StructuredStep.intent: LogIntentCall`, `DecisionAgent.log_step` before every agent (rules,
+  llm, cascade), llm `log_intent`/`log_args`, `require_intent`; the engine runs intents through
+  `log_tools.run_intent`; aggregates carry `intent`, `args`, `rows`, `rendering`.
+- R2-B4 scope guard (`decision/log_guard.py`) with `logs.serving.allow_adhoc_scopes`; n4 single-tenant
+  refusal in config, `Engine.__init__`, `create_app`, `create_mcp`.
+- M1: MCP log tools (generated signatures, drift-checked, `readOnlyHint`), `mount_on_http` at `/mcp`
+  (`streamable_http_path="/"`, parent lifespan, SDK transport security, `serving.mcp.token_env`).
+- Live-deployment number-check bug: grouped sums, group count, population accepted; every aggregate
+  has a deterministic `rendering` that replaces model numbers the aggregate does not back.
+- sqlite typed-scope latency fix (owner-index hint).
+- H2 partial: answers state "spans N library identities" from the manifest's `identity_span`.
+
+**Deviations.**
+- Profile name `logs_example` (the task's name; the plan says `profile: logs`).
+- Kinds `log_day`/`log_hour` added (day/hour × tenant × env × service × level × status ×
+  signature); several intents use them instead of the plan's `service_day`/`signature_window`
+  because those carry no level. `log_new` reads `signature_catalog` (all served history, owner
+  decision) instead of `signature_window`.
+- Analytics kinds default off; the profile turns them on (generic logs configs unchanged).
+- Co-firing: connected components of the kept-pair graph; Louvain (`louvain_partitions`, copied
+  verbatim from the bug-fix slice, merged identical) only splits components above `split_above`
+  (default 12): Louvain on a small complete bipartite block scatters a planted incident one
+  signature per community (measured).
+- One derived-history mechanism: my carried-forward documents were removed in favour of the bug-fix
+  slice's per-day derived snapshots and day-document cache; the analytics kinds are part of the
+  cached day build; the snapshot already carries the typed aggregates (round-trip test).
+- `log_tenants` uses `unit_day` source counts when a count query covers the level, else `log_day`.
+- The property test uses seeded `random` (no `hypothesis` in the venv).
+- `test_request_parity` iterates only the MCP tools that exist (log tools are absent there).
+
+**Not done / follow-ups.**
+- **H1 history tier** (day/window shards, shard manifests, append-only history collections with a
+  shard filter on SQLite and OpenSearch, gc by reference, day-181 acceptance): not started. The
+  180-day read latency shows why it is needed (linear in records; 2 of 10 tools over 200 ms).
+- **H2 lineage** (`signature_lineage`, `signature_history`, folding superseded signatures): not
+  started beyond the identity-span sentence.
+- Compose reading the fallback overlay (`model_line` → `unknown` bucket, `extraction_source` per
+  field): the fallback slice has not landed on this base.
+- `line` kind, classifier-agent mapping (the shared `log_step` covers it), `doctor` checks for the
+  profile, OpenSearch/Elasticsearch runs of the new kinds and B3 operations, CI job at `mcp==1.10.0`.
+- Test counts: before 1951 passed / 91 skipped; after 2272 passed / 94 skipped (not external).
+
+### 2026-11-04 — logs/raw-hardening + interim derived archive (A2 §11.0, §11.R4 bug-fix slice) — DONE (synthetic)
+
+Branch `v2-logs-raw-hardening` from `fdb7c4a`. Commits: `a96ca4f` (raw hardening, A1 amendment
+docs) and the follow-up commit (raw gateway module, derived archive, serve bound, Host guard).
+
+**Done.**
+- Raw tier: parent not group/world-writable (`RawLocationUnsafe`); path outside the partition store,
+  backends, library and the served directories (installed package, UI bundle); verify requires
+  exactly 0700/0600 and no day older than `raw_days`; `ingestion/raw_reparse.py` is the only
+  importer of `raw_store` (open, write, read, reparse, rederive, audit); `RawStore` has no read
+  method; class G: `rederive` step re-derives only in-raw days, others `stale_redaction`.
+- A1 rule (a) and the content verify scoped to the masked tier (docs: A1 §3.8.3 amended by A2
+  rev 3/4). No refusal of `derived ≠ window` (rev 4, n-r4-1).
+- Snapshots: `derived_format: 2`, identity `sha(key, version, library identity, partition format,
+  fallback identity, compose format)`, payload with every aggregate-level artifact, typed-value
+  aggregates when present, overlay rows (`v<n>/fallback/<identity>/`), accounting;
+  `source_unavailable` for missing inputs; format-1 read and marked.
+- `logs.history.serve_days` (default `keep_days`) and `max_serve_rows`; window rollups over the
+  masked window; `library_identities`/`identity_span` in the manifest; day documents cached by
+  snapshot identity (only new or changed days rebuilt).
+- Host guard when the UI is enabled, MCP is mounted on the HTTP app, or `allowed_hosts` is
+  non-empty; `create_app(bind=)`; the standalone MCP HTTP app is guarded when `allowed_hosts` is set.
+
+**Deviations.**
+- (a) `serving.mcp.mount_on_http` does not exist at `fdb7c4a` (MCP runs as its own server); the guard
+  reads it with `getattr` so it takes effect when that key lands, and no unused key was added.
+- (b) The overlay layout is read generically (`v<n>/fallback/<identity>/**/*.json`, newest identity
+  name) because `ingestion/overlay.py` has not landed; the fallback slice exposes the final interface.
+- (c) "Typed-value aggregates" are every aggregate-level `.json` artifact of the sealed version
+  (format 1 has none, so `typed_inputs` is `source_unavailable`).
+- (d) `max_serve_rows` counts unit rows, signature rows and hourly cells of each served day; the
+  masked window is always served, derived days are dropped oldest first.
+- (e) The compose bound is the serve window plus the day-document cache; the write path still
+  builds one generation from the served documents (shards are H1).
+
+**Tests.** `not external`: 2095 passed at `a96ca4f` → **2105 passed, 94 skipped**; new `tests/contract/test_derived_archive.py`
+(8 tests, including the 60-day cost test), raw hardening tests in `test_retention_scopes_and_raw.py`,
+Host guard tests in `test_serving_pins_and_bind.py`. ruff clean; schema regenerated with `write_all`.
+
+### 2026-11-04 — logs/package-run: deployment-run fixes, B11 safe redaction, retention scopes and raw tier, N10 — DONE (synthetic/mocked; postgres, OpenSearch 3.9.0 and RE2 checks on isolated local resources)
+
+Base `106d4b0` (`v2/logs`). Commits: `63171b7` (fixes, B11, N10, O1–O3, B8 pins, serve bind) and the
+follow-up commit with the raw tier, retention scopes, N16 and docs. No paid call; every bug was
+reproduced with synthetic names and lines.
+
+**Done.**
+- P1 probe: PIT check opt-in (`--probe-pit`), skipped for an unknown/old version or
+  `sources.<n>.disallow: [pit]` (rows refused by the transport before I/O). P14: one privilege
+  request per source. P18: `--request-log` (content-free JSONL with a summary row).
+- P2/P3/N16 index names: `prefix` stripped (already at base; now tested end to end through
+  discovery); `deployment_position: before_service` (declared prefixes) and `after_env`
+  (env-anchored, any deployment between the env and service vocabularies); `unparsed: exclude`
+  counts `excluded_scope.unparsed_name` (discover/count/probe output, partition step report).
+- P4: `closing_bracket` and the contextual `python_traceback` rule (defaults); approved library
+  `continuation` entries applied in `assemble(..., library=)` at pull time; the lint refuses
+  selectors on continuation entries. P5: `patterns coverage|mine` assemble multiline records
+  (source rules + library entries, JSONL `ts`/`container`/`file`), report fragments; `bootstrap`
+  takes `fragments`. P6: `noise` `precedence: before_message` stage; identity unchanged when unset.
+  P7: `patterns lint` returns every issue and exits 1.
+- P10 record keys filterable (request filters and compiled scopes). P11: group-by + time word and
+  enum value inside a field identifier no longer qualifiers. P12 `measure` on aggregates. P13
+  `native_link_relations`, no `base_url` for local embedders.
+- Retention semantics: `keep_days` = N most recent complete days (`expiry_cutoff(today, N)`), one
+  reference day (today) for run-daily, retention and report rotation.
+- Postgres native types: test-ordering bug (kit's text-count check rewrote the records); the kit
+  exposes `record_rows()` and the test re-upserts before the type query.
+- O1 `docs_index_parts` (literal prefix); activation reads every pointer back before `CURRENT`
+  (B9). O2: 503 causes logged, `/ready` runs the request pin. O3: `communities.base.louvain_partitions`
+  (integer-relabelled, sorted graph), shared by `louvain` and `louvain_hierarchical`.
+- B8: `Engine.process_pins` (with `logs:`) pins every request's generation from `_begin` to
+  `_finish` (search, answer, streams, tools, values; so HTTP, SSE, MCP). `serve` honours
+  `serving.http.bind`/`token_env`.
+- B11: `privacy/redactors.py`, `privacy/scan.py`, PrivacyConfig `engine`, `redactors`, `custom`,
+  `regex_engine`, `regex_timeout_ms`, `hash_key_env`, `actions`, `record_fields[_allow]`; wired into
+  `LogMapping` (message, stack, extra), `LogsPipeline.from_engine` (CLI), ingest
+  (`redact_document`), `LineRedactor`/`lines_from_records` (stamped lines admitted as is);
+  `privacy scan [--raw]`.
+- Raw tier and scopes: `ingestion/raw_store.py`, `logs.partitions.raw`, `retention.raw_days`,
+  `partition_days` alias, `derived: window|forever|<days>`, derived snapshots and
+  `logs_compose.downsample` hook, `logs reparse [--from-raw]`, retention run/verify/report per scope.
+- N10: batched catalog/records writes, catalog-only chunks reduced to shapes, copy-on-write
+  redaction, compose frees day inputs: 10^6 rows in 1096.5 s at 3.94 GiB (met).
+
+**Deviations.**
+- (a) `sources:` configs are **not** required to use `engine: safe` (addendum §3.2.3); the pulling
+  commands refuse at run time instead, as the task specified. `PrivacyConfig.max_line_bytes` was
+  not added (the source's `max_line_bytes` already bounds lines).
+- (b) The safe engine without google-re2 runs on the `regex` development engine only when
+  configured (`regex_engine: regex`); there is no automatic fallback.
+- (c) Payload redactors (`llm_text`, `content`, `query`, `record_payload`, `pg_row`,
+  `tracking_id`) match the key with RE2-safe patterns and extend the value with linear Python scans
+  (quoted strings, brackets, SQL literals, end of line), because RE2 repeats stop at 1000.
+  `api_key` flags the lease `"token"` in generation manifests during scans (documented false
+  positive); redaction counts are `[name, count]` pairs so they do not look like assignments.
+- (d) Retention: chose "N complete days" (today excluded): day 1 is deleted on day 12 with
+  `keep_days: 10`, not on day 11 as the private plan's A8 expected.
+- (e) Derived data is kept as per-day masked snapshots in the partition store (`derived/`), and
+  compose rebuilds the serving generation from them; it is not an append-only delta into the
+  backends. Coordination with the L5 delta reparse / content-addressed day docs is open: they can
+  key on the same per-day snapshots. Derived days whose partition expired cannot be reparsed under a
+  new library (served as composed, identity listed).
+- (f) Raw copies are written per unit during the pull; a library change does not re-join records
+  already stored (reparse re-matches stored heads; `--from-raw` re-joins).
+- (g) Library `continuation` entries take no `applies_to` selectors (lint error).
+- (h) `ProcessPins` starts a heartbeat thread in every `Engine` with a `logs:` section.
+- (i) P3b, P8 (bounded idiom documented by the lint messages; not relaxed), P9 (composite signature
+  ids), P15 (token-aware chunk cap), P16 (dev version on unreleased builds), P17 (TLS fingerprint
+  pin) were not done: feature or packaging decisions, not fixes of wrong behaviour.
+
+**Tests.** `not external`: 1951 passed, 91 skipped at base → **2062 passed, 94 skipped** (final run
+after this entry). RE2 (isolated google-re2): redaction/B11/package-run files 100 passed, 1
+skipped. External: postgres conformance 25 passed; OpenSearch 3.9.0 e2e + adapter 7 passed (e2e
+fails at base). ruff clean; schema regenerated with `write_all`. New test files:
+`tests/unit/test_package_run_fixes.py`, `test_redaction_safe_engine.py`,
+`tests/contract/test_deployment_run_engine_fixes.py`, `test_logs_safe_redaction.py`,
+`test_serving_pins_and_bind.py`, `test_retention_scopes_and_raw.py`,
+`tests/services/test_opensearch_underscore_dataset.py`. Changed: `test_retention_11_days.py`,
+`test_pins_and_gc.py` (as-of = today), `test_log_day_window.py`, postgres conformance.
+
+**Follow-ups.** P8/P9/P15/P16/P17; redaction throughput on real volumes; derived-forever growth and
+the downsampling policy; L5 alignment on derived day docs; a CI leg with google-re2.
+
 ### 2026-11-04 — A1/L4b: LLM pattern-learning loop and writer, plus the L1 index-name grammar fix — DONE (synthetic/mocked evidence)
 Branch `worktree-agent-a3278fda379576f1e` (base `a27ab5a`, `v2/logs`), commit `a586d0b`. Scope: addendum
 `v2_addendum_logs_and_patterns.md` rev 3, §3.6.1–3.6.3, and the index-name parser fix (L1).
@@ -1271,3 +1495,246 @@ Follow-ups:
 - `percentiles` would need a measure-contract change.
 - The other records adapters (sqlite, postgres, mongodb) still scan. Pushdown there is a separate
   slice.
+
+### 2026-11-04 — A2/U1-MVP: read-only web UI, Host allow-list, CSP, `serve` bind fix — DONE (synthetic + mocked model)
+
+Base `v2/logs` at `106d4b0`; commit `cbc06f5`. Built to addendum A2 rev 2 §4.4 / §11.3 under an owner
+deadline: the MVP views against the **existing API only**; the full-scope views follow.
+
+Done:
+- `ui/` (Vite 8, React 18, TypeScript, cytoscape, zod; Node 24 in `.nvmrc`; committed
+  `package-lock.json`): Ask (SSE via fetch stream, Stop aborts the run, provisional tokens dimmed,
+  `done` authoritative, citation chips jump to evidence, contract badge with violations), evidence tabs
+  per arm (structured: exactness badge with a symbol, basis, denominator, total, truncated-ids flag,
+  `rendering` sentence when present, chart), graph explorer (graph-arm provenance; uses
+  `/v2/graph/neighbourhood` only when advertised), charts (`group_count` by a groupable field), trace
+  panel, settings. View registry (`ui/src/views/registry.tsx`) is the extension point; optional
+  routes/tools are feature-detected from `/openapi.json` and `GET /v2/tools`.
+- Wheel `su-multi-arm-ui` (`ui/python`, hatch hook refuses an empty bundle, `manifest.json` with
+  sha256, `THIRD_PARTY_NOTICES.txt`); extra `su-multi-arm[ui]`; core sdist excludes `ui/`.
+- `serving/ui.py` (mount, CSP + security headers, containment, `ui-config.json`),
+  `serving/hosts.py` (B10 Host allow-list 421, Origin 403, N12 `nosniff` on `/v2/*`), `inspect`
+  scope on built-in principals (B4), `serve` honours `serving.http.bind` and `bearer_env` (N20),
+  `cli.build_parser()` factored out (for future copy-command round-trip tests), `doctor` reports the UI.
+- CI job `ui` (npm ci, build, vitest, UI wheel). Docs: README, serving.md (Web UI), CONFIGURATION,
+  CHANGELOG, VALIDATION; schema regenerated.
+
+Deviations (safer interpretation, recorded):
+- Static `/ui/*` assets are served without a credential (rev 2 §4.4.2 says so); "requires auth" is
+  enforced on every `/v2/*` call and by refusing `ui.enabled` without bearer/injected resolver.
+- Built bundle is **committed** (owner deadline: offline wheel build from `git archive`); CI rebuilds it.
+- Runtime validation uses zod schemas written by hand, not `ajv` standalone validators generated from
+  `scripts/gen_ui_schema.py` (N11): follow-up, with the schema drift test.
+- No markdown rendering at all (stricter than `react-markdown` + `skipHtml`); charts are dependency-free
+  SVG instead of recharts; no Tailwind / TanStack Query.
+- MCP mounted in the HTTP app (N14, separate MCP token) is owned by the L5/M1 slice per rev 2 §11.1.8;
+  not done here.
+
+Tests: pytest `not external` 1958 passed, 105 skipped (21 new in `tests/contract/test_ui_mount.py`;
+base not re-measured separately). vitest 40 passed. ruff clean. Manual Playwright smoke
+(`ui/e2e/serve_synthetic.py` + `ui/e2e/smoke.mjs`, local cached chromium): 0 CSP violations, 0 page
+errors. Both wheels build from `git archive` of the commit.
+
+Follow-ups: Playwright e2e in CI with `securitypolicyviolation` assertion; S1a inspect routes
+(`/v2/info`, spend, runs, patterns view) and S1b (graph neighbourhood, communities); Overview tiles
+(`log_top`, `log_new`), Patterns, Incidents, Runs/spend dashboards and log-intent shortcuts
+(feature-detected); `shlex.quote` copy commands with round-trip test; ajv validators + schema drift
+test; axe accessibility audit; large-graph layout.
+
+## A2 C1–C4 — accounted coverage and LLM fallback extraction (2026-11-04, Claude; base `106d4b0` then merged `fdb7c4a`)
+
+**Status: done at the mocked-contract level.** Commits `72cc431`, `f744347`, the merge `955977b`,
+`bdb1149` and `feb2977`. Built to A2 rev 2 §4.2 with the rev 3/4 deltas and the owner decisions
+listed below. The draft plan was used from the external workspace and is not committed.
+
+**Done**
+- C1 accounting: `ingestion/accounting.py`. The counting unit is the source document. Identities Q
+  (per-stratum fetched vs `min(quota, count)`, documents handed over = Σ fetched), D (`docs_pulled =
+  malformed + heads + joined + fragments + overflow`) and H (`heads = Σ final_status`) are checked in
+  `FilePartitionStore.seal` (refused seal, version stays open). S is reported with a derived `rest`.
+  `UnitArtifacts.docs_pulled`/`malformed` are recorded by `_pull_unit`; older units report
+  `recorded: false`. Match rows carry `final_status`, `reason`, `pattern_owner`,
+  `extraction_source` and `gaps`; the manifest carries `accounting`. Validators give `range_invalid`.
+  Coverage keeps regex-only and with-model numbers apart, with `deterministic_reviewed`,
+  `fragment_share` and owner targets per service × tier.
+- C2 cluster tier and overlay:
+  - `learning/extraction/slots.py`: labels on `vN`/`maskN` (N3), or a model regex, through the full
+    gate on today's lines; group-span values; the existing writer.
+  - `ingestion/overlay.py`: per-unit atomic files, the manifest written last, H re-checked, and
+    `OverlayStore.rows()` as the read API.
+  - Reply cache keyed by template sha, service, level, provider, model, prompt and schema version
+    (N4). Labels and regex are re-anchored and re-gated.
+  - `run_daily` gains `fallback` (today plus deferred, missing or stale in-window days, ranked
+    together) and `apply_decisions` (one reparse into v+1, overlay rebuilt with 0 calls). A failed
+    fallback is recorded and compose still runs.
+- C3 fill and tail: `fill.py` (gated `fix` per `(pattern, gap set)`, then line quotes for the gaps
+  only) and `lines.py` (capped tail, quotes grounded in their own line, `exact`/`normalised`,
+  ambiguous only when identical at every occurrence).
+- C4 spend and routes:
+  - `models.routes.<role>` lists ordered routes with health and capacity probes. No route available
+    gives `capacity_deferred`. A paid route after a local one needs `allow_paid_fallback`.
+  - `TotalSpendLedger` holds total-period caps per provider key, with a projected-exhaustion alert.
+  - `LearnerMeter(role=…, totals=…)`; local routes record calls and tokens at USD 0.
+  - R3-B2: a paid route is refused at config load without a price table, a finite provider total and
+    finite daily and run USD caps.
+  - Per-route throughput (calls/min, tokens/s) and the caller state (`ok`, `paused`,
+    `paid_exhausted`, `capacity_limited`) are in the run report.
+- Real-run fixes:
+  - case-insensitive, token-bounded pseudonymiser;
+  - the B11 built-ins (cookie, session and tracking values) in the egress shape check;
+  - per-line `egress_refused` with `max_refused_share`;
+  - stop file or SIGTERM gives a clean stop between calls;
+  - the run report is persisted through a progress callback;
+  - a pending proposal for the same template is reused without a call;
+  - model-labelled noise becomes a `noise` proposal for a human.
+- `logs coverage --date D [--from D0]` exits 1 when a day is open or an identity fails.
+  `docs/config.schema.json` was regenerated with `write_all`.
+
+**Tests:** 44 new (`tests/unit/test_fallback_extraction.py` 27, `test_fallback_realrun_fixes.py` 10,
+`tests/contract/test_fallback_daily.py` 7). The full suite gives 2253 passed and 1 skipped (a base
+test, skipped when google-re2 is installed) on the merged base; without this slice that is 2209 (2253 − 44,
+derived, not a separate run). `ruff check src tests` is clean. No pre-existing test was changed or removed.
+
+**Deviations from the plan**
+1. Extra unresolved reasons: `not_attempted` (fallback disabled), `field_gap` (no fill resolved the
+   gap) and `provider_error` (a call failed, never retried). With the fallback enabled, `format_only`
+   heads are sealed `fallback_pending`, because they are residue too.
+2. Identity D keeps `malformed` (the mapper drops malformed documents), as rev 3 confirms.
+   `independent_rest` is not offered: a counted `rest` needs a source-side `_count` (bug-fix/source
+   slice), so S is reported, not enforced.
+3. The reply cache is its own SQLite file next to the spend ledger, not ledger `raw:` entries. The
+   line-cache key also includes service and level (stricter than rev 3).
+4. `out_of_cluster` evidence only counts residue the entry's `applies_to` can see. Otherwise the same
+   template in another service (a separate cluster) always failed the gate. The `novelty` refusals
+   that remain (same regex proposed for another service) follow the existing L4a rule.
+5. `LineExtractionReply` carries no `entities` (B7: `model_line` feeds no graph edges).
+6. Routes have a `local`/`paid` tier from loopback detection. The `lan` tier, `egress.allow_lan`,
+   per-route time windows and invalid-reply limits are not implemented. A probe *command* is not
+   offered (config never names code); probes are HTTP GET only.
+7. Run caps are per route meter; the day and total caps are shared through the persistent ledgers.
+
+**Follow-ups (not done)**
+- Compose reading overlays (L5 B7 arm mapping), `ScopeResult.applied_extraction`, and `coverage_day`
+  documents.
+- Rev 4: `learning.bootstrap` (disabled by default, `require_measured_throughput`), `learn
+  measure-throughput --tier --clusters 50`, the `serving.answers` spend scope, and the uncapped-paid
+  check extended to `learning.bootstrap` and `serving.answers` chains.
+- The `lan` tier and time windows; the 11-day synthetic gold set E1/E1b with backlog trajectory; a
+  two-process test of `TotalSpendLedger` (same SQL pattern as the tested day ledger); the L4b
+  `patterns learn` CLI does not yet use the stop file, progress persistence or the pending-proposal
+  skip (only the fallback path does).
+- Real-model evaluation (local first, paid only within the owner's caps) in the external workspace.
+
+### 2026-11-04 — A2/S1a+S1b, U2, U3 (follow-up to the UI MVP): inspect routes, pattern review, ops views, log shortcuts — DONE (synthetic)
+
+Base `v2/logs` at `fdb7c4a` (MVP merged). Commits: `806c660` inspect routes, `c40558b` pattern
+review view + runs/spend + communities views, `78855b2` LAN forwarder origins + doctor TLS warning +
+served/archived days, `6f39af0` log shortcuts and overview tiles. (`17dae49`, copy-CLI commands and
+the Playwright CI job, was already merged upstream.)
+
+Done:
+- `serving/inspect.py`: `/v2/info`, `/v2/runs`, `/v2/spend`, `/v2/patterns/view` (generation
+  snapshot from the ledger), `/v2/patterns/review` (review queue), `/v2/graph/neighbourhood`,
+  `/v2/graph/edges/{id}`, `/v2/communities[/{id}]`; scope `inspect`; single-tenant 403 under an
+  access policy (B4); absent data → `available: false` + reason.
+- UI: Patterns (review queue first: proposals with regex, redacted examples, matched lines, gate
+  checks; shlex-quoted promote/deprecate/disable commands, text fallback without the clipboard API;
+  learned entries; generation snapshot; decision history), Runs & spend (generation info, served vs
+  archived days, multi-library note, run steps, spend ledger), Communities, Logs (tiles + shortcuts
+  from tool input schemas; hidden until `log_*` tools exist).
+- Hosts: Origins on `serving.allowed_hosts` names accepted (forwarder may rewrite Host); `doctor`
+  warns off-loopback without TLS.
+
+Deviations:
+- `/v2/patterns/review` reads the library **working files** (read-only, shas reported): proposals
+  exist to be reviewed before any generation, and no compose-time capture exists yet (plan §4.3 wants
+  generation-only reads for the patterns view; `/v2/patterns/view` keeps that rule).
+- `owner` in `/v2/patterns/view` is `null` when the snapshot records no author (not inferred).
+- `archived_days` is `null` until the manifest records archived days (the H1/history slice);
+  `library_identities` is computed from the served partitions.
+- Rev 3 fallback-state banner, per-tier call counts, paid burn and per-tier retention bytes, and
+  the Trends history windows are **not built**: their data (C-slice ledger tiers, history tier) is
+  not on this branch; the views will read them when the routes/fields exist.
+
+Tests: pytest `not external` 2088 passed, 108 skipped (new: `test_inspect_routes.py` 9,
+`test_ui_forwarder.py` 2). vitest 54 passed. ruff clean. Playwright smoke (synthetic logs engine,
+fake streaming model, 2 synthetic noise proposals): 9 screenshots, 0 CSP violations, 0 page errors.
+The CI `ui-e2e` job has not run on GitHub yet.
+
+## A2 C1–C4 rev 4 follow-ups and merges (2026-11-04, Claude)
+
+**Merges.**
+- `e95f6b0`: `42627b0` (raw tier, versioned snapshots). `schedule.py` uses only
+  `raw_reparse.open_raw`. The derived snapshot reads overlays through `OverlayStore.rows()`; the
+  base snapshot test now seals a real overlay, and there is an end-to-end round-trip test.
+- `1b6fd8c`: `dacd166` (L5 profile), resolved against the v2/logs head. The accounting row keys
+  were renamed to `account_owner`/`required_gaps` so L5's `pattern_owner`/`pattern_reviewed`/`gaps`
+  keep their meaning. Delta-reparse reuse requires `final_status`.
+
+**Done (commits `1b4ea4b`, `1ee7971`, `91e7eee`, `1132caa`, docs commit).**
+1. `learning.bootstrap`: off by default, `require_measured_throughput`, self-hosted routes only,
+   cap = min(150, measured calls/hour × `hours_per_day`). A finite `max_usd_per_day` is required when
+   a paid route can be reached.
+2. `su-multi-arm patterns measure-throughput --tier --clusters 50 --date` (`throughput.json`).
+3. `serving.answers` spend scope (`runtime/answers_spend.py`, `RunBudgetMeter`, `RunContext.spend`),
+   plus the fail-closed config rule for capped paid providers at answer time.
+4. Route `tier` (`local`/`lan`/`paid`), `egress.allow_lan`, UTC `windows`, `max_invalid_replies`.
+5. `patterns learn|propose`: stop file and SIGTERM (`paused`, exit 0), `--output` persisted per
+   cluster, pending-proposal skip.
+6. E1b synthetic fallback gold set with an oracle model; it found and fixed the cap-counting defect
+   (free clusters no longer take slots).
+7. `OverlayStore.rows()`/`latest()` break `created_at` ties on the manifest's write time. This was
+   found by the full suite under the `regex` engine (2338 passed, 0 failed) after the merges; with
+   google-re2 the suite gives 2457 passed and 1 failed (the stdio-subprocess re2 path artifact).
+
+**Tests:** 23 more in this round (routes/bootstrap 13, answers 2, learn run control 3, gold 4 and the
+snapshot round trip in `test_fallback_daily.py` 1). One pre-existing test changed:
+`test_the_day_cap_refuses_before_any_request_and_persists_across_runs` (run 2 skips pending
+templates; the persisted cap is still asserted in run 3). The base snapshot test changed from a fake
+`ov-1/rows.json` to a sealed overlay.
+
+**Deviations.**
+- The command is `patterns measure-throughput`, not `learn measure-throughput`: `learn` is a
+  `patterns` subcommand in this CLI.
+- `serving.answers` covers single answer-time roles. There are no serving route chains yet, so
+  "serving chains" is the rule for roles whose provider has a lifetime cap.
+- The tier is recorded per route in the run report, not per stored value.
+
+**Follow-ups.**
+- Compose mapping overlays into rollups and `applied_extraction` (L5/B7).
+- A counted `rest` (source slice).
+- Real-model and throughput measurement on the deployment, local first.
+- The MCP parity test's subprocess env could append to `PYTHONPATH` instead of replacing it, so
+  isolated engines carry over (owner of that test).
+
+## Logs branch integration: H1/H2 merge and fresh-install test run (2026-11-04, Claude)
+
+**Done.**
+- `19ad82b` merges `v2-logs-h1` (`b705f83`) into `v2/logs` (`312e314`) with `--no-ff`. Git merged it
+  without conflicts. CHANGELOG, VALIDATION and this log keep both sides. Both key sets stay: the
+  fallback's `account_owner`/`required_gaps` and L5's `pattern_owner`/`pattern_reviewed`/`gaps`.
+  The schema regenerated through `su_multi_arm.core.schema.write_all` with no diff.
+- `e6d3b79` fixes the tests for a fresh `[dev]`-only install (bare `pytest -q` from a `git archive`):
+  - The logs gold set (`tests/logs_gold_support.gold_config`) skips without networkx or a pattern
+    engine.
+  - `QUESTIONS` moved to `tests/logs_gold_support.py`. The history-tier tests imported it from the
+    fastapi-importing surface-parity module.
+  - Regex-engine tests skip through the existing `engine_or_skip`. This covers the redaction helper,
+    the learn CLI `fake` fixture, the run-control `session()`, the 10 learning-loop tests that use
+    the default engine, and the graph B7 test.
+  - Lazy fastapi/uvicorn imports use `importorskip`.
+- The 2 `TypeError: string indices` are not a product bug. Without the regex package,
+  `patterns learn` correctly exits 1 with `error: PatternEngineUnavailable ...`. The tests then
+  indexed that text as JSON. The tests now skip on the missing extra.
+- One real test bug: `test_raw_inside_the_installed_package_is_refused` pointed at `ROOT/src/...`.
+  On a non-editable install the imported package is in site-packages, so the check correctly did
+  not fire there. The test now targets `su_multi_arm.__file__`.
+
+**Tests.** Full venv `not external`: 2355 passed, 95 skipped (the same before and after the test
+fixes; only the line numbers in the skip reasons moved). Fresh `[dev]`-only: 1791 passed, 651
+skipped, 0 failed, 0 errors (was 59 failed / 89 errors). No test was removed. No assertion was
+weakened.
+
+**Notes.** With the anaconda `pytest` on `PATH` instead of the venv's, `tests/qa` qa10/qa11 fail.
+Their subprocess runs `sys.executable`, which has no `su_multi_arm`. This comes from the
+environment, not the code: run with `.venv/bin/python -m pytest`.

@@ -1,0 +1,94 @@
+# Example profile: daily log analytics (addendum A2 §4.1). The pattern extractor's output feeds every
+# arm: dense (signature and incident documents only, never line text), lexical (signatures, their
+# per-tenant redacted examples, incidents), structured (typed rollups with exactness and basis
+# roles), graph (span-anchored header links and line-scoped facts) and communities (co-firing
+# incidents). Serving is single-tenant: the operator sees all tenants (review B4); a tenant-scoped
+# access policy is refused under this profile.
+#
+# The deployment supplies sources:, logs: (source and partitions path), backends, storage and
+# extraction.pattern_library.path; configuration values override everything here.
+name: logs_example
+overlay:
+  metadata_schema:
+    timezone: UTC
+    unknown_fields: allow
+    fields:
+      - {name: date, type: date, groupable: true, sortable: true, time_basis: index_date}
+      - {name: ts_hour, type: datetime, groupable: true, sortable: true, time_basis: event_hour}
+      - {name: first_hour, type: datetime, sortable: true}
+      - {name: peak_hour, type: datetime, sortable: true}
+      - {name: last_hour, type: datetime, sortable: true}
+      - {name: first_seen, type: date, groupable: true, sortable: true}
+      - {name: last_seen, type: date, groupable: true, sortable: true}
+      - {name: tenant, type: string, groupable: true, listable: true}
+      - {name: env, type: string, groupable: true, listable: true}
+      - {name: deployment, type: string, groupable: true, listable: true}
+      - {name: service, type: string, groupable: true, listable: true}
+      - {name: level, type: string, groupable: true, listable: true}
+      - {name: status, type: enum, enum_values: [parsed, noise, unparsed, format_only, timeout], groupable: true}
+      - {name: signature_id, type: string, groupable: true, listable: true, max_catalog_cardinality: 2000}
+      - {name: category, type: string, groupable: true, listable: true}
+      - {name: pattern_id, type: string, groupable: true}
+      - {name: pattern_owner, type: enum, enum_values: [user, learned, none], groupable: true}
+      - {name: endpoint, type: string, groupable: true, listable: true}
+      - {name: http_method, type: string, groupable: true}
+      - {name: status_class, type: string, groupable: true, listable: true}
+      - {name: exception_class, type: string, groupable: true, listable: true}
+      - {name: community_id, type: string, groupable: true}
+      - {name: signatures, type: string}
+      - {name: services, type: string}
+      - {name: lines, type: integer, sortable: true}
+      - {name: lines_total, type: integer, sortable: true}
+      - {name: lines_pulled, type: integer, sortable: true}
+      - {name: lines_parsed, type: integer, sortable: true}
+      - {name: lines_noise, type: integer, sortable: true}
+      - {name: lines_unparsed, type: integer, sortable: true}
+      - {name: lines_format_only, type: integer, sortable: true}
+      - {name: lines_timeout, type: integer, sortable: true}
+      - {name: fragments, type: integer, sortable: true}
+      - {name: lines_window, type: integer, sortable: true}
+      - {name: lines_history, type: integer, sortable: true}
+      - {name: days_seen, type: integer, sortable: true}
+      - {name: tenants_affected, type: integer, sortable: true}
+      - {name: cells, type: integer, sortable: true}
+      - {name: latency_ms_sum, type: number, sortable: true}
+      - {name: latency_ms_count, type: integer, sortable: true}
+      - {name: latency_ms_max, type: number, sortable: true}
+      - {name: latency_ms_p95, type: number, sortable: true, additive: false}
+      - {name: coverage, type: number, sortable: true, additive: false}
+      - {name: row_exactness, type: enum, enum_values: [exact, approximate], role: exactness}
+      - {name: basis, type: string, role: basis}
+      - {name: extraction_source, type: enum, enum_values: [deterministic, model_assisted], role: extraction}
+      - {name: method, type: string}
+  extraction:
+    extractors: [pattern]
+    pattern_library:
+      log_links: true
+  communities:
+    strategy: declared
+    min_documents: 1
+  ingestion:
+    line_recipe:
+      fields: [exemplars]
+    projections:
+      exclude_kinds:
+        lexical: [unit_day, signature_day, service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour, log_day, log_hour, endpoint_day, endpoint_window, exception_day, coverage_day, signature_catalog, graph_link, signature_history, signature_lineage]
+        vector: [unit_day, signature_day, service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour, log_day, log_hour, endpoint_day, endpoint_window, exception_day, coverage_day, signature_catalog, signature_examples, graph_link, signature_history, signature_lineage]
+        graph: [service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour, log_day, log_hour, endpoint_window, coverage_day, signature_catalog, signature_history, signature_lineage]
+      embed_fields:
+        signature: [template]
+        incident: [summary]
+  privacy:
+    trace_masking: privacy
+  logs:
+    compose:
+      exemplars: per_tenant
+      kinds: {log_day: true, log_hour: true, endpoint_day: true, exception_day: true, coverage_day: true, incident: true}
+    retention:
+      derived: forever
+    history:
+      tier: true
+    intents:
+      enabled: true
+  tools:
+    enabled: [search, get_document, list_values, aggregate, log_top, log_new, log_affected, log_trend, log_compare, log_tenants, log_around, log_endpoints, log_signature, log_coverage, incidents, graph_neighbourhood]

@@ -663,7 +663,7 @@ def downgrade(v2: "ConfigV2") -> Config:
             threshold=v2.extraction.threshold,
             model=_model(roles.extractor),
         ),
-        privacy=PrivacyConfig(**v2.privacy.model_dump(exclude={"trace_masking"})),
+        privacy=_v1_privacy(v2.privacy),
         input_mapping=None if v2.ingestion.input_mapping is None else InputMapping(**v2.ingestion.input_mapping.model_dump()),
         arms=ArmsConfig(
             enabled=enabled,
@@ -710,3 +710,10 @@ def downgrade(v2: "ConfigV2") -> Config:
         ),
         max_llm_calls=v2.budgets.max_llm_calls,
     )
+
+
+def _v1_privacy(privacy: Any) -> PrivacyConfig:
+    """The v1 privacy keys; the B11 safe engine has no v1 equivalent."""
+    if privacy.engine != "legacy":
+        raise ConfigError("privacy.engine: safe has no schema_version 1 equivalent", "privacy.engine")
+    return PrivacyConfig(redact_emails=privacy.redact_emails, patterns=dict(privacy.patterns), metadata_fields=list(privacy.metadata_fields))

@@ -165,25 +165,25 @@ def test_verify_detects_an_injected_leak(eleven_days):
     pipe, backend = eleven_days["pipe"], eleven_days["backend"]
     tombstone = pipe.store.tombstone("2026-01-01")
     retention = Retention(eleven_days["cfg"], pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now)
-    assert retention.verify(date(2026, 1, 11))["ok"]
+    assert retention.verify(date(2026, 1, 12))["ok"]
     # a raw reply holding a day-1 source id that nothing references and nothing tagged
     sample_id = sorted(eleven_days["day1_source_ids"])[0]
     backend.ledger.put_raw("raw:leak", json.dumps({"note": f"seen {sample_id}"}), True)
     try:
-        result = retention.verify(date(2026, 1, 11))
+        result = retention.verify(date(2026, 1, 12))
         assert not result["ok"]
         assert any("expired content" in p for p in result["problems"]) and any("referenced by no remaining generation" in p for p in result["problems"])
     finally:
         backend.ledger.purge(PurgeSpec(unreferenced_prefixes=["raw:leak"]))
-    assert retention.verify(date(2026, 1, 11))["ok"]
+    assert retention.verify(date(2026, 1, 12))["ok"]
     assert tombstone is not None
 
 
 def test_retention_report_lists_what_is_kept(eleven_days):
     pipe, backend = eleven_days["pipe"], eleven_days["backend"]
-    report = Retention(eleven_days["cfg"], pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).report(date(2026, 1, 11))
+    report = Retention(eleven_days["cfg"], pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).report(date(2026, 1, 12))
     assert report["cutoff"] == "2026-01-02" and report["tombstones"] == ["2026-01-01"]
     assert [p["key"] for p in report["partitions"]] == [d.isoformat() for d in days(FIRST + timedelta(days=1), 10)]
     assert report["generations"][0]["active"] and report["generations"][0]["days"][0] == "2026-01-02"
     assert report["retained_beyond_window"]["decision"] == "O7" and report["retained_beyond_window"]["approved_examples"]
-    assert report["next_run"] == {"expire": [], "delete_generations": []}
+    assert report["next_run"] == {"expire": [], "expire_derived": [], "expire_raw": [], "delete_generations": []}

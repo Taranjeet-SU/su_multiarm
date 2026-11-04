@@ -27,7 +27,7 @@ outcome, then ``done`` with the same ``AnswerResult`` ``answer`` returns, or ``e
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import os
 import time
 import warnings
@@ -79,7 +79,8 @@ from .pipeline.validate import decision_for_mode, raise_for
 from .profiles.prompts import GENERATOR_PROMPT, voice_instruction
 from .providers import Embedder, JsonModel, RunBudgetMeter
 from .providers._chat import MissingSecret
-from .runtime.acl import ANONYMOUS, AccessPolicy, NoConstraints, Principal
+from .decision.log_guard import guard_active, log_scope_guard
+from .runtime.acl import ANONYMOUS, AccessPolicy, Principal, policy_from_config, require_single_tenant
 from .runtime.actions import ActionRequest, ActionRunner
 from .runtime.budget import BudgetLimits, load_price_table
 from .runtime.builtin_actions import BUILTIN_ACTIONS, ActionCall, LedgerAuditLog
@@ -129,6 +130,8 @@ def scope_result_of(aggregate: dict[str, Any]) -> ScopeResult:
         unknown=aggregate.get("unknown", {}),
         numerator=aggregate.get("numerator"),
         basis=aggregate.get("basis", []),
+        applied_basis=aggregate.get("applied_basis", []),
+        applied_extraction=aggregate.get("applied_extraction", []),
     )
 
 
@@ -158,6 +161,16 @@ class _Retrieval:
     filter_check: FilterCheck = field(default_factory=FilterCheck)  # request filters validated against the schema
 
 
+class _RecordsRouter:
+    """What the structured arm executes against when the history tier is on (``Engine.records_execute``)."""
+
+    def __init__(self, engine: Any):
+        self.engine = engine
+
+    def execute(self, gen: Any, spec: ScopeSpec, constraints: list[Any]) -> ScopeResult:
+        return self.engine.records_execute(gen, spec, constraints)
+
+
 class Engine:
     def __init__(self, config: Config | ConfigV1, components: Iterable[Any] = (), acl: AccessPolicy | None = None):
         if isinstance(config, ConfigV1):
@@ -167,7 +180,8 @@ class Engine:
         if not isinstance(config, Config):
             raise ConfigError("Engine needs a su_multi_arm.core.config.Config (v2) or a v1 Config")
         self.config = config
-        self.acl = acl or NoConstraints()
+        self.acl = acl or policy_from_config(getattr(config, "access", None))
+        require_single_tenant(config, self.acl)
         self.backends = self._build_backends()
         roles = config.models.roles
         self.embedder = Embedder(roles.embedder)
@@ -178,7 +192,12 @@ class Engine:
         deps = Dependencies(
             backends={**self.backends, "records": self.records},
             providers={"embedder": self.embedder, **self.models},
-            components={"catalog": catalog, **injected["models"]},
+            components={
+                "catalog": catalog,
+                **injected["models"],
+                **({"log_scope_guard": True} if guard_active(config) else {}),
+                **({"records_router": _RecordsRouter(self)} if config.logs is not None and config.logs.history.tier else {}),
+            },
             metadata_schema=config.metadata_schema,
         )
         self.extractor = BuiltinExtractor(config.extraction, deps)
@@ -198,6 +217,14 @@ class Engine:
             profile=config.profile,
             config_fingerprint=config.fingerprint(),
         )
+        # Cross-process generation pins (B8): with a ``logs`` section (``logs.pins``; the logs config
+        # only accepts registries that store pins) every request pins the generation it reads, so a
+        # retention run in another process waits instead of deleting it mid-request.
+        self.process_pins = None
+        if getattr(config, "logs", None) is not None:
+            from .ingestion.pins import ProcessPins
+
+            self.process_pins = ProcessPins.for_config(config, self.write_path.registry, current=self._current_generation, start=True)
         self.audit = LedgerAuditLog(getattr(self.backends[config.storage.ledger], "ledger"), config.dataset)
         self.actions = ActionRunner(
             self.audit,
@@ -500,6 +527,7 @@ class Engine:
             max_steps=runtime.config.decision.max_steps,
             id_patterns=runtime.id_patterns(),
             graph_templates={name: t.description for name, t in graph.templates.items()} if (graph := runtime.config.arms.graph) else {},
+            log_intents=bool(self.config.logs is not None and self.config.logs.intents.enabled),
         )
 
     def _limits(self) -> BudgetLimits:
@@ -523,9 +551,18 @@ class Engine:
             acl=self.acl,
             profile=self.config.profile,
             config_fingerprint=self.config.fingerprint(),
+            spend=self._answers_spend(),
         )
         ctx.trace.root.set(incomplete_stages=self._incomplete_stages(manifest))
         return ctx
+
+    def _answers_spend(self):
+        """The ``serving.answers`` spend scope, built once per engine (``None`` when disabled)."""
+        if not hasattr(self, "_answers_spend_cache"):
+            from .runtime.answers_spend import answers_spend_from_config
+
+            self._answers_spend_cache = answers_spend_from_config(self.config)
+        return self._answers_spend_cache
 
     # --- sessions ------------------------------------------------------------------------------
 
@@ -544,6 +581,25 @@ class Engine:
         """Pin the generation, open the session (budget clipped, memory re-validated) and build the
         context. Returns ``(ctx, pinned, session, session_trace, request)``."""
         pinned = self.write_path.pin()
+        generation = pinned[0].generation
+        self._hold(generation)
+        try:
+            return self._begin_pinned(principal, session_id, request, pinned)
+        except BaseException:
+            self._unhold(generation)
+            raise
+
+    def _hold(self, generation: str) -> None:
+        """Cross-process pin of the generation a request reads (B8, ``logs.pins``): retention cannot
+        delete it until the request ends (``_finish``) and, while it is current, between requests."""
+        if self.process_pins is not None:
+            self.process_pins.acquire(generation)
+
+    def _unhold(self, generation: str) -> None:
+        if self.process_pins is not None:
+            self.process_pins.release(generation)
+
+    def _begin_pinned(self, principal: Principal | None, session_id: str | None, request: SearchRequest | None, pinned: Any):
         if session_id is None:
             return self._context_for(principal, pinned), pinned, None, None, request
         session = self.sessions.open(principal or ANONYMOUS, session_id)
@@ -568,9 +624,12 @@ class Engine:
         return ctx, pinned, session, info, request
 
     def _finish(self, ctx: RunContext, session: Session | None, info: dict[str, Any] | None, query: str | None, shown: list[str], answer_id: str | None = None) -> None:
-        if session is None or info is None:
-            return
-        info["usage"] = self.sessions.finish(ctx, session, query, shown, answer_id)
+        try:
+            if session is None or info is None:
+                return
+            info["usage"] = self.sessions.finish(ctx, session, query, shown, answer_id)
+        finally:
+            self._unhold(ctx.generation.generation)
 
     @staticmethod
     def _incomplete_stages(manifest: dict[str, Any]) -> list[str]:
@@ -735,6 +794,8 @@ class Engine:
 
     def _run_step(self, ctx: RunContext, state: _Retrieval, step: Any) -> ArmResult:
         request, arms = state.request, state.pipe.arms
+        if isinstance(step, StructuredStep) and step.intent is not None:
+            return self._run_log_step(ctx, step)
         if isinstance(step, StructuredStep):
             arm = arms.get("structured")
             if arm is None:
@@ -759,6 +820,36 @@ class Engine:
             allow_incomplete=state.pipe.config.allow_incomplete_arms,
         )
         return arm.run(ctx, inputs)
+
+    def _run_log_step(self, ctx: RunContext, step: StructuredStep) -> ArmResult:
+        """A typed log intent (review B5): the same ``run_intent`` the log tools call. The aggregate
+        record carries ``intent``, ``args``, ``rows`` and ``rendering`` (the deterministic sentence
+        the answer quotes for its numbers)."""
+        from .arms.structured import aggregate_record
+
+        output = self.run_log_intent(ctx, step.intent)
+        result = output.result or ScopeResult(exactness="bounded", denominator=0, unsupported=[])
+        if output.status == "refused":
+            from .models import UnsupportedConstraint
+
+            result = result.model_copy(update={"exactness": "bounded", "unsupported": [UnsupportedConstraint(constraint_text=step.intent.intent, reason="not_supported_by_backend", suggestion=output.refusal)]})
+        else:
+            result = result.model_copy(update={"exactness": output.exactness})
+        record = aggregate_record(output.scope or step.scope, result)
+        record.update(
+            {
+                "intent": output.intent,
+                "args": output.args,
+                "rows": output.rows,
+                "rendering": output.rendering,
+                "status": output.status,
+                "source_unavailable": output.source_unavailable,
+                "methods": output.methods,
+            }
+        )
+        if output.document_ids:
+            record["document_ids"] = sorted(set(record.get("document_ids") or []) | set(output.document_ids))
+        return ArmResult(arm="structured", aggregates=[record])
 
     def _execute(self, ctx: RunContext, state: _Retrieval, steps: list[Any], query: str | None = None) -> PerArm:
         """Run plan steps in parallel; returns the new per-arm candidates and records the round."""
@@ -1237,7 +1328,7 @@ class Engine:
             emit(EvidenceEvent(ids=[row["id"] for row in evidence], omitted_ids=list(evidence_trace.get("omitted_ids", [])), truncated_ids=list(evidence_trace.get("truncated_ids", []))))
         answer = self._generate(ctx, state, evidence, on_delta=on_delta)
         evidence_ids = {row["id"] for row in evidence}
-        aggregates = [AggregateEvidence(id=a["id"], result=scope_result_of(a)) for a in state.aggregates if a["id"] in evidence_ids]
+        aggregates = [AggregateEvidence(id=a["id"], result=scope_result_of(a), rendering=a.get("rendering")) for a in state.aggregates if a["id"] in evidence_ids]
         manifest = pinned[1]
         checked = pipe.contract.enforce(
             answer,
@@ -1322,9 +1413,175 @@ class Engine:
     def list_values(self, field_name: str, limit: int = 100, principal: Principal | None = None) -> dict[str, Any]:
         """Distinct values of a ``listable`` field within the principal's ACL scope (serving surface
         ``/v2/values/{field}``; works whether or not the ``list_values`` tool is enabled)."""
-        ctx = self._context_for(principal)
-        values = self.values_in(ctx, field_name, limit + 1)
+        ctx, _pinned, _session, _info, _ = self._begin(principal, None)
+        try:
+            values = self.values_in(ctx, field_name, limit + 1)
+        finally:
+            self._finish(ctx, None, None, None, [])
         return {"field": field_name, "values": values[:limit], "truncated": len(values) > limit, "generation": ctx.generation.generation}
+
+    # --- LogOperations for the log tools (addendum A2 §4.1.5) ---------------------------------------
+
+    def log_context(self, ctx: RunContext) -> Any:
+        """Compilation context of the log intents: the anchor day in ``logs.timezone`` and the
+        count queries of the logs source (name -> lower-case levels)."""
+        from zoneinfo import ZoneInfo
+
+        from .decision.log_intents import CompileContext
+
+        logs = self.config.logs
+        if logs is None or not logs.intents.enabled:
+            raise RequestRejected("log tools need logs.intents.enabled")
+        source = self.config.sources.get(logs.source)
+        counts = {name: [lv.casefold() for lv in q.levels] for name, q in (source.counts.items() if source is not None else [])}
+        today = datetime.now(ZoneInfo(logs.timezone)).date()
+        return CompileContext(today=today, default_window=logs.intents.default_window, count_queries=counts)
+
+    def log_execute(self, ctx: RunContext, spec: ScopeSpec) -> ScopeResult:
+        """A compiled log scope on the record store under the caller's constraints (the scope guard
+        does not apply: the scope comes from a ``LogIntentCall``)."""
+        from .backends._scope import non_additive
+
+        refused = non_additive(spec, self.config.metadata_schema)
+        if refused is not None:
+            return ScopeResult(exactness="bounded", denominator=0, unsupported=[refused])
+        with ctx.trace.span("log_scope", kinds=[p.value for p in spec.predicates if p.field == "kind"]):
+            return self.records_execute(ctx.generation, spec, list(ctx.constraints()))
+
+    # --- history tier (H1): day kinds are read from the generation's day shards -------------------
+
+    @property
+    def history(self) -> Any:
+        from .ingestion.history import open_history, tier_enabled
+
+        if not tier_enabled(self.config):
+            return None
+        if getattr(self, "_history_store", None) is None:
+            self._history_store = open_history(self.config, self.backends)
+        return self._history_store
+
+    def history_shards(self, gen: Any) -> list[str] | None:
+        """The day shards generation ``gen`` references (``None``: no history tier)."""
+        if self.history is None:
+            return None
+        manifest = self.write_path.registry.manifest(gen.generation) or {}
+        return sorted((((manifest.get("logs") or {}).get("history") or {}).get("shards") or {}).values())
+
+    def records_execute(self, gen: Any, spec: ScopeSpec, constraints: list[Any]) -> ScopeResult:
+        """``RecordStore.execute`` with the history tier: a scope over day kinds reads the
+        generation's day shards (shard filter), any other scope the generation's records; a scope
+        mixing both is refused (``bounded``), never half answered."""
+        from .ingestion.history import DAY_KINDS
+        from .models import UnsupportedConstraint
+
+        shards = self.history_shards(gen)
+        if shards is None:
+            return self.records.execute(gen, spec, constraints)
+        kinds: set[str] | None = None
+        for p in spec.predicates:
+            if p.field == "kind" and not p.negate and p.op in {"eq", "in"}:
+                named = {p.value} if p.op == "eq" else set(p.value or [])
+                kinds = named if kinds is None else kinds & named
+        if kinds is not None and kinds and kinds <= DAY_KINDS:
+            return self.history.execute(shards, spec, constraints, self.config.metadata_schema)
+        if kinds is not None and not (kinds & DAY_KINDS):
+            return self.records.execute(gen, spec, constraints)
+        refused = UnsupportedConstraint(constraint_text="kind", reason="not_supported_by_backend", suggestion="with the history tier a scope names day kinds only or window kinds only (one kind condition)")
+        return ScopeResult(exactness="bounded", denominator=0, unsupported=[refused])
+
+    def history_weights(self, ctx: RunContext, link: Document, since: str | None = None) -> dict[str, int]:
+        """Per-day weights of a ``graph_link`` edge from the day shards (lines per day, from ``since``)."""
+        from .core.types import Measure, Predicate as P
+
+        kind_of = {"emits": ("signature_day", "lines"), "runs": ("unit_day", "lines_total"), "serves": ("endpoint_day", "lines"), "raises": ("exception_day", "lines")}
+        m = link.metadata
+        kind, measure = kind_of.get(str(m.get("predicate")), (None, None))
+        shards = self.history_shards(ctx.generation)
+        if kind is None or not shards:
+            return {}
+        sf, of = str(m.get("subject_field")), str(m.get("object_field"))
+        window = [P(field="date", op="range", lower=since)] if since else []
+        spec = ScopeSpec(
+            predicates=[P(field="kind", op="eq", value=kind), *window, P(field=sf, op="eq", value=m.get(sf)), P(field=of, op="eq", value=m.get(of))],
+            group_by=["date"],
+            measure=Measure(kind="sum", field=measure),
+        )
+        result = self.history.execute(shards, spec, list(ctx.constraints()), self.config.metadata_schema)
+        return {str(g.key["date"]): int(g.value) for g in result.groups if isinstance(g.value, (int, float))}
+
+    def log_manifest(self, ctx: RunContext) -> dict[str, Any]:
+        return self.write_path.registry.manifest(ctx.generation.generation) or {}
+
+    def run_log_intent(self, ctx: RunContext, call: Any) -> Any:
+        from .runtime.log_tools import run_intent
+
+        return run_intent(self, ctx, call)
+
+    def graph_view(self, ctx: RunContext, request: Any) -> Any:
+        """A bounded neighbourhood of the entity named ``request.entity`` (``graph_neighbourhood``)."""
+        from .backends import extras
+        from .core.types import TraversalSpec
+        from .providers import tokens
+        from .runtime.log_tools import GraphEdge, GraphNode, GraphView
+
+        arm = self.default.config.arms.graph
+        backend = self.backends[arm.backend if arm is not None else self.config.storage.communities]
+        graph = extras.require(backend, extras.GraphExtras, "graph", "find_entities")
+        scope = Scope(predicates=list(ctx.constraints()))
+        seeds = [e for e in graph.find_entities(ctx.generation, tokens(request.entity), scope) if e.name.casefold() == request.entity.casefold()]
+        if not seeds:
+            return GraphView(seeds=[], nodes=[], edges=[], note=f"no entity named {request.entity!r} in this generation")
+        spec = TraversalSpec(seed_entity_ids=[e.id for e in seeds], hops=request.hops, edge_kinds=list(request.edge_kinds), limit=request.limit + 1)
+        paths = backend.graph.traverse(ctx.generation, spec, scope)
+        truncated = len(paths) > request.limit
+        edges: dict[tuple[str, str, str, str], Any] = {}
+        node_ids: set[str] = {e.id for e in seeds}
+        for path in paths[: request.limit]:
+            node_ids.update(path.nodes)
+            for edge in path.edges:
+                edges.setdefault((edge.subject_id, edge.predicate, edge.object_id, edge.edge_kind), edge)
+        names = {}
+        for node in sorted(node_ids):  # one representative mention per node (a node has one per day document)
+            found = graph.mentions(ctx.generation, [node], scope, 1)
+            if found:
+                names[node] = found[0]
+        doc_ids = sorted({o.span.document_id for e in edges.values() for o in (e.occurrences or [])} | {e.span.document_id for e in edges.values()})
+        docs = {d.id: d for d in self.documents_in(ctx, doc_ids)} if doc_ids else {}
+        composed = (self.log_manifest(ctx).get("logs") or {}).get("as_of")  # the generation's last day, not the wall clock
+        anchor = request.as_of or (date.fromisoformat(composed) if isinstance(composed, str) else None)
+        since = (anchor - timedelta(days=request.days - 1)).isoformat() if anchor is not None else None
+        out_edges = []
+        for (subject, predicate, object_, kind), edge in sorted(edges.items()):
+            occurrence_docs = sorted({o.span.document_id for o in (edge.occurrences or [])} or {edge.span.document_id})
+            weights: dict[str, int] = {}
+            for doc_id in occurrence_docs:
+                doc = docs.get(doc_id)
+                if doc is None:
+                    continue
+                if doc.kind == "graph_link":
+                    for day, lines in self.history_weights(ctx, doc, since).items():
+                        weights[day] = weights.get(day, 0) + lines
+                    continue
+                day = doc.metadata.get("date")
+                lines = doc.metadata.get("lines", doc.metadata.get("lines_total"))
+                if isinstance(day, str) and isinstance(lines, int) and (since is None or day >= since):
+                    weights[day] = weights.get(day, 0) + lines
+            out_edges.append(
+                GraphEdge(
+                    subject=subject,
+                    predicate=predicate,
+                    object=object_,
+                    edge_kind=kind,
+                    support=edge.support,
+                    quote=edge.span.text,
+                    document_id=edge.span.document_id,
+                    occurrences=len(occurrence_docs),
+                    weights=[{"date": d, "lines": n} for d, n in sorted(weights.items())],
+                )
+            )
+        nodes = [GraphNode(id=n, name=names[n].name if n in names else n, type=getattr(names.get(n), "type", "") or "") for n in sorted(node_ids)]
+        note = "co_firing edges are statistical co-occurrence, not causality" if "co_firing" in request.edge_kinds else ""
+        return GraphView(seeds=[e.id for e in seeds], nodes=nodes, edges=out_edges, truncated=truncated, note=note)
 
     # --- EngineOperations for the built-in tools -------------------------------------------------
 
@@ -1337,7 +1594,12 @@ class Engine:
             return []
         catalog = self.backends[self.config.storage.catalog].catalog
         scope = Scope(predicates=list(ctx.constraints()), document_ids=list(ids))
-        return list(catalog.iter_scope(ctx.generation, scope, Page(size=len(ids))).items)
+        found = list(catalog.iter_scope(ctx.generation, scope, Page(size=len(ids))).items)
+        shards = self.history_shards(ctx.generation)
+        missing = [i for i in ids if i not in {d.id for d in found}]
+        if shards and missing:  # day documents live in the day shards (H1)
+            found.extend(self.history.documents(shards, missing))
+        return found
 
     def values_in(self, ctx: RunContext, field_name: str, limit: int) -> list[str]:
         spec = self.config.metadata_schema.field(field_name)
@@ -1359,7 +1621,12 @@ class Engine:
         check = check_request_filters(ValueResolver(self.config.metadata_schema, self.records, ctx.generation, ctx.constraints()), dict(filters))
         ctx.trace.event("request_filters", **check.trace())
         constraints = [*ctx.constraints(), *(Predicate(field=k, op="eq", value=v) for k, v in check.applied.items())]
-        result = self.records.execute(ctx.generation, spec, constraints)
+        from .backends._scope import non_additive
+
+        refused = non_additive(spec, self.config.metadata_schema) or (log_scope_guard(spec) if guard_active(self.config) else None)
+        if refused is not None:
+            return ScopeResult(exactness="bounded", denominator=0, unsupported=[refused])
+        result = self.records_execute(ctx.generation, spec, constraints)
         if check.unsupported:
             exactness = "bounded" if result.exactness == "exact" else result.exactness
             result = result.model_copy(update={"exactness": exactness, "unsupported": [*result.unsupported, *check.unsupported]})

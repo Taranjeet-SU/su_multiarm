@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 from ..core.errors import BackendError
 from ..core.types import GroupRow, ListedRecord, MetadataSchema, Predicate, ScopeResult, ScopeSpec, StructuredRecord
 from ._lucene_common import MATCH_NONE, predicate_query
-from ._scope import _basis, _flag, _numerator_share, calendar_label, order_groups, temporal_key, unsupported_reason, zone_of
+from ._scope import _basis, _flag, _numerator_share, calendar_label, order_groups, role_fields, temporal_key, unsupported_reason, zone_of
 
 if TYPE_CHECKING:  # pragma: no cover
     from .opensearch.adapter import OpenSearchBackend
@@ -55,7 +55,7 @@ PAIR_PAGE = 10_000
 ID_PAGE = 10_000
 CARDINALITY_PRECISION = 40_000  # the engines' maximum precision_threshold
 SAFE_INTEGER = 2**53
-INTERVALS = {"day": "1d", "month": "1M", "year": "1y"}
+INTERVALS = {"hour": "1h", "day": "1d", "month": "1M", "year": "1y"}
 KINDS = ("s", "n", "b")
 
 
@@ -372,7 +372,19 @@ class NativeAggregation:
             for p in applied
             if p.negate and p.op in {"eq", "in"} and (spec := self._spec(p.field)) is not None and spec.nullable
         ]
+        if scope.measure is not None and scope.measure.of is not None:
+            unsupported.append(
+                _flag(
+                    f"bucket of {scope.measure.of.kind}",
+                    "not_supported_by_backend",
+                    "a bucket of an inner measure is computed on the client aggregation path only (records.aggregation: client)",
+                )
+            )
         aggs: dict[str, Any] = {**self._kinds_aggs(probe_fields)}
+        # count semantics (B2): worst ``role: exactness`` value and the distinct basis/extraction values
+        roles = [(r, f) for r in ("exactness", "basis", "extraction") for f in role_fields(self.schema, r)]
+        for i, (_role, field) in enumerate(roles):
+            aggs[f"role{i}"] = {"terms": {"field": f"s.{field}", "size": 1000}}
         for i, field in enumerate(unknown_fields):
             aggs[f"unknown{i}"] = {"filter": _missing(field)}
         grouped = bool(scope.periods) or bool(scope.group_by)
@@ -431,7 +443,15 @@ class NativeAggregation:
         listed = self._listed(scope, query, kinds) if scope.limit is not None else []
         basis = _basis(scope, self.schema, applied, unknown) + self.approximate
         exactness = "bounded" if unsupported else ("approximate" if self.approximate else "exact")
+        role_values: dict[str, set[str]] = {"exactness": set(), "basis": set(), "extraction": set()}
+        for i, (role, _field) in enumerate(roles):
+            for bucket in first.get("aggregations", {}).get(f"role{i}", {}).get("buckets", []):
+                role_values[role].update(v for v in str(bucket["key"]).split(",") if v)
+        if exactness == "exact" and "approximate" in role_values["exactness"]:
+            exactness = "approximate"
         return ScopeResult(
+            applied_basis=sorted(role_values["basis"]),
+            applied_extraction=sorted(role_values["extraction"]),
             exactness=exactness,
             denominator=population,
             value=value,

@@ -49,6 +49,25 @@ class Community(StrictModel):
         return cls(id=id, label=label, document_ids=document_ids, entity_ids=entity_ids, report=report, **meta)
 
 
+def louvain_partitions(memberships: dict[str, set[str]], seed: int, resolution: float = 1.0) -> list[list[frozenset[str]]]:
+    """Seeded Louvain over the entity-document bipartite graph, **reproducible across processes**
+    (O3): nodes are integers assigned in sorted label order (``e:<entity>`` and ``d:<document>``)
+    and edges are added in sorted order, so neither ``networkx``'s internal sets nor the caller's
+    set/dict order depend on ``PYTHONHASHSEED``. Returns every pass (finest first) as label sets;
+    ``[]`` when the graph has no edge."""
+    import networkx as nx
+
+    labels = sorted({"e:" + key for key in memberships} | {"d:" + doc for docs in memberships.values() for doc in docs})
+    number = {label: n for n, label in enumerate(labels)}
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(labels)))
+    graph.add_edges_from(sorted((number["e:" + key], number["d:" + doc]) for key in memberships for doc in memberships[key]))
+    if not graph.number_of_edges():
+        return []
+    passes = nx.community.louvain_partitions(graph, seed=seed, resolution=resolution)
+    return [sorted((frozenset(labels[n] for n in group) for group in partition), key=sorted) for partition in passes]
+
+
 def build_communities(
     strategy: str, memberships: dict[str, set[str]], names: dict[str, str], min_documents: int, seed: int, hierarchy: Any = None
 ) -> list[Community]:
@@ -67,17 +86,11 @@ def build_communities(
         ]
     if strategy != "louvain":
         raise ValueError(f"unknown community strategy {strategy!r}")
-    import networkx as nx
-
-    graph = nx.Graph()
-    for key, docs in memberships.items():
-        graph.add_node("e:" + key)
-        for doc in docs:
-            graph.add_edge("e:" + key, "d:" + doc)
-    if not graph.number_of_edges():
+    partitions = louvain_partitions(memberships, seed)
+    if not partitions:
         return []
     result = []
-    for group in nx.community.louvain_communities(graph, seed=seed):
+    for group in partitions[-1]:
         keys = {n[2:] for n in group if n.startswith("e:")}
         docs = {n[2:] for n in group if n.startswith("d:")}
         if len(docs) >= min_documents and keys:
@@ -91,3 +104,39 @@ def build_communities(
                 )
             )
     return sorted(result, key=lambda c: c.id)
+
+
+DECLARED_FIELD = "community_id"
+DECLARED_STATS = ("window_first", "window_last", "first_hour", "peak_hour", "last_hour", "lines", "signatures", "services", "tenant", "row_exactness", "pairs")
+
+
+def declared_communities(corpus: list[Any], mentions: list[Any], min_documents: int) -> list[Community]:
+    """``communities.strategy: declared``: one community per distinct ``community_id`` metadata
+    value (the co-firing incidents of the logs profile, ``communities/cooccurrence.py``). Members
+    are those documents; entities are the mentions anchored in them; ``stats`` copies the declared
+    incident statistics. Deterministic: ids and members are sorted, no clustering runs."""
+    groups: dict[str, list[Any]] = {}
+    for document in corpus:
+        value = document.metadata.get(DECLARED_FIELD)
+        if isinstance(value, str) and value:
+            groups.setdefault(value, []).append(document)
+    entities: dict[str, set[str]] = {}
+    for mention in mentions:
+        entities.setdefault(mention.span.document_id, set()).add(mention.id)
+    out = []
+    for key in sorted(groups):
+        docs = sorted(groups[key], key=lambda d: d.id)
+        if len(docs) < min_documents:
+            continue
+        first = docs[0]
+        stats = {k: first.metadata[k] for k in DECLARED_STATS if k in first.metadata}
+        out.append(
+            Community(
+                id=key,
+                label=str(first.metadata.get("community_label") or first.title or key),
+                document_ids=[d.id for d in docs],
+                entity_ids=sorted(set().union(*(entities.get(d.id, set()) for d in docs))),
+                stats=stats,
+            )
+        )
+    return out

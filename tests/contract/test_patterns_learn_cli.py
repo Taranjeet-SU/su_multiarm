@@ -11,12 +11,14 @@ import yaml
 
 from su_multi_arm.core.config import load_config
 from su_multi_arm.core.errors import ConfigError
+from tests.pattern_fixtures import engine_or_skip
 from tests.pattern_learning_support import HOSTED_ROLE, FakeLearner, config_data, learning_lines, library_dir
 from tests.unit.test_config_cli_a2 import run_main
 
 
 @pytest.fixture
 def fake(monkeypatch):
+    engine_or_skip("regex")  # every test of a learning run uses the default development engine
     from su_multi_arm.providers import base
 
     learner = FakeLearner()

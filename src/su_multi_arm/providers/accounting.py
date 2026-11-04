@@ -24,6 +24,7 @@ class RunBudgetMeter:
     def __init__(self, ctx: RunContext, stage: str, pricing_key: str | None):
         self.ctx, self.stage, self.pricing_key = ctx, stage, pricing_key
         self._reservations: list[Any] = []
+        self._spend: Any = None  # the serving.answers reservation of the call in flight
 
     def remaining_seconds(self) -> float | None:
         return self.ctx.budget.remaining("wall_clock")
@@ -36,6 +37,16 @@ class RunBudgetMeter:
             input_tokens=estimate.input_tokens,
             output_tokens=estimate.output_tokens,
         )
+        spend = getattr(self.ctx, "spend", None)
+        if spend is not None:
+            usd = sum(r.estimate for r in self._reservations if r.kind == "usd")
+            try:
+                self._spend = spend.reserve(usd, self.pricing_key)
+            except Exception:
+                for reservation in self._reservations:
+                    self.ctx.budget.release(reservation)
+                self._reservations = []
+                raise
 
     def _cost(self, usage: dict[str, Any]) -> float | None:
         table = self.ctx.budget.price_table
@@ -67,7 +78,11 @@ class RunBudgetMeter:
                 budget.commit(reservation, int(usage.get("output_tokens") or 0))
             elif reservation.kind == "usd":
                 budget.commit(reservation, cost if cost is not None else reservation.estimate)
+        estimated = sum(r.estimate for r in self._reservations if r.kind == "usd")
         self._reservations = []
+        if self._spend is not None:  # serving.answers: the measured spend (the estimate when unreported)
+            self.ctx.spend.commit(self._spend, cost if cost is not None else estimated)
+            self._spend = None
         self.ctx.trace.event(
             "model_call",
             stage=item.get("stage"),

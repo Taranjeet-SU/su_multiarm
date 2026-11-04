@@ -86,8 +86,36 @@ def _labels(name: str) -> list[str]:
     return sorted({name, spaced}, key=len, reverse=True)
 
 
-def _field_qualifiers(query: str, schema: MetadataSchema, units: set[str], taken: list[tuple[int, int]]) -> list[tuple[int, Qualifier]]:
-    """``field`` candidates: a filterable field's name next to a value of its type (B1)."""
+# "by <field>", "per <field>", "for each <field>", "across <field>": the field is a group-by, not a
+# qualifier, so the word after it is never that field's value.
+_GROUP_CUE = re.compile(r"(?:\bby|\bper|\beach|\bacross|\bgrouped\s+by|\bbroken\s+down\s+by)\s*$", re.I)
+
+
+def _field_name_spans(query: str, schema: MetadataSchema) -> list[tuple[int, int]]:
+    """Where a declared field's identifier (``lines_matching_level_fatal``) occurs as one word. A
+    value or field name found **inside** such a span is part of the field's name, never a qualifier
+    (P11: an enum value ``fatal`` inside a numeric field's name)."""
+    spans: list[tuple[int, int]] = []
+    folded = query.casefold()
+    for spec in schema.fields:
+        if "_" not in spec.name:
+            continue
+        for match in re.finditer(r"(?<![\w])" + re.escape(spec.name.casefold()) + r"(?![\w])", folded):
+            spans.append((match.start(), match.end()))
+    return spans
+
+
+def _inside(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
+    return any(a <= span[0] and span[1] <= b and (a, b) != span for a, b in spans)
+
+
+def _field_qualifiers(query: str, schema: MetadataSchema, units: set[str], taken: list[tuple[int, int]], names: list[tuple[int, int]] | None = None) -> list[tuple[int, Qualifier]]:
+    """``field`` candidates: a filterable field's name next to a value of its type (B1). Not a
+    candidate: a field name inside a longer field identifier, a field named as a group-by
+    (``by service``) followed by a word that is not linked to it, and a value word that is a
+    calendar expression (``by service yesterday``: ``yesterday`` is a time qualifier)."""
+    names = names if names is not None else _field_name_spans(query, schema)
+    times = [(m.start(), m.end()) for m in _TIME.finditer(query)]
     found: list[tuple[int, Qualifier]] = []
     for spec in schema.fields:
         if not spec.filterable or spec.type in {"datetime", "date"}:
@@ -106,6 +134,13 @@ def _field_qualifiers(query: str, schema: MetadataSchema, units: set[str], taken
                 vspan = (match.start("val"), match.end("val"))
                 if any(a < vspan[1] and vspan[0] < b for a, b in taken):
                     continue  # the value is already a ``value`` candidate
+                if _inside((match.start(), match.start() + len(label)), names) or _inside(vspan, names):
+                    continue  # part of a longer field identifier
+                if spec.type in {"string", "id", "enum"} and any(a < vspan[1] and vspan[0] < b for a, b in times):
+                    continue  # a calendar word ("yesterday") is a time qualifier, never a word value
+                linked = query[match.start() + len(label) : vspan[0]].strip() != ""
+                if not linked and _GROUP_CUE.search(query[: match.start()]):
+                    continue  # "by <field>": a group-by, the next word is not its value
                 folded = value.casefold()
                 if spec.type in {"string", "id"} and (folded in _FUNCTION_WORDS or folded in units):
                     continue
@@ -116,6 +151,8 @@ def _field_qualifiers(query: str, schema: MetadataSchema, units: set[str], taken
             if spec.type == "boolean":
                 valued = {p for p, q in found if q.field == spec.name}
                 for match in re.finditer(head, query.casefold()):
+                    if _inside((match.start(), match.end()), names) or _GROUP_CUE.search(query[: match.start()]):
+                        continue
                     if match.start() not in valued:
                         valued.add(match.start())
                         found.append((match.start(), Qualifier(kind="field", text=query[match.start() : match.end()], field=spec.name, compare=True)))
@@ -139,18 +176,21 @@ def qualifier_candidates(query: str, schema: MetadataSchema, resolver: ValueReso
         values = spec.enum_values if spec.type == "enum" else (resolver.observed(spec.name) if resolver is not None else None)
         universe.extend((spec.name, v) for v in values or [] if isinstance(v, str))
         universe.extend((spec.name, s.name) for s in spec.states)  # declared states ("open")
+    names = _field_name_spans(query, schema)
     for field, value in sorted(universe, key=lambda fv: len(fv[1]), reverse=True):
         folded = value.casefold().strip()
         if len(folded) < 2 or folded in units:
             continue
         for match in re.finditer(_word_pattern(folded), text):
             span = (match.start(), match.end())
+            if _inside(span, names):
+                continue  # "fatal" inside "lines_matching_level_fatal" names the field, not a value
             if any(a < span[1] and span[0] < b for a, b in taken if (a, b) != span):
                 continue  # inside a longer value already found
             if span not in taken:
                 taken.append(span)
             found.append((match.start(), Qualifier(kind="value", text=query[span[0] : span[1]], field=field, value=value)))
-    fields = _field_qualifiers(query, schema, units, taken)
+    fields = _field_qualifiers(query, schema, units, taken, names)
     found.extend(fields)
     for match in _TIME.finditer(query):
         if any(f.value is not None and p <= match.start() < p + len(f.text) for p, f in fields):

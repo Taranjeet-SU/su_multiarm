@@ -7,6 +7,120 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Accounted coverage and LLM fallback extraction (preview, addendum A2 §4.2, slices C1–C4)
+
+- **Accounting** (`ingestion/accounting.py`): every head gets one final status (`parsed`,
+  `parsed_filled`, `provisional`, `model_line`, `noise`, or `unresolved` with a reason from a closed
+  list). Identities Q, D and H are checked before the seal, and an imbalance refuses it
+  (`AccountingImbalance`, version stays open). Match rows carry `final_status`, `reason`,
+  `pattern_owner`, `extraction_source` and `gaps`; the partition manifest carries per-unit
+  accounting. New keys `logs.accounting.{required_fields, validators, targets}`.
+- **Fallback overlays** (`ingestion/overlay.py`, `learning/extraction/`): after the seal, residue
+  clusters get one `pattern_learner` call each (labels on the synthesised `vN`/`maskN` groups, or a
+  regex) through the full gate. Field gaps get a gated `fix`, then capped line quotes, and singletons
+  get a capped per-line tail. Values are always spans of the line. Replies are cached; overlays are
+  keyed by a fallback identity and rebuilt from the cache when stale. New keys
+  `learning.extraction.*`, `models.roles.log_extractor`, `models.routes.*` and
+  `budgets.providers.<provider>.max_usd_total`.
+- **Provider routes**: ordered local → local → paid routes per role, with health and capacity
+  probes. No route available gives `capacity_deferred` (retried next run). A paid route after a local
+  one runs only with `models.routes.allow_paid_fallback: true`. A paid route is refused at config
+  load without a price table, a finite provider total and finite daily and run USD caps. Local routes
+  record calls and tokens at USD 0. A total-period spend ledger projects days until exhaustion.
+- **`run-daily`** gains the `fallback` and `apply_decisions` steps. `su-multi-arm logs coverage`
+  prints regex-only and with-model numbers with fragment accounting.
+- **Route tiers** `local`/`lan`/`paid` (`lan` needs `egress.allow_lan`), UTC time windows and an
+  invalid-reply limit per route. **`learning.bootstrap`** (off by default) runs on self-hosted routes
+  only, refuses an unmeasured start, and is capped by measured throughput. **`patterns
+  measure-throughput --tier --clusters 50 --date`** records calls/hour and tokens/s.
+  **`serving.answers`** is a persistent answer-time spend scope. The cluster cap now counts only
+  clusters that need a model call. E1b adds the synthetic fallback gold set
+  (`testing/fixtures/logs/fallback_gold.py`).
+- **`patterns learn|propose`**: a stop file or SIGTERM gives a clean stop (`paused`), `--output` is
+  persisted per cluster, and a template with a pending proposal gets no new call.
+- **Changed (egress):** a line with a residual PII, cookie, session or tracking shape is refused on
+  its own (`egress_refused`), and the run is refused only above `max_refused_share`. The B11
+  built-in redactors are part of the egress shape check. Pseudonymisation is case-insensitive and
+  token-bounded. A model-labelled noise pattern becomes a `noise` proposal for a human, never an
+  auto-promoted message.
+
+### Logs analytics profile (addendum A2 L5a–L5d, M1, B2+B3; synthetic/contract evidence)
+
+- **`profile: logs_example`**: the pattern extractor's output feeds every arm. Dense: `signature`
+  (masked human template; the regex moved to metadata `regex`) and `incident` documents only.
+  Lexical: signatures, per-tenant redacted `signature_examples`, incidents. Structured: typed
+  rollups `log_day`, `log_hour`, `endpoint_day`, `endpoint_window`, `exception_day`, `coverage_day`,
+  `signature_catalog` (first/last seen over all served history) next to the A1 kinds. Graph:
+  span-anchored header links `emits`/`runs`/`serves`/`raises` (`native_link`) with per-day weights,
+  line-scoped facts of reviewed entries, `co_fires_with` (`co_firing`, new edge kind, not traversed
+  by default). Communities: co-firing incidents per tenant (`communities.strategy: declared`).
+- **Partition format 2:** typed values with spans and gaps, `pattern_owner`, `deployment` and
+  exactness in hourly cells, analytics aggregates and a library digest (`patterns.json`); an older
+  partition is reparsed before compose.
+- **Delta reparse** (`ingestion/reparse.py`): change classes A–H, an engine-`Set` steal scan over the
+  stored lines, rows outside the delta copied; delta == full (seeded property test); content-addressed
+  day documents are reused.
+- **Ten typed log intents** (`decision/log_intents.py`) and tools (`runtime/log_tools.py`):
+  `log_top`, `log_new`, `log_affected`, `log_trend`, `log_compare`, `log_tenants`, `log_around`,
+  `log_endpoints`, `log_signature`, `log_coverage`, plus `incidents` and `graph_neighbourhood`.
+  Every decision agent (rules, llm, cascade) goes through one typed `StructuredStep.intent`; the
+  engine compiles the scopes; aggregates carry `intent`, `args`, `rows` and a deterministic
+  `rendering` (basis, exactness with method, time basis, `source_unavailable` days).
+- **Scope guard** (`decision/log_guard.py`): under the profile a kind-less, negated or multi-kind
+  scope is refused with `intent_required` (decision steps, the request aggregate, the HTTP and MCP
+  `aggregate` tool); `logs.serving.allow_adhoc_scopes` opts out.
+- **Count semantics (B2+B3):** `FieldSpec.role` (`exactness`, `basis`, `extraction`) gives worst-row
+  exactness and `ScopeResult.applied_basis`/`applied_extraction`; `FieldSpec.additive: false` refuses
+  sum/avg (`measure_unsupported`); `Sort(field="$measure")`; `Measure(kind="bucket", of=...)`; the
+  `hour` granularity.
+- **MCP:** the log tools are MCP tools with `readOnlyHint: true`; `serving.mcp.mount_on_http` mounts
+  streamable HTTP at `/mcp` on the HTTP app (SDK DNS-rebinding protection, optional
+  `serving.mcp.token_env`); the existing tools are unchanged.
+- **Single tenant:** a tenant-scoped access policy is refused under the profile (`Engine`,
+  `create_app`, `create_mcp`); new `access.policy: none | tenant` for other profiles.
+
+### History tier and lineage (addendum A2 H1/H2)
+
+- `logs.history.tier: true` (on in `logs_example`): day documents become content-addressed,
+  append-only day shards (sqlite, or `logs.history.backend` such as OpenSearch); a generation is the
+  window shard plus shard refs; every read of a day kind filters by the pinned generation's shard
+  set; gc by reference; imports the per-day derived snapshots (formats 1 and 2). Appending a day
+  writes that day's rows only.
+- `signature_lineage` (supersede decisions) and `signature_history` (per library identity); log
+  tools fold superseded signatures into their successor. New kinds `graph_link` (one per header link
+  of the served history, per-day weights from the shards).
+- `graph_neighbourhood.days` (default 30) bounds the per-day weights.
+
+### Fixed (logs analytics)
+
+- Generated answers to grouped-sum questions no longer abstain when they state the group values,
+  their total, the number of groups shown or the grouped population; every aggregate record carries a
+  deterministic `rendering`, and an answer stating a number the cited exact aggregate does not back has
+  its text replaced by the rendering (recorded as `answer_number_mismatch`, action `strip`) instead
+  of abstaining; without a rendering it still abstains.
+- sqlite typed scope: the correlated field lookup now always uses the `(owner, field)` index; the
+  planner chose the `(field, value)` index and scanned every row of that value per record (1.8 s →
+  0.02 s for 4.6×10³ records).
+
+### Web UI (preview, addendum A2 §4.4)
+
+- **Read-only web UI** in the separate wheel `su-multi-arm-ui` (`ui/`, Vite + React + TypeScript; the
+  built bundle is committed under `ui/python/su_multi_arm_ui/static`). `serving.ui.enabled: true`
+  mounts it at `/ui` on the HTTP app (same origin, same `PrincipalResolver`); the wheel missing is a
+  `ConfigError`. Views: Ask (SSE stream, citations, contract status and violations), evidence per arm
+  (structured aggregates with exactness, basis, denominator, truncated-ids flag), graph explorer
+  (graph-arm evidence; no fabricated edges), grouped-aggregate charts and a trace panel (decision,
+  arms, timings, model calls and spend).
+- **Browser guards (B10, N12).** With the UI enabled: Host allow-list (421) and cross-origin `Origin`
+  refusal on writes and the answer stream (403); strict CSP and security headers on `/ui/*`;
+  `X-Content-Type-Options: nosniff` on every `/v2/*` response. `ui.enabled` requires bearer auth or an
+  injected resolver unless `serving.ui.allow_unauthenticated_loopback: true`.
+- New config keys `serving.ui.*` and `serving.allowed_hosts`; `docs/config.schema.json` regenerated.
+- The built-in principals gain the read-only `inspect` scope (for the A2 inspect routes).
+- **Fixed:** `serve` ignored `serving.http.bind`; it now takes host and port from it unless
+  `--host`/`--port` are given, and its non-loopback guard accepts `serving.http.auth: bearer_env`.
+- New extra `su-multi-arm[ui]` (not in `all`); the core sdist excludes `ui/`.
+
 ### Log features
 
 - **LLM pattern learning** (addendum A1, slice L4b). `su-multi-arm patterns learn` runs one loop:
@@ -30,6 +144,40 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 - **Index-name grammar** (`sources.<name>.index_name`). Optional `prefix`, optional
   `deployment_prefixes` (`{n}` = digits; recorded as the `deployment` attribute) and vocabularies for
   any segment. A name that does not fit exactly once is `unparsed` with a typed `reason`.
+- **Safe redaction** (B11, `privacy.engine: safe`). Named redactors (`email`, `ipv4`, `ipv6`,
+  `bearer_token`, `jwt`, `api_key`, `aws_key`, `url_credentials`, `query_values`, `uuid` and
+  `request_id` hashed, `hex_secret`, and the payload classes `llm_text`, `content`, `query`,
+  `tracking_id` hashed, `record_payload` with configurable field lists, `pg_row`), user redactors
+  (`privacy.custom`) validated by the pattern engine's RE2-subset and ReDoS lint and run on the
+  configured engine (fail closed on a timeout). Runs before any partition write, on ingested
+  documents and on every prompt line; stamped (`safe:<sha16>`), counts per redactor in the partition
+  manifest. `logs run-daily|backfill|settle` run from the CLI with a safe redactor and still refuse
+  without one. `su-multi-arm privacy scan` is a content-free leak scan (text, `.gz`, SQLite).
+- **Retention scopes** (`logs.retention.raw_days`, `partition_days`/`keep_days`, `derived:
+  window|forever|<days>`) and the optional **raw-copy tier** (`logs.partitions.raw`, off by default,
+  0700/0600, `logs reparse --from-raw`, `privacy scan --raw`). With `derived: forever` composed days
+  stay served after their partitions expired (masked exemplars kept indefinitely).
+- **Interim derived archive** (A2 §4.8.6): per-day snapshots with `derived_format: 2`, an identity
+  over partition format, fallback identity and compose format, typed-value aggregates, overlay rows
+  and accounting; format-1 snapshots read and marked. `logs.history.serve_days` (default
+  `keep_days`) and `max_serve_rows` bound what compose serves; window rollups cover the masked
+  window; a manifest flag when served days span several library identities; day documents cached by
+  snapshot identity.
+- **Raw tier hardening**: parent-directory check, served-directory check, exact 0700/0600 verify,
+  every access through `ingestion/raw_reparse.py`, and a redaction change re-derives only days the
+  raw tier still holds (`rederive` step).
+- **Host guard** also when `serving.allowed_hosts` is non-empty (API-only behind a LAN forwarder)
+  and on the standalone MCP HTTP app.
+- **A2 rev 3/4 amendment of A1 §3.8.3**: rule (a) and the content-based verify are scoped to the
+  masked tier; derived and raw tiers have their own clocks and checks.
+- **Index-name grammar**: `deployment_position: before_service | after_env` (env-anchored), and
+  `unparsed: exclude` (counted as `excluded_scope.unparsed_name`).
+- **Multiline**: `closing_bracket` and contextual `python_traceback` rules (column-0 tracebacks), and
+  approved library `continuation` entries are applied when joining lines.
+- **Pattern library**: `noise` entries take `precedence: before_message` to win over a message.
+- **Sources**: the probe's PIT check is opt-in (`--probe-pit`) and skipped when unsupported or
+  `sources.<n>.disallow: [pit]`; `--request-log` writes a content-free request log; the privilege
+  endpoint is asked once.
 - **Configuration.** New keys `learning.patterns`, `models.roles.pattern_learner`,
   `extraction.pattern_library.gate.min_cluster_coverage` / `max_out_of_cluster`, and the
   `index_name` grammar keys; the config schema is regenerated.
@@ -40,6 +188,32 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
   multi-token tenant (previously "the first prefix field keeps extra separators") now needs a tenant
   vocabulary, and a name with an undeclared left-side prefix is `unparsed` instead of being read
   into the tenant.
+- **`keep_days` is the N most recent complete days** before today (`today - N` .. `today - 1`).
+  `run-daily` composes that window and runs retention as of today; `retention --date D` takes D as
+  today. Previously `run-daily` and the CLI used different reference days.
+- **`patterns lint`** prints every issue (also structured) and exits 1 on errors instead of failing
+  at load with a truncated message. **`patterns coverage|mine`** apply multiline joining and count
+  fragments like ingest (`--no-multiline` for the old per-line behaviour).
+- **`serve`** binds to `serving.http.bind` (and its token variable) unless overridden.
+- **Request filters** on `id`, `source`, `dataset`, `kind` are accepted without a schema entry.
+- **Aggregates** carry `measure` (the measure kind, e.g. `sum` of a field).
+- **Manifest**: `native_link_relations` counted; a local embedder's unused `base_url` is omitted.
+
+### Fixed
+
+- Grammar false positives that made complete aggregates `bounded`: "by <field> yesterday" and an
+  enum value inside a numeric field's name (real dropped qualifiers still bound the result).
+- OpenSearch/Elasticsearch: a dataset or index prefix containing `_` no longer makes the adapter
+  read its own index as foreign (every request 503); activation reads each pointer back before
+  `CURRENT` moves.
+- HTTP 503s log their cause (class, adapter, operation; no request content); `/ready` reports
+  `not_ready` when the active generation cannot be served.
+- Louvain communities are identical across processes for the same input and seed.
+- The serving path pins the generation of every request (cross-process pins), so retention cannot
+  delete it mid-request or mid-stream.
+- The PostgreSQL native-types conformance test read records after another check overwrote them.
+- Compose of 10^6 aggregate rows fits the memory budget (catalog/records written in batches,
+  catalog-only chunks dropped after their batch; 3.94 GiB peak, was 10.28 GiB).
 
 ### Added
 

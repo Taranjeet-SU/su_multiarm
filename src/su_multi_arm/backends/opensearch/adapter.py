@@ -52,6 +52,14 @@ KNN_ENGINES: dict[int, frozenset[str]] = {2: frozenset({"lucene", "faiss", "nmsl
 DOCS_PATTERN = re.compile(r"^(?P<prefix>[a-z][a-z0-9_]*)_(?P<dataset>[a-z0-9][a-z0-9_-]*)_(?P<generation>[0-9a-f]{32})_docs$")
 
 
+def docs_index_parts(name: str, prefix: str) -> tuple[str, str] | None:
+    """``(dataset, generation)`` of ``<prefix>_<dataset>_<generation>_docs`` for **this** adapter's
+    prefix, else ``None``. The prefix is matched literally, so an ``_`` in the prefix or in the
+    dataset name cannot shift the split (a free prefix group would take the dataset's ``_``)."""
+    match = re.fullmatch(re.escape(prefix) + r"_(?P<dataset>[a-z0-9][a-z0-9_-]*)_(?P<generation>[0-9a-f]{32})_docs", name)
+    return None if match is None else (match.group("dataset"), match.group("generation"))
+
+
 def records_options(config: Any) -> dict[str, Any]:
     """Constructor arguments of a ``LuceneBackend.records`` block (absent: the defaults)."""
     records = getattr(config, "records", None)
@@ -281,10 +289,10 @@ class OpenSearchBackend:
         names = self.alias_indices(self.alias(dataset, "docs"), "active_generation")
         generations = set()
         for name in names:
-            match = DOCS_PATTERN.match(name)
-            if match is None or match.group("prefix") != self.prefix or match.group("dataset") != dataset:
+            parts = docs_index_parts(name, self.prefix)
+            if parts is None or parts[0] != dataset:
                 raise BackendError(self.kind, "active_generation", f"alias serves a foreign index {name}")
-            generations.add(match.group("generation"))
+            generations.add(parts[1])
         if not generations:
             return None
         if len(generations) != 1:
@@ -373,9 +381,9 @@ class OpenSearchBackend:
         reply = self.call("generations", "GET", f"/_cat/indices/{self.prefix}_*_docs", params={"format": "json", "h": "index"})
         found = set()
         for row in reply or []:
-            match = DOCS_PATTERN.match(row["index"])
-            if match is not None and match.group("prefix") == self.prefix:
-                found.add(f"{match.group('dataset')}/{match.group('generation')}/")
+            parts = docs_index_parts(row["index"], self.prefix)
+            if parts is not None:
+                found.add(f"{parts[0]}/{parts[1]}/")
         return sorted(found)
 
     def close(self) -> None:

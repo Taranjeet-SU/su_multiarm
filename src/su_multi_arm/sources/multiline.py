@@ -6,9 +6,21 @@ goes to the head's ``stack``. A continuation with no eligible head is a ``fragme
 reported separately (excluded from coverage targets) and sampled at ``fragment_sample_rate`` with a
 deterministic hash so the unparsed queue gets the same sample on every run (N13).
 
-In this slice the head test is "not a continuation", and the continuation rules are a closed set of
-package-authored, linear patterns. The pattern library's ``format`` and ``continuation`` kinds (L2)
-replace both through the ``is_head``/``is_continuation`` parameters.
+Continuation rules are a closed set of package-authored, linear patterns (``BUILTIN_CONTINUATION``),
+plus the **approved ``continuation`` entries of the pattern library** when a compiled library is
+passed (``library=``): a line matching any of them continues the open head. The head test is "not a
+continuation".
+
+Two built-in rules are **contextual** (they look at the open head's stack, never across streams):
+
+- ``python_traceback``: a Python traceback whose lines arrive as separate column-0 documents. The
+  chained-exception markers (``During handling of the above exception …``, ``The above exception
+  was the direct cause …``) always continue; inside an open traceback (after ``Traceback (most
+  recent call last):`` or a ``File "…", line N`` frame) the source line after a frame, the
+  ``^~~~`` marker lines and the final ``SomeError: message`` line continue too. Outside a traceback
+  those lines are ordinary heads, so a lone ``ValueError: …`` log line is never hidden as a fragment.
+- ``closing_bracket``: a line that is only closing brackets (``}``, ``]``, ``)``, ``});``, ``},``)
+  always continues (the tail of a multi-line JSON or object dump).
 """
 
 from __future__ import annotations
@@ -16,7 +28,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from ..core.config_sources import MultilineConfig
 from .logs import LogRecord
@@ -24,16 +36,57 @@ from .logs import LogRecord
 BUILTIN_CONTINUATION: dict[str, re.Pattern[str]] = {
     "indented": re.compile(r"^[ \t]+\S"),
     "java_frame": re.compile(r"^[ \t]+at \S"),
-    "python_frame": re.compile(r'^[ \t]+File "[^"\n]*", line [0-9]+'),
+    # indented (the usual rendering) or at column 0 (each traceback line shipped as its own document)
+    "python_frame": re.compile(r'^[ \t]*File "[^"\n]*", line [0-9]+'),
     "caused_by": re.compile(r"^Caused by: "),
     "traceback_header": re.compile(r"^Traceback \(most recent call last\):"),
     "ellipsis_more": re.compile(r"^[ \t]*\.\.\. [0-9]+ more\b"),
+    "closing_bracket": re.compile(r"^[ \t]*[}\])][}\])]*[;,]?[ \t]*$"),
+    "python_traceback": re.compile(
+        r"^(?:During handling of the above exception, another exception occurred:"
+        r"|The above exception was the direct cause of the following exception:)[ \t]*$"
+    ),
 }
+# Lines that continue only inside an open Python traceback (rule ``python_traceback``).
+PY_CARET = re.compile(r"^[ \t]*[\^~]+[ \t]*$")
+PY_EXCEPTION = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,200}(?::[ \t].*|:)?$")
+_TB_START = ("traceback_header", "python_traceback")
 
 
-def continuation_predicate(rules: Iterable[str]) -> Callable[[str], bool]:
+def continuation_predicate(rules: Iterable[str], library: Any = None) -> Callable[[str], bool]:
+    """The context-free part of the configured rules (plus approved library ``continuation``
+    entries when ``library`` is a ``CompiledLibrary``): ``text -> bool``."""
     compiled = [BUILTIN_CONTINUATION[name] for name in rules]
-    return lambda text: any(p.match(text) for p in compiled)
+    extra = getattr(library, "is_continuation", None)
+    if extra is None:
+        return lambda text: any(p.match(text) for p in compiled)
+    return lambda text: any(p.match(text) for p in compiled) or extra(text)
+
+
+def _traceback_state(rules: set[str], state: str | None, text: str) -> str | None:
+    """The traceback state after ``text`` joined a head (``None`` outside a traceback)."""
+    if "python_traceback" not in rules and "python_frame" not in rules and "traceback_header" not in rules:
+        return None
+    if BUILTIN_CONTINUATION["python_frame"].match(text):
+        return "file"
+    if any(BUILTIN_CONTINUATION[name].match(text) for name in _TB_START):
+        return "header"
+    if state == "file":
+        return "source"  # the source line after a frame
+    if state in {"header", "source"} and PY_CARET.match(text):
+        return state
+    if state is not None and PY_EXCEPTION.match(text):
+        return None  # the final exception line ends the traceback
+    return state
+
+
+def _in_traceback(state: str | None, text: str) -> bool:
+    """A contextual continuation of an open traceback (rule ``python_traceback``)."""
+    if state is None or not text.strip():
+        return False
+    if state == "file":
+        return True  # the frame's source line (or the exception line of a frame without source)
+    return bool(PY_CARET.match(text) or PY_EXCEPTION.match(text))
 
 
 @dataclass
@@ -60,29 +113,38 @@ def assemble(
     *,
     is_continuation: Callable[[str], bool] | None = None,
     is_head: Callable[[str], bool] | None = None,
+    library: Any = None,
 ) -> tuple[list[LogRecord], MultilineStats]:
-    """Reassemble one unit's records. Output order: by ``(container, file, ts, offset, id)``."""
+    """Reassemble one unit's records. Output order: by ``(container, file, ts, offset, id)``.
+    ``library`` (a ``CompiledLibrary``) adds its approved ``continuation`` entries to the rules."""
     stats = MultilineStats()
     ordered = sorted(records, key=lambda r: (r.container or "", r.file or "", r.ts, r.offset if r.offset is not None else -1, r.id))
     if not config.enabled:
         stats.heads = len(ordered)
         return ordered, stats
-    cont = is_continuation or continuation_predicate(config.continuation)
+    rules = set(config.continuation)
+    cont = is_continuation or continuation_predicate(config.continuation, library)
     head_test = is_head or (lambda text: not cont(text))
+    contextual = "python_traceback" in rules
     out: list[LogRecord] = []
     open_heads: dict[tuple[str, str], dict] = {}
     for record in ordered:
         key = (record.container or "", record.file or "")
-        if head_test(record.message) or not cont(record.message):
-            state = {"record": record, "stack": [record.stack] if record.stack else [], "lines": 1, "bytes": len(record.message.encode()), "last": record.ts, "truncated": record.truncated}
+        state = open_heads.get(key)
+        gap_ms = (record.ts - state["last"]).total_seconds() * 1000 if state else None
+        in_gap = state is not None and gap_ms is not None and 0 <= gap_ms <= config.max_gap_ms
+        continues = cont(record.message) and not (is_head is not None and head_test(record.message))
+        if not continues and contextual and in_gap and _in_traceback(state["tb"], record.message):
+            continues = True
+        if not continues:
+            state = {"record": record, "stack": [record.stack] if record.stack else [], "lines": 1, "bytes": len(record.message.encode()), "last": record.ts, "truncated": record.truncated, "tb": None}
+            state["tb"] = _traceback_state(rules, None, record.message)
             open_heads[key] = state
             out.append(record)  # placeholder, replaced on flush
             state["slot"] = len(out) - 1
             stats.heads += 1
             continue
-        state = open_heads.get(key)
-        gap_ms = (record.ts - state["last"]).total_seconds() * 1000 if state else None
-        if state is None or gap_ms is None or gap_ms < 0 or gap_ms > config.max_gap_ms:
+        if not in_gap:
             stats.fragments += 1
             if _sampled(record.id, config.fragment_sample_rate):
                 stats.fragment_samples.append(record)
@@ -96,6 +158,7 @@ def assemble(
             state["lines"] += 1
             state["bytes"] += size
             stats.joined += 1
+        state["tb"] = _traceback_state(rules, state["tb"], record.message)
         state["last"] = record.ts
         _flush(out, state)
     return out, stats

@@ -44,7 +44,7 @@ import numpy as np
 
 from ..backends import extras
 from ..backends._scope import document_values
-from ..communities.base import build_communities
+from ..communities.base import build_communities, declared_communities
 from ..communities.reports import ReportFailure, community_report, disabled_report
 from ..communities.stats import community_stats
 from ..core.errors import BackendError, BudgetExhausted, ConfigError, GenerationInUse, IndexNotReady, WriteConflict
@@ -161,7 +161,7 @@ class WritePath:
             "dataset": self.cfg.dataset,
             "index_format": INDEX_FORMAT,
             "chunking": chunking_recipe(self.cfg),
-            "privacy": self.cfg.privacy.model_dump(mode="json", exclude={"trace_masking"}),
+            "privacy": self.cfg.privacy.recipe(),
             "extractor": self.extractor.recipe_fingerprint(),
             # ``precomputed`` enters only when set (2.0.0a1 golden values unchanged) and only as its
             # content identity (file digests), never its paths: moving the files keeps the index.
@@ -179,6 +179,11 @@ class WritePath:
         """``ingestion.projections.exclude_kinds``: catalog and records always hold every document."""
         projections = self.cfg.ingestion.projections
         return projections is not None and kind in projections.exclude_kinds.get(projection, [])
+
+    def _catalog_only(self, kind: str) -> bool:
+        """Only the catalog and the records read documents of this kind (excluded from lexical,
+        vector and graph by ``ingestion.projections``)."""
+        return all(self._excluded(p, kind) for p in ("lexical", "vector", "graph"))
 
     def _embeds(self, kind: str, field: str) -> bool:
         """Not excluded from vector, and (``ingestion.projections.embed_fields``) a listed field of its kind."""
@@ -276,8 +281,11 @@ class WritePath:
             for doc_id in delete_ids:
                 existing.pop(doc_id, None)
             redactions: dict[str, int] = {}
+            from ..privacy import safe_redactor
+
+            safe = safe_redactor(cfg.privacy)  # None under privacy.engine: legacy
             for document in documents:
-                document, counts = redact_document(document, cfg.privacy)
+                document, counts = redact_document(document, cfg.privacy, safe)
                 existing[document.id] = document
                 for label, count in counts.items():
                     redactions[label] = redactions.get(label, 0) + count
@@ -350,6 +358,11 @@ class WritePath:
                 before = self.generations.active(holder, gen.dataset)
                 self.generations.activate(holder, gen, manifest, expected=before)
                 moved.append((holder, before))
+                # read the pointer back the way a request will: a backend that cannot recognise
+                # its own index names (O1) fails here, before CURRENT moves, and is compensated
+                served = self.generations.active(holder, gen.dataset)
+                if served != gen.generation:
+                    raise BackendError(holder.name, "activate", f"pointer reads back {served!r}, expected {gen.generation}")
             step = self.generations.authoritative.name
             self.registry.activate(manifest, expected=base)
         except BaseException as exc:
@@ -488,19 +501,41 @@ class WritePath:
             sequence[0] += 1
 
         log("start", policy=policy.name, fingerprint=gen.fingerprint)
-        chunks_by_doc = {d.id: self._chunk(d) for d in corpus}
-        all_chunks = [c for d in corpus for c in chunks_by_doc[d.id]]
+        self._refs: set[str] = set()
+        # 1. catalog (authoritative), then the scope mirrors on secondary backends, written in
+        # batches. A document of a kind excluded from lexical, vector and graph (``ingestion.
+        # projections``: the log rollups) needs its chunks only in the catalog: after the batch is
+        # written they are dropped and only their field shapes are kept (N10 memory budget).
+        chunks_by_doc: dict[str, list[Any]] = {}
+        all_chunks: list[Chunk] = []  # chunks of documents some other projection reads
+        total_chunks = 0
+        sample_chunks: list[Chunk] = []  # the first chunks in corpus order (catalog round-trip sample)
+        reached.append((self.slots["catalog"], "catalog"))
+        mirrors = self.generations.mirrors()
+        for holder in mirrors:
+            reached.append((holder.name, "scope_mirror"))
+        for start in range(0, max(len(corpus), 1), BUILD_BATCH):
+            batch = corpus[start : start + BUILD_BATCH]
+            batch_chunks: list[Chunk] = []
+            for document in batch:
+                parts = self._chunk(document)
+                batch_chunks.extend(parts)
+                total_chunks += len(parts)
+                if len(sample_chunks) < SAMPLE:
+                    sample_chunks.extend(parts[: SAMPLE - len(sample_chunks)])
+                if self._catalog_only(document.kind):
+                    chunks_by_doc[document.id] = [_shape(c.field) for c in parts]
+                else:
+                    chunks_by_doc[document.id] = parts
+                    all_chunks.extend(parts)
+            self._facet("catalog").put_documents(gen, batch, batch_chunks)
+            for holder in mirrors:
+                holder.backend.catalog.put_documents(gen, batch, batch_chunks)
+            del batch_chunks
         kinds = {d.id: d.kind for d in corpus}
         # projection exclusions (``ingestion.projections``; catalog and records hold every document)
         lexical_chunks = [c for c in all_chunks if not self._excluded("lexical", kinds[c.document_id])]
         vector_chunks = [c for c in all_chunks if self._embeds(kinds[c.document_id], c.field)]
-        self._refs: set[str] = set()
-        # 1. catalog (authoritative), then the scope mirrors on secondary backends
-        reached.append((self.slots["catalog"], "catalog"))
-        self._facet("catalog").put_documents(gen, corpus, all_chunks)
-        for holder in self.generations.mirrors():
-            reached.append((holder.name, "scope_mirror"))
-            holder.backend.catalog.put_documents(gen, corpus, all_chunks)
         # 2. lexical
         if "lexical" in self.slots:
             reached.append((self.slots["lexical"], "lexical"))
@@ -508,10 +543,15 @@ class WritePath:
             lexical.index(gen, lexical_chunks, [])
             lexical.refresh(gen)
         # 3. records (storage.records and the structured arm's backend)
-        records = [StructuredRecord(schema_id="document", id=d.id, values=document_values(d), provenance=Provenance(extractor="catalog")) for d in corpus]
-        for holder in self.generations.targets("records"):
+        catalog_provenance = Provenance(extractor="catalog")
+        record_targets = self.generations.targets("records")
+        for holder in record_targets:
             reached.append((holder.name, "records"))
-            holder.backend.records.upsert(gen, records, cfg.metadata_schema)
+        for start in range(0, max(len(corpus), 1), BUILD_BATCH):  # batched: the rows of one batch at a time
+            records = [StructuredRecord(schema_id="document", id=d.id, values=document_values(d), provenance=catalog_provenance) for d in corpus[start : start + BUILD_BATCH]]
+            for holder in record_targets:
+                holder.backend.records.upsert(gen, records, cfg.metadata_schema)
+        del records
         # 4. extraction under policy
         extraction_meter = meter.role(roles.extractor.price_key() if roles.extractor else None, "extraction")
         outputs, reused, llm_calls = self._extract(gen, corpus, chunks_by_doc, policy, extraction_meter, ledger)
@@ -539,7 +579,10 @@ class WritePath:
         for mention in mentions:
             membership_map.setdefault(mention.id, set()).add(mention.span.document_id)
             names.setdefault(mention.id, mention.name)
-        communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed, cfg.communities.hierarchy)
+        if cfg.communities.strategy == "declared":
+            communities = declared_communities(corpus, mentions, cfg.communities.min_documents)
+        else:
+            communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed, cfg.communities.hierarchy)
         if cfg.communities.stats is not None:
             stats_cfg = cfg.communities.stats
             by_id = {d.id: d for d in corpus}
@@ -549,7 +592,8 @@ class WritePath:
                 )
         report_meter = meter.role(roles.community.price_key() if roles.community else None, "community_reports")
         communities = self._reports(communities, all_chunks, policy, report_meter)
-        memberships = [Membership(community_id=c.id, member_id=doc_id, basis="entity") for c in communities for doc_id in c.document_ids]
+        basis = "declared" if cfg.communities.strategy == "declared" else "entity"
+        memberships = [Membership(community_id=c.id, member_id=doc_id, basis=basis) for c in communities for doc_id in c.document_ids]
         community_count = {doc_id: 0 for doc_id in per_doc}
         for membership in memberships:
             community_count[membership.member_id] += 1
@@ -584,7 +628,7 @@ class WritePath:
                 community_memberships=community_count[document.id],
             )
         # 8. per-projection validation
-        projections = self._validate_projections(gen, corpus, all_chunks, embedded, lexical_chunks, vector_chunks)
+        projections = self._validate_projections(gen, corpus, sample_chunks, embedded, lexical_chunks, vector_chunks, total_chunks=total_chunks)
         projections.update(self._validate_graph(gen, corpus, mentions, communities, memberships))
         facts = [r for r in relations if r.edge_kind == "fact"]
         co_occurrences = [r for r in relations if r.edge_kind == "co_occurrence"]
@@ -600,11 +644,13 @@ class WritePath:
             "policy": policy.name,
             "status": policy.manifest_status(),
             "documents": len(corpus),
-            "chunks": len(all_chunks),
+            "chunks": total_chunks,
             "entities": len(mentions),
             "relations": len(facts),
             "relation_occurrences": sum(len(r.occurrences) for r in facts),
             "co_occurrence_relations": len(co_occurrences),
+            # header-scoped attribute links of the pattern extractor (edge kind ``native_link``)
+            "native_link_relations": sum(1 for r in relations if r.edge_kind == "native_link"),
             "co_occurrence_occurrences": sum(len(r.occurrences) for r in co_occurrences),
             "communities": len(communities),
             "reused_extractions": reused,
@@ -617,8 +663,11 @@ class WritePath:
             **({"precomputed_vectors": embedded.precomputed} if embedded and embedded.precomputed else {}),
             "budget": meter.summary(),
             "incremental": INCREMENTAL,
+            # a local provider has no endpoint: its (default) base_url is not reported (P13)
             "embedding": {
-                **cfg.models.roles.embedder.model_dump(mode="json", exclude={"precomputed"}),
+                **cfg.models.roles.embedder.model_dump(
+                    mode="json", exclude={"precomputed", "base_url"} if cfg.models.roles.embedder.provider in {"hash", "sentence_transformers"} else {"precomputed"}
+                ),
                 **({"precomputed": cfg.models.roles.embedder.precomputed.identity()} if cfg.models.roles.embedder.precomputed is not None else {}),
             },
             "embedding_recipe": self.embedding_recipe(),
@@ -644,7 +693,7 @@ class WritePath:
             ledger.add_refs(gen.generation, refs)
             manifest["ledger_refs_count"] = len(refs)
             manifest["ledger_refs_sha"] = hashlib.sha256("\n".join(refs).encode()).hexdigest()
-        log("manifest", status=manifest["status"], documents=len(corpus), chunks=len(all_chunks))
+        log("manifest", status=manifest["status"], documents=len(corpus), chunks=total_chunks)
         return manifest
 
     def _extract(self, gen: GenerationId, corpus: list[Document], chunks_by_doc: dict[str, list[Chunk]], policy: ExtractionPolicy, budget: Any, ledger: Any):
@@ -864,6 +913,7 @@ class WritePath:
         embedded: "Embedded | None",
         lexical_chunks: list[Chunk] | None = None,
         vector_chunks: list[Chunk] | None = None,
+        total_chunks: int | None = None,
     ) -> dict[str, Any]:
         """Counts against the catalog and a sample of ids round-tripping through every target: the
         same sampled chunk ids must come back from the catalog, every scope mirror, the lexical and
@@ -873,23 +923,25 @@ class WritePath:
         catalog = self._facet("catalog")
         counts = extras.require(self.backends[self.slots["catalog"]], extras.CatalogCounts, "catalog", "validate")
         _expect("catalog", counts.count_documents(gen), len(corpus), "documents")
-        _expect("catalog", counts.count_chunks(gen), len(chunks), "chunks")
+        # ``chunks`` is every chunk, or (with ``total_chunks``) the first ones in corpus order
+        n_chunks = len(chunks) if total_chunks is None else total_chunks
+        _expect("catalog", counts.count_chunks(gen), n_chunks, "chunks")
         sample = chunks[:SAMPLE]
         fetched = {c.id: c for c in catalog.get_chunks(gen, [c.id for c in sample])}
         for chunk in sample:
             if fetched.get(chunk.id) != chunk:
                 raise ProjectionError("catalog", chunk.id, "sampled chunk did not round-trip")
-        results["catalog"] = {"backend": self.slots["catalog"], "documents": len(corpus), "chunks": len(chunks), "verified": True}
+        results["catalog"] = {"backend": self.slots["catalog"], "documents": len(corpus), "chunks": n_chunks, "verified": True}
         for holder in self.generations.mirrors():
             projection = f"scope_mirror:{holder.name}"
             mirror = extras.require(holder.backend, extras.CatalogCounts, "catalog", "validate")
             _expect(projection, mirror.count_documents(gen), len(corpus), "documents")
-            _expect(projection, mirror.count_chunks(gen), len(chunks), "chunks")
+            _expect(projection, mirror.count_chunks(gen), n_chunks, "chunks")
             mirrored = {c.id: c for c in holder.backend.catalog.get_chunks(gen, [c.id for c in sample])}
             for chunk in sample:
                 if mirrored.get(chunk.id) != chunk:
                     raise ProjectionError(projection, chunk.id, "sampled chunk did not round-trip through the scope mirror")
-            results[projection] = {"backend": holder.name, "documents": len(corpus), "chunks": len(chunks), "verified": True}
+            results[projection] = {"backend": holder.name, "documents": len(corpus), "chunks": n_chunks, "verified": True}
         sampled_documents = list(dict.fromkeys([*(d.id for d in corpus[:SAMPLE]), *(c.document_id for c in sample)]))
         for holder in self.generations.targets("records"):
             projection = _projection_key("records", holder.name, self.generations.placement)
@@ -1034,6 +1086,28 @@ def _conflict(exc: BaseException) -> WriteConflict | None:
     if isinstance(exc, ActivationError) and isinstance(exc.cause, WriteConflict):
         return exc.cause
     return None
+
+
+BUILD_BATCH = 5000  # documents per catalog/records write batch
+
+
+class _ChunkShape:
+    """The field of a dropped chunk of a catalog-only document (status reporting needs no more)."""
+
+    __slots__ = ("field",)
+
+    def __init__(self, field: str):
+        self.field = field
+
+
+_SHAPES: dict[str, _ChunkShape] = {}
+
+
+def _shape(field: str) -> _ChunkShape:
+    shape = _SHAPES.get(field)
+    if shape is None:
+        shape = _SHAPES[field] = _ChunkShape(field)
+    return shape
 
 
 def _expect(projection: str, actual: int, expected: int, what: str) -> None:

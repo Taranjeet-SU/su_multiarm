@@ -54,6 +54,12 @@ TOOL_MODELS: dict[str, Any] = {
     "session_delete": None,
     "capabilities": None,
 }
+# The log tools (addendum A2 §4.5.1): one MCP tool per enabled log tool, arguments = the tool's
+# input model field for field (``log_tools.py``); all read-only.
+from ..runtime.log_tools import LOG_TOOL_CLASSES as _LOG_TOOL_CLASSES  # noqa: E402
+
+LOG_TOOL_MODELS: dict[str, Any] = {cls.name: cls.input_model for cls in _LOG_TOOL_CLASSES}
+TOOL_MODELS.update(LOG_TOOL_MODELS)
 
 
 def safe_message(exc: BaseException) -> str:
@@ -108,7 +114,16 @@ class SessionBinder:
             self._bound.pop((principal.key(), mcp_key), None)
 
 
-def create_mcp(config=None, *, engine=None, principal_resolver: PrincipalResolver | None = None, host: str = "127.0.0.1", port: int = 8100):
+def create_mcp(
+    config=None,
+    *,
+    engine=None,
+    principal_resolver: PrincipalResolver | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8100,
+    streamable_http_path: str = "/mcp",
+    allowed_hosts: list[str] | None = None,
+):
     """The FastMCP server. ``engine`` reuses a constructed engine (Python injection);
     ``principal_resolver`` is used by ``mcp_http_app`` for the streamable-HTTP transport."""
     import anyio
@@ -121,7 +136,15 @@ def create_mcp(config=None, *, engine=None, principal_resolver: PrincipalResolve
         if config is None:
             raise ValueError("create_mcp needs a config or an engine")
         engine = Engine(config)
-    server = FastMCP("su_multi_arm", host=host, port=port)
+    from ..runtime.acl import require_single_tenant
+
+    require_single_tenant(engine.config, engine.acl)
+    options: dict[str, Any] = {"streamable_http_path": streamable_http_path}
+    if allowed_hosts is not None:  # mounted on the HTTP app: the SDK's DNS-rebinding protection
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        options["transport_security"] = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=list(allowed_hosts), allowed_origins=[])
+    server = FastMCP("su_multi_arm", host=host, port=port, **options)
     server.engine = engine  # type: ignore[attr-defined]
     server.principal_resolver = principal_resolver  # type: ignore[attr-defined]
     binder = SessionBinder(engine)
@@ -268,8 +291,44 @@ def create_mcp(config=None, *, engine=None, principal_resolver: PrincipalResolve
         require(principal, "search")
         return describe(engine)
 
+    if engine.config.serving.mcp.log_tools:
+        for name in [n for n in engine.tools.names() if n in LOG_TOOL_MODELS]:
+            _add_log_tool(server, engine, name, bound, run)
     check_drift(server)
     return server
+
+
+def _add_log_tool(server, engine, name: str, bound, run) -> None:
+    """Register one log tool with a signature generated from its input model (so the drift check
+    compares it field for field) and the read-only annotations."""
+    import inspect
+
+    from mcp.server.fastmcp import Context
+    from mcp.types import ToolAnnotations
+
+    model = LOG_TOOL_MODELS[name]
+    params = []
+    annotations: dict[str, Any] = {}
+    for field_name, info in model.model_fields.items():
+        default = inspect.Parameter.empty if info.is_required() else (None if info.default_factory is not None else info.default)
+        annotation = info.annotation if info.is_required() or default is not None else (info.annotation | None)
+        params.append(inspect.Parameter(field_name, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=annotation))
+        annotations[field_name] = annotation
+    params.append(inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context))
+    annotations["ctx"] = Context
+
+    async def tool(**kwargs: Any) -> dict[str, Any]:
+        ctx = kwargs.pop("ctx")
+        principal, session_id = await bound(ctx, "tools")
+        args = {k: (v.model_dump(mode="json") if hasattr(v, "model_dump") else v) for k, v in kwargs.items() if v is not None}
+        call = await run(engine.call_tool, name, args, principal, session_id)
+        return call.result.output.model_dump(mode="json")
+
+    tool.__signature__ = inspect.Signature(params, return_annotation=dict[str, Any])  # type: ignore[attr-defined]
+    tool.__annotations__ = {**annotations, "return": dict[str, Any]}
+    tool.__name__ = name
+    description = engine.tools.get(name).description
+    server.add_tool(tool, name=name, description=description, annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False), structured_output=True)
 
 
 def check_drift(server) -> None:
@@ -309,13 +368,17 @@ class PrincipalMiddleware:
         await self.app(scope, receive, send)
 
 
-def mcp_http_app(server, token_env: str | None = None):
-    """The streamable-HTTP ASGI app (path ``/mcp``) behind the principal resolver."""
+def mcp_http_app(server, token_env: str | None = None, bind: str | None = None):
+    """The streamable-HTTP ASGI app (path ``/mcp``) behind the principal resolver and the Host/Origin
+    guard (active when ``serving.allowed_hosts`` is set)."""
+    from .hosts import HostGuard, guard_hosts
+
     engine = server.engine
     if "streamable_http" not in engine.config.serving.mcp.transports:
         raise RuntimeError("serving.mcp.transports does not enable streamable_http")
     resolver = server.principal_resolver or default_resolver(engine.config, token_env)
-    return PrincipalMiddleware(server.streamable_http_app(), resolver)
+    serving = engine.config.serving
+    return HostGuard(PrincipalMiddleware(server.streamable_http_app(), resolver), guard_hosts(bind or serving.http.bind, serving.allowed_hosts))
 
 
 def run_stdio(server) -> None:

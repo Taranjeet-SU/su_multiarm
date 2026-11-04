@@ -70,10 +70,13 @@ def bootstrap(
     min_support: int = 3,
     min_literal_chars: int = 4,
     created: datetime | None = None,
+    fragments: int = 0,
 ) -> BootstrapReport:
+    """``lines`` are multiline heads; ``fragments`` counts the head-less continuation lines that
+    multiline assembly set aside (reported, excluded from the coverage target, never mined)."""
     lines = list(lines)
     results = [compiled.match_line(line.text, field_name=line.field_name, attributes=line.attributes) for line in lines]
-    before = coverage(results)
+    before = coverage(results, fragments)
     mining = TemplateMiner(compiled.engine, compiled.library.masks, miner)
     for line, result in zip(lines, results):
         if result.status not in {"unparsed", "format_only"}:
@@ -107,4 +110,4 @@ def bootstrap(
     for line, result in zip(lines, after_results):
         if result.message is not None and result.message.entry.entry.id in {p.id for p in proposals}:
             support.setdefault(result.message.entry.entry.id, []).append(line.id)
-    return BootstrapReport(before, coverage(after_results), proposals, rejected, mining.stats(), len(clusters), support)
+    return BootstrapReport(before, coverage(after_results, fragments), proposals, rejected, mining.stats(), len(clusters), support)

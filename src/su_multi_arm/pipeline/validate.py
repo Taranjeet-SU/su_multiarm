@@ -188,6 +188,7 @@ def role_schemas() -> dict[str, list[type]]:
     """The reply schemas the package sends per chat role (QA-13). The generator's per-request
     variant (evidence-id and claim-kind enums) has the same shape as ``Answer``."""
     from ..decision.llm import LlmPlan
+    from ..learning.extraction.replies import ClusterExtractionReply, LineBatchReply
     from ..learning.patterns.propose import PatternProposalReply
     from ..models import Answer, CommunityReport, Extraction
     from .review import Review
@@ -198,7 +199,8 @@ def role_schemas() -> dict[str, list[type]]:
         "reviewer": [Review],
         "extractor": [Extraction],
         "community": [CommunityReport],
-        "pattern_learner": [PatternProposalReply],
+        "pattern_learner": [PatternProposalReply, ClusterExtractionReply],
+        "log_extractor": [LineBatchReply],
     }
 
 
@@ -266,7 +268,7 @@ def _strict_schema_diagnostics(config: Config) -> list[Diagnostic]:
 
 def config_diagnostics(config: Config) -> list[Diagnostic]:
     """Every static problem of a parsed v2 config (profile overlay already applied)."""
-    from ..core.config import AVAILABLE_PROFILES, BUILTIN_ACTIONS, BUILTIN_TOOLS, DEFAULT_PIPELINE
+    from ..core.config import AVAILABLE_PROFILES, BUILTIN_ACTIONS, BUILTIN_TOOLS, DEFAULT_PIPELINE, LOG_TOOLS
 
     out: list[Diagnostic] = []
     if config.profile not in AVAILABLE_PROFILES:
@@ -315,8 +317,11 @@ def config_diagnostics(config: Config) -> list[Diagnostic]:
             if decision.uses_llm() and roles.planner is None:
                 out.append(_error("request.modes", "role_missing", f"{mode!r} on pipeline {name!r} needs models.roles.planner"))
     for tool in config.tools.enabled:
-        if tool not in BUILTIN_TOOLS:
-            out.append(_error("tools.enabled", "unknown_component", f"{tool!r} is not a built-in tool ({', '.join(BUILTIN_TOOLS)})"))
+        if tool in LOG_TOOLS:
+            if config.logs is None or not config.logs.intents.enabled:
+                out.append(_error("tools.enabled", "requires_logs_intents", f"{tool!r} is a log tool: it needs logs.intents.enabled"))
+        elif tool not in BUILTIN_TOOLS:
+            out.append(_error("tools.enabled", "unknown_component", f"{tool!r} is not a built-in tool ({', '.join((*BUILTIN_TOOLS, *LOG_TOOLS))})"))
     for action in config.actions.allow:
         if action not in BUILTIN_ACTIONS:
             out.append(_error("actions.allow", "unknown_component", f"{action!r} is not a built-in action ({', '.join(BUILTIN_ACTIONS)})"))

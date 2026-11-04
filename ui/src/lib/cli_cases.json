@@ -1,0 +1,62 @@
+[
+ {
+  "input": {
+   "config": "config.yaml",
+   "op": "promote",
+   "id": "msg.dependency.connect_failed",
+   "by": "alice",
+   "reason": "reviewed"
+  },
+  "expected": "su-multi-arm --config=config.yaml patterns promote --by=alice --reason=reviewed -- msg.dependency.connect_failed"
+ },
+ {
+  "input": {
+   "config": "/etc/su multi arm/logs.yaml",
+   "op": "deprecate",
+   "id": "learned.0042",
+   "by": "ops.team@example.test",
+   "reason": "noisy since the 2026-01 release; see ticket #12"
+  },
+  "expected": "su-multi-arm '--config=/etc/su multi arm/logs.yaml' patterns deprecate --by=ops.team@example.test '--reason=noisy since the 2026-01 release; see ticket #12' -- learned.0042"
+ },
+ {
+  "input": {
+   "config": "c.yaml",
+   "op": "disable",
+   "id": "p-1",
+   "by": "bob",
+   "reason": "it's $(rm -rf /) `id` && echo \"x\" | tee /tmp/y > z; *"
+  },
+  "expected": "su-multi-arm --config=c.yaml patterns disable --by=bob '--reason=it'\"'\"'s $(rm -rf /) `id` && echo \"x\" | tee /tmp/y > z; *' -- p-1"
+ },
+ {
+  "input": {
+   "config": "c.yaml",
+   "op": "promote",
+   "id": "--help",
+   "by": "bob",
+   "reason": ""
+  },
+  "expected": "su-multi-arm --config=c.yaml patterns promote --by=bob --reason= -- --help"
+ },
+ {
+  "input": {
+   "config": "c.yaml",
+   "op": "promote",
+   "id": "id with\nnewline",
+   "by": "bob",
+   "reason": "multi\nline\treason ✓"
+  },
+  "expected": "su-multi-arm --config=c.yaml patterns promote --by=bob '--reason=multi\nline\treason ✓' -- 'id with\nnewline'"
+ },
+ {
+  "input": {
+   "config": "-c.yaml",
+   "op": "deprecate",
+   "id": "-x",
+   "by": "bob",
+   "reason": "--reason=sneaky -rf"
+  },
+  "expected": "su-multi-arm --config=-c.yaml patterns deprecate --by=bob '--reason=--reason=sneaky -rf' -- -x"
+ }
+]

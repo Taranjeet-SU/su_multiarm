@@ -30,17 +30,51 @@ def day_window(day: str, tz: str) -> SourceWindow:
     return SourceWindow(partition_key=day, start=start.astimezone(timezone.utc), end=(start + timedelta(days=1)).astimezone(timezone.utc))
 
 
-def run_probe(source: ElasticsearchRestSource, day: str, *, max_units: int = 3, max_docs: int = 1000, counts: bool = True) -> dict[str, Any]:
-    """Bounded probe. ``max_units`` units get counts and the PIT/random_score checks; one unit gets
-    a scroll pull of at most ``max_docs`` documents for throughput and mapping statistics."""
+def pit_check_status(source: ElasticsearchRestSource, caps: Any, requested: bool) -> tuple[bool, str]:
+    """Whether the probe may open a PIT: only on request (``--probe-pit``), when the configuration
+    does not disallow it and when the capabilities say the server supports it (a version that could
+    not be read, e.g. after a 403 on ``GET /``, counts as unsupported). Returns ``(run, reason)``."""
+    if not requested:
+        return False, "not_requested"
+    if "pit" in source.config.disallow:
+        return False, "disallowed_by_config"
+    if not caps.pit:
+        return False, "unsupported_or_unknown_version"
+    return True, "requested"
+
+
+def run_probe(
+    source: ElasticsearchRestSource,
+    day: str,
+    *,
+    max_units: int = 3,
+    max_docs: int = 1000,
+    counts: bool = True,
+    probe_pit: bool = False,
+    random_score: bool = True,
+) -> dict[str, Any]:
+    """Bounded probe. ``max_units`` units get counts and the ``random_score`` check; one unit gets a
+    scroll pull of at most ``max_docs`` documents for throughput and mapping statistics.
+
+    The PIT check (open and close one point-in-time context per sampled unit) is **opt-in**
+    (``probe_pit``) and runs only where ``pit_check_status`` allows it, so a probe never sends a
+    request the deployment or the server does not permit. A skipped check leaves ``capabilities.pit``
+    as the version probe reported it and records why under ``pit_check``."""
     report: dict[str, Any] = {"source": source.source_name, "kind": source.name, "day": day, "errors": []}
     caps = source.capabilities(probe=True)
     report["self_check"] = [d.model_dump() for d in source.self_check()]
+    run_pit, pit_reason = pit_check_status(source, caps, probe_pit)
+    report["pit_check"] = {"status": "run" if run_pit else "skipped", "reason": pit_reason}
     window = day_window(day, source.config.timezone)
     units = source.discover(window)
     report["units_discovered"] = len(units)
     parsed = [u for u in units if "unknown" not in u.attributes.values()]
-    report["index_names"] = {"parsed": len(parsed), "unparsed": len(units) - len(parsed), "services": sorted({u.attributes.get("service", "unknown") for u in units})}
+    report["index_names"] = {
+        "parsed": len(parsed),
+        "unparsed": len(units) - len(parsed),
+        "excluded_scope": dict(source.excluded_scope),
+        "services": sorted({u.attributes.get("service", "unknown") for u in units}),
+    }
     mapped = source.config.mapping.requested()
     report["field_presence"] = {field: sum(1 for u in units if field in source.mappings.get(u.index, {})) for field in mapped}
     report["units"] = []
@@ -51,13 +85,17 @@ def run_probe(source: ElasticsearchRestSource, day: str, *, max_units: int = 3, 
             if counts:
                 counted = source.count(unit)
                 entry.update(total=counted.total, by_query=counted.by_query, basis=counted.basis)
-            entry["pit"] = source.probe_pit(unit)
-            entry["random_score_seq_no"] = _random_score_ok(source, unit)
+            if run_pit:
+                entry["pit"] = source.probe_pit(unit)
+            if random_score:
+                entry["random_score_seq_no"] = _random_score_ok(source, unit)
         except SourceError as error:
             entry["error"] = f"{type(error).__name__}: {error}"
         report["units"].append(entry)
-    caps.random_score_seq_no = any(e.get("random_score_seq_no") for e in report["units"])
-    caps.pit = any(e.get("pit") for e in report["units"]) if report["units"] else caps.pit
+    if random_score and report["units"]:
+        caps.random_score_seq_no = any(e.get("random_score_seq_no") for e in report["units"])
+    if run_pit and report["units"]:
+        caps.pit = any(e.get("pit") for e in report["units"])
     if sample_units and max_docs > 0:
         report["throughput"] = _throughput(source, sample_units[0], window, max_docs)
     report["capabilities"] = caps.model_dump()

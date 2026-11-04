@@ -253,6 +253,27 @@ in the configuration, then `su-multi-arm --config YOUR_CONFIG.yaml mcp --transpo
 Tools mirror the HTTP API (`search`, `answer`, `capabilities`, `list_values`, …). Details:
 [Configuration → Serving](docs/CONFIGURATION.md#serving).
 
+**Web UI** (read-only, preview): a static single-page app in the separate wheel `su-multi-arm-ui`
+(`pip install './ui/python'` from a checkout, or `'su-multi-arm[ui]'` once published), served by
+`serve` at `/ui` on the same origin and behind the same bearer token as `/v2/*`:
+
+```yaml
+serving:
+  http: {bind: 127.0.0.1:8099, auth: bearer_env, token_env: SU_UI_TOKEN}
+  ui: {enabled: true}
+```
+
+```bash
+export SU_UI_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(24))')
+su-multi-arm --config YOUR_CONFIG.yaml serve      # host/port from serving.http.bind; --host/--port override
+# open http://127.0.0.1:8099/ui/ and paste the token (kept in memory only)
+```
+
+Views: Ask (streamed answer, citations, contract status and violations), evidence per arm (dense,
+lexical, graph, communities, structured aggregates with exactness, basis, denominator and the
+truncated-ids flag), a graph explorer, grouped-aggregate charts and a trace panel (decision, arms,
+timings, model calls and spend). Details and the security model: [docs/serving.md](docs/serving.md#web-ui).
+
 ## Configuration in 20 lines
 
 A v2 file with PostgreSQL for the catalog, records and vectors, OpenSearch for full-text, Neo4j for

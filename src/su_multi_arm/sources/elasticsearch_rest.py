@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from ..core.component import Dependencies, Diagnostic, Environment
-from ..core.config_sources import SourceConfig, duration_seconds
+from ..core.config_sources import SourceConfig, disallowed_rows, duration_seconds
 from .contracts import (
     CountQuery,
     PartitionBudget,
@@ -96,10 +96,12 @@ class ElasticsearchRestSource:
         self._rate_limiter = rate_limiter
         self._transport: SourceTransport | None = None
         self._caps: SourceCapabilities | None = None
+        self._privileges: tuple[tuple[str, Any] | None] | None = None  # one privilege request per process (P14)
         self.parser = IndexNameParser(config.index_name)
         self.mappings: dict[str, dict[str, str]] = {}
         self.units: dict[str, dict[str, Any]] = {}  # unit id -> {"query", "window", "includes"}
         self.diagnostics: list[Diagnostic] = []
+        self.excluded_scope: dict[str, int] = {}  # indices left out of scope, by reason (counted, never silent)
         # at most max_concurrency x slices open contexts per process (§3.1.1)
         self.cursors = CursorRegistry(config.pull.max_concurrency * config.pull.slices, self.close)
         self._context_used = 0
@@ -156,6 +158,7 @@ class ElasticsearchRestSource:
                 keepalive_max_seconds=duration_seconds(self.config.pull.keepalive_max),
                 rate_limiter=self._rate_limiter or RateLimiter(self.config.limits.requests_per_second),
                 http_transport=self._http_transport,
+                disallowed_rows=disallowed_rows(self.config.disallow),
             )
         return self._transport
 
@@ -211,6 +214,13 @@ class ElasticsearchRestSource:
         return out
 
     def _privileges_response(self) -> tuple[str, Any] | None:
+        """The privilege endpoint's answer, requested once per source object (the capability probe
+        and the self-check share it)."""
+        if self._privileges is None:
+            self._privileges = (self._request_privileges(),)
+        return self._privileges[0]
+
+    def _request_privileges(self) -> tuple[str, Any] | None:
         server = self._caps.server if self._caps else "unknown"
         if server == "opensearch":
             status, payload = self.transport.request("GET", "/_plugins/_security/api/account", tolerate=SELF_CHECK_TOLERATED)
@@ -299,6 +309,9 @@ class ElasticsearchRestSource:
                 parsed = self.parser.parse(index)
                 if not parsed.ok:
                     self.diagnostics.append(Diagnostic(severity="warning", code="source_index_name_unparsed", message=parsed.problem or "unparsed", path=f"sources.{self.source_name}.index_name", component=self.name))
+                    if self.config.index_name.unparsed == "exclude":
+                        self.excluded_scope["unparsed_name"] = self.excluded_scope.get("unparsed_name", 0) + 1
+                        continue
                 fields = self.mapping(index)
                 slice_ = None if dated else (window.start, window.end)
                 query = self.unit_query(index, fields, slice_)

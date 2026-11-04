@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from .base import Community
+from .base import Community, louvain_partitions
 
 
 def _id(level: int, members: frozenset[str]) -> str:
@@ -35,16 +35,9 @@ def build_hierarchical(
 ) -> list[Community]:
     """``memberships``: entity id -> document ids; ``names``: entity id -> display name. Returns every
     level's communities sorted by ``(level, id)``."""
-    import networkx as nx
-
-    graph = nx.Graph()
-    for key in sorted(memberships):
-        graph.add_node("e:" + key)
-        for doc in sorted(memberships[key]):
-            graph.add_edge("e:" + key, "d:" + doc)
-    if not graph.number_of_edges():
+    passes = louvain_partitions(memberships, seed, resolution)
+    if not passes:
         return []
-    passes = [[frozenset(g) for g in partition] for partition in nx.community.louvain_partitions(graph, seed=seed, resolution=resolution)]
     dendrogram = list(reversed(passes))[:levels]  # coarsest first
 
     def documents(group: frozenset[str]) -> list[str]:

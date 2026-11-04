@@ -32,7 +32,17 @@ DURATION = re.compile(r"^([1-9][0-9]{0,5})(ms|s|m)$")
 DURATION_UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0}
 # Hard ceiling on any scroll keepalive, whatever the config says (addendum §3.1.1 "bounded keepalive").
 KEEPALIVE_CEILING_SECONDS = 600.0
-CONTINUATION_RULES = ("indented", "java_frame", "python_frame", "caused_by", "traceback_header", "ellipsis_more")
+# Optional request families a deployment can forbid on top of the transport allow-list
+# (``sources.<n>.disallow``), with the allow-list rows each one covers.
+DISALLOWABLE = {"pit": (8, 9)}
+CONTINUATION_RULES = (
+    "indented", "java_frame", "python_frame", "caused_by", "traceback_header", "ellipsis_more", "closing_bracket", "python_traceback",
+)
+
+
+def disallowed_rows(names: list[str]) -> frozenset[int]:
+    """Allow-list rows covered by ``sources.<n>.disallow``."""
+    return frozenset(row for name in names for row in DISALLOWABLE[name])
 
 
 def duration_seconds(value: str) -> float:
@@ -86,13 +96,21 @@ class LogFieldMap(StrictModel):
 
 
 class IndexNameConfig(StrictModel):
-    """Index-name grammar: ``[<prefix>-][<deployment prefix>-]<prefix fields>-<service>-<date>``.
+    """Index-name grammar: ``[<prefix>-][<deployment prefix>-]<prefix fields>-<service>-<date>``
+    (``deployment_position: leading``) or ``[<prefix>-]<prefix fields>-[<deployment prefix>-]<service>-<date>``
+    (``deployment_position: before_service``).
 
     - ``date_format`` matches the trailing date (``%Y``, ``%m``, ``%d`` and literal separators).
-    - ``prefix`` (optional) is a literal every name must start with, followed by ``separator``.
-    - ``deployment_prefixes`` (optional) are left-side deployment or infrastructure prefixes, tried
-      longest first; ``{n}`` stands for a run of digits (``os-data-{n}`` matches ``os-data-1``). A
-      matched prefix is recorded as the ``deployment`` attribute (``none`` when the name has none).
+    - ``prefix`` (optional) is a literal every name must start with, followed by ``separator``. It
+      is stripped before the segments are read, so it never becomes part of the first prefix field
+      (``prefix: logs`` reads ``logs-acme-prod-crawler-…`` as tenant ``acme``).
+    - ``deployment_prefixes`` (optional) are deployment or infrastructure prefixes, tried longest
+      first; ``{n}`` stands for a run of digits (``os-data-{n}`` matches ``os-data-1``). A matched
+      prefix is recorded as the ``deployment`` attribute (``none`` when the name has none).
+      ``deployment_position`` says where they stand: at the left of the prefix fields (``leading``,
+      the default) or between the prefix fields and the service (``before_service``). ``after_env``
+      is env-anchored and needs no list: the deployment is whatever lies between the last prefix
+      field (matched by its vocabulary) and the service (matched by its vocabulary).
     - ``prefix_fields`` (default ``tenant``, ``env``) and ``service`` are the segments. A segment
       with a vocabulary takes the **longest** vocabulary entry that fits (``query-gateway`` wins
       over ``gateway``); a segment without one is exactly one separator-free token, so service
@@ -107,6 +125,10 @@ class IndexNameConfig(StrictModel):
     date_format: str = "%Y.%m.%d"
     prefix: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
     deployment_prefixes: list[str] = Field(default_factory=list)
+    deployment_position: Literal["leading", "before_service", "after_env"] = "leading"
+    # ``include``: an index whose name does not parse is a unit with ``unknown`` attributes (and a
+    # diagnostic); ``exclude``: it is not a unit and is counted as ``excluded_scope.unparsed_name``.
+    unparsed: Literal["include", "exclude"] = "include"
     prefix_fields: list[str] = Field(default_factory=lambda: ["tenant", "env"])
     # Keys: ``service`` or a prefix field. Values are literal lower-case names (``_`` allowed).
     vocabularies: dict[str, list[str]] = Field(default_factory=dict)
@@ -162,17 +184,26 @@ class IndexNameConfig(StrictModel):
                 raise ValueError(f"deployment prefix {item!r} must not end with the separator")
         if self.prefix is not None and self.prefix.endswith(self.separator):
             raise ValueError("prefix must not end with the separator")
+        if self.deployment_position == "after_env":
+            anchor = self.prefix_fields[-1] if self.prefix_fields else None
+            if "service" not in self.vocabularies or anchor is None or anchor not in self.vocabularies:
+                raise ValueError(
+                    "deployment_position: after_env needs a service vocabulary and a vocabulary for the last prefix field "
+                    "(the env anchor): the deployment is whatever lies between them"
+                )
         return self
 
 
 class MultilineConfig(StrictModel):
-    """Join continuation documents (stack frames, ``Caused by:`` …) onto the preceding head of the
-    same ``(container, file)`` within ``max_gap_ms``. Continuation rules are a closed built-in set
-    in this slice; the pattern library's ``continuation`` kind (L2) replaces them."""
+    """Join continuation documents (stack frames, ``Caused by:``, column-0 Python tracebacks, lone
+    closing brackets …) onto the preceding head of the same ``(container, file)`` within
+    ``max_gap_ms``. ``continuation`` names built-in rules (``sources/multiline.py``); the approved
+    ``continuation`` entries of the pattern library are applied in addition wherever a library is
+    loaded (``logs`` pulls, ``patterns coverage|mine``)."""
 
     enabled: bool = True
     continuation: list[Literal[CONTINUATION_RULES]] = Field(  # type: ignore[valid-type]
-        default_factory=lambda: ["java_frame", "python_frame", "traceback_header", "caused_by", "ellipsis_more"]
+        default_factory=lambda: ["java_frame", "python_frame", "traceback_header", "python_traceback", "caused_by", "ellipsis_more", "closing_bracket"]
     )
     max_gap_ms: int = Field(default=2000, ge=0, le=600_000)
     max_lines: int = Field(default=200, ge=1, le=10_000)
@@ -261,6 +292,10 @@ class SourceConfig(StrictModel):
     indices: list[str] = Field(min_length=1)
     timezone: str = "UTC"
     require_read_only_role: bool = False
+    # Request families this deployment forbids although the allow-list permits them (e.g. a cluster
+    # policy that bans point-in-time contexts): refused by the transport before any I/O, and the
+    # probe skips the corresponding check.
+    disallow: list[Literal["pit"]] = Field(default_factory=list)
     mapping: LogFieldMap = Field(default_factory=LogFieldMap)
     index_name: IndexNameConfig = Field(default_factory=IndexNameConfig)
     multiline: MultilineConfig = Field(default_factory=MultilineConfig)

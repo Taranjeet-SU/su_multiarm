@@ -38,7 +38,7 @@ from .config_logs import LINE_TEXT_FIELDS, PIN_REGISTRY_KINDS, LineRecipeConfig,
 from .config_sources import SOURCE_NAME, SourceConfig
 from .errors import ConfigError
 from .request import RequestConfig
-from .types import MetadataSchema
+from .types import EdgeKind, MetadataSchema
 
 IDENTIFIER = r"^[a-z][a-z0-9_]{0,63}$"
 SQL_IDENTIFIER = r"^[a-z][a-z0-9_]{0,40}$"
@@ -48,6 +48,22 @@ SQL_IDENTIFIER = r"^[a-z][a-z0-9_]{0,40}$"
 BUILTIN_GUARDS: frozenset[str] = frozenset()
 # Built-in read-only tools and write actions (``runtime/builtin_tools.py``, ``builtin_actions.py``).
 BUILTIN_TOOLS: tuple[str, ...] = ("search", "get_document", "list_values", "aggregate")
+# Typed read-only log tools (addendum A2 §4.1.5, §4.5.1; ``runtime/log_tools.py``); they need
+# ``logs.intents.enabled``.
+LOG_TOOLS: tuple[str, ...] = (
+    "log_top",
+    "log_new",
+    "log_affected",
+    "log_trend",
+    "log_compare",
+    "log_tenants",
+    "log_around",
+    "log_endpoints",
+    "log_signature",
+    "log_coverage",
+    "incidents",
+    "graph_neighbourhood",
+)
 BUILTIN_ACTIONS: tuple[str, ...] = ("ingest_delta", "invalidate_cache")
 DEFAULT_PIPELINE = "default"
 AVAILABLE_PROFILES: frozenset[str] = available_profiles()
@@ -451,6 +467,7 @@ class ModelRoles(StrictModel):
     generator: ChatRole | None = None
     community: ChatRole | None = None
     pattern_learner: ChatRole | None = None  # ``patterns learn|propose`` (learning.patterns)
+    log_extractor: ChatRole | None = None  # per-line quotes of the log fallback (learning.extraction)
     embedder: EmbedderRole = Field(default_factory=EmbedderRole)
     reranker: RerankerRole | None = None
 
@@ -478,12 +495,66 @@ class ModelRoles(StrictModel):
         return self
 
     def chat_roles(self) -> dict[str, ChatRole]:
-        names = ("planner", "reviewer", "extractor", "generator", "community", "pattern_learner")
+        names = ("planner", "reviewer", "extractor", "generator", "community", "pattern_learner", "log_extractor")
         return {n: getattr(self, n) for n in names if getattr(self, n) is not None}
+
+
+class ModelRoute(StrictModel):
+    """One provider route of a learning role (owner decision 2026-11-04: local models first).
+
+    ``health_url`` is probed (HTTP GET, 2xx = ready) before the first call of a run; for an
+    ``openai_compatible`` role it defaults to ``<base_url>/models``. ``capacity_url`` is an optional
+    second GET whose JSON ``{"available": true|false}`` (or a 2xx without a body) says whether the
+    server takes work now. A hosted route without a ``health_url`` is not probed. There is no probe
+    *command*: config never names code."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    role: ChatRole
+    # ``local`` (loopback), ``lan`` (a self-hosted server on the private network; needs
+    # ``egress.allow_lan``) or ``paid`` (anything else). Unset: ``local`` for a loopback
+    # openai_compatible role, else ``paid``. A route declared ``local`` must be loopback.
+    tier: Literal["local", "lan", "paid"] | None = None
+    health_url: str | None = Field(default=None, pattern=r"^https?://")
+    capacity_url: str | None = Field(default=None, pattern=r"^https?://")
+    probe_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    # UTC time windows ``HH:MM-HH:MM`` in which the route takes work (a window may wrap midnight);
+    # empty: always. Outside every window the route is skipped (``outside_window``).
+    windows: list[str] = Field(default_factory=list, max_length=8)
+    # After this many invalid replies (schema violations) in one run the route is marked down.
+    max_invalid_replies: int | None = Field(default=3, ge=1, le=1000)
+
+    @field_validator("windows")
+    @classmethod
+    def window_syntax(cls, value):
+        for window in value:
+            if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]", window):
+                raise ValueError(f"window {window!r} is not HH:MM-HH:MM (UTC)")
+        return value
+
+
+class ModelRoutes(StrictModel):
+    """Ordered provider routes per learning role (``pattern_learner``: cluster calls;
+    ``log_extractor``: line and fill calls). The first available route is used; when none is
+    available the items are ``unresolved: capacity_deferred`` and the next run retries them. A paid
+    (non-loopback) route after a local one is used only with ``allow_paid_fallback: true``. Empty
+    lists mean the single route ``models.roles.<role>``."""
+
+    pattern_learner: list[ModelRoute] = Field(default_factory=list)
+    log_extractor: list[ModelRoute] = Field(default_factory=list)
+    allow_paid_fallback: bool = False
+
+    @model_validator(mode="after")
+    def unique(self):
+        for name in ("pattern_learner", "log_extractor"):
+            routes = getattr(self, name)
+            if len({r.name for r in routes}) != len(routes):
+                raise ValueError(f"models.routes.{name}: route names must be unique")
+        return self
 
 
 class ModelsConfig(StrictModel):
     roles: ModelRoles = Field(default_factory=ModelRoles)
+    routes: ModelRoutes = Field(default_factory=ModelRoutes)
 
 
 # --- pipeline ----------------------------------------------------------------------------------
@@ -617,6 +688,9 @@ class GraphArm(StrictModel):
     templates: dict[str, TraversalTemplate] = Field(default_factory=dict)
     # Optional ontology the templates are validated against (an attached store's mapping is used too).
     ontology: GraphOntology | None = None
+    # Edge kinds the free-text mode traverses (A1 §3.12). ``co_firing`` is statistical
+    # co-occurrence, never a fact: admit it only deliberately (the logs ``around`` question does).
+    edge_kinds: list[EdgeKind] = Field(default_factory=lambda: ["fact"], min_length=1)
 
     @model_validator(mode="after")
     def templates_fit(self):
@@ -800,6 +874,10 @@ class PatternLibraryRef(StrictModel):
     min_literal_chars: int = Field(default=4, ge=0, le=64)
     regex_timeout_ms: int = Field(default=100, ge=1, le=10_000)  # ``regex`` engine only
     gate: PatternGateConfig = Field(default_factory=PatternGateConfig)
+    # The logs profile's header ontology (addendum A2 §4.1.3): ``emits``/``runs``/``serves``/
+    # ``raises`` native links from day-rollup headers and ``co_fires_with`` from incident headers
+    # (``extraction/patterns/log_links.py``). Enters the extraction reuse salt, not the recipe.
+    log_links: bool = False
 
     def recipe(self) -> dict[str, Any]:
         return {"engine": self.engine, "max_line_bytes": self.max_line_bytes, "mode": self.mode}
@@ -860,7 +938,9 @@ class CommunityStats(StrictModel):
 
 
 class CommunitiesConfig(StrictModel):
-    strategy: Literal["entity", "louvain", "louvain_hierarchical"] = "entity"
+    # ``declared``: one community per distinct ``community_id`` metadata value (the co-firing
+    # incidents composed by the logs profile, addendum A2 §4.1.4); no graph clustering runs.
+    strategy: Literal["entity", "louvain", "louvain_hierarchical", "declared"] = "entity"
     min_documents: int = Field(default=2, ge=1)
     seed: int = 42
     prompt: str | None = None
@@ -958,6 +1038,14 @@ class IngestBudget(StrictModel):
     max_usd: float | None = Field(default=None, gt=0)
 
 
+class ProviderBudget(StrictModel):
+    """A lifetime (total-period) USD cap for one provider key across every learning and extraction
+    scope (addendum A2 §4.2.6). Reservations persist in the learning spend ledger; reaching the cap
+    stops the step (``budget_deferred``), never a switch to another provider."""
+
+    max_usd_total: float = Field(gt=0)
+
+
 class BudgetsConfig(StrictModel):
     max_llm_calls: int = Field(default=12, ge=1, le=1000000)
     max_input_tokens: int | None = Field(default=None, ge=1)
@@ -967,9 +1055,12 @@ class BudgetsConfig(StrictModel):
     price_table: Path | None = None
     session: SessionBudget | None = None  # per-session limits on top of the per-request ones above
     ingest: IngestBudget = Field(default_factory=IngestBudget)  # whole-build limits of the write path
+    providers: dict[Literal["anthropic", "openai", "openai_compatible"], ProviderBudget] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def usd_needs_prices(self):
+        if self.providers and self.price_table is None:
+            raise ValueError("budgets.providers caps require price_table (operator-supplied; no bundled prices)")
         if self.max_usd is not None and self.price_table is None:
             raise ValueError("max_usd requires price_table (operator-supplied; no bundled prices)")
         if self.ingest.max_usd is not None and self.price_table is None:
@@ -979,13 +1070,108 @@ class BudgetsConfig(StrictModel):
         return self
 
 
+REDACTOR_NAMES = (
+    "email", "ipv4", "ipv6", "bearer_token", "jwt", "api_key", "aws_key", "url_credentials", "query_values", "uuid", "request_id", "hex_secret",
+    "llm_text", "content", "query", "tracking_id", "record_payload", "pg_row",
+)
+FIELD_NAME = r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+
+
+class CustomRedactor(StrictModel):
+    """A user redactor of the ``safe`` engine: a regular expression in the RE2 subset that passes
+    the ReDoS lint (validated at load), and what replaces each match. ``mask`` writes
+    ``[REDACTED_<NAME>]``; ``hash`` writes ``[<NAME>:<12 hex>]``, a keyed sha256 of the match, so
+    equal values stay joinable without being readable."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    regex: str = Field(min_length=1, max_length=2048)
+    action: Literal["mask", "hash"] = "mask"
+
+
 class PrivacyConfig(StrictModel):
-    """Opt-in conservative redaction; not a complete PII detector."""
+    """Opt-in conservative redaction; not a complete PII detector.
+
+    ``engine: legacy`` (default) is the a1/a2 behaviour: ``redact_emails`` and ``patterns`` with
+    Python ``re`` on documents. ``engine: safe`` (B11) runs the named built-in ``redactors``, the
+    ``custom`` redactors and the ``patterns`` (as ``mask`` redactors) through the pattern engine's
+    validator (RE2 subset, ReDoS lint) and runtime (``regex_engine``: ``re2``, or the ``regex``
+    development engine with a per-call timeout that fails the redaction rather than skipping it).
+    It redacts log records before any persistence, ingested documents and every prompt line. The
+    new keys are omitted from every fingerprint while they hold their defaults."""
 
     redact_emails: bool = False
     patterns: dict[str, str] = Field(default_factory=dict)
     metadata_fields: list[str] = Field(default_factory=list)
     trace_masking: Literal["privacy", "raw"] = "privacy"
+    engine: Literal["legacy", "safe"] = "legacy"
+    redactors: list[Literal[REDACTOR_NAMES]] = Field(default_factory=list)  # type: ignore[valid-type]
+    custom: list[CustomRedactor] = Field(default_factory=list)
+    regex_engine: Literal["re2", "regex"] = "re2"
+    regex_timeout_ms: int = Field(default=100, ge=1, le=10_000)
+    # Environment variable holding the key of ``hash`` redactors (keyed sha256). Unset: plain sha256.
+    hash_key_env: str | None = Field(default=None, pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")
+    # Per built-in override of mask/hash (``query: hash`` keeps equal queries joinable).
+    actions: dict[Literal[REDACTOR_NAMES], Literal["mask", "hash"]] = Field(default_factory=dict)  # type: ignore[valid-type]
+    # ``record_payload``: JSON field names whose values are masked (``None``: the built-in list of
+    # entity fields: names, ids, addresses, contact data), minus ``record_fields_allow``.
+    record_fields: list[str] | None = None
+    record_fields_allow: list[str] = Field(default_factory=list)
+
+    @field_validator("record_fields", "record_fields_allow")
+    @classmethod
+    def field_names(cls, value):
+        for name in value or []:
+            if not re.fullmatch(FIELD_NAME, name):
+                raise ValueError(f"record field {name!r} must be a plain field name")
+        return value
+
+    @model_validator(mode="after")
+    def coherent(self):
+        safe_only = {
+            "redactors": self.redactors,
+            "custom": self.custom,
+            "hash_key_env": self.hash_key_env,
+            "actions": self.actions,
+            "record_fields": self.record_fields is not None,
+            "record_fields_allow": self.record_fields_allow,
+        }
+        if self.engine == "legacy":
+            used = sorted(k for k, v in safe_only.items() if v)
+            if used:
+                raise ValueError(f"{used} need privacy.engine: safe")
+            return self
+        if len(set(self.redactors)) != len(self.redactors):
+            raise ValueError("privacy.redactors must be unique")
+        names = [c.name for c in self.custom] + [label.casefold() for label in self.patterns]
+        if len(set(names)) != len(names) or set(names) & set(self.redactors):
+            raise ValueError("custom redactor and pattern names must be unique and differ from the built-in names")
+        unused = sorted(set(self.actions) - set(self.redactors))
+        if unused:
+            raise ValueError(f"privacy.actions names redactors that are not enabled: {unused}")
+        if self.record_fields == []:
+            raise ValueError("privacy.record_fields cannot be empty (omit it for the built-in list)")
+        if not (self.redactors or self.custom or self.patterns or self.redact_emails):
+            raise ValueError("privacy.engine: safe needs at least one redactor (redactors, custom, patterns or redact_emails)")
+        from ..extraction.patterns.engine import validate_regex
+
+        for label, regex in [*((c.name, c.regex) for c in self.custom), *self.patterns.items()]:
+            errors = [i for i in validate_regex(regex, pattern_id=label, source="privacy") if i.severity == "error"]
+            if errors:
+                raise ValueError(f"redactor {label!r} is outside the safe engine: {errors[0].message}")
+        return self
+
+    def recipe(self) -> dict[str, Any]:
+        """The fingerprint dump: the a1/a2 keys, plus the B11 keys only when they differ from their
+        defaults (so existing index identities are unchanged)."""
+        data = self.model_dump(mode="json", exclude={"trace_masking"})
+        defaults = {
+            "engine": "legacy", "redactors": [], "custom": [], "regex_engine": "re2", "regex_timeout_ms": 100, "hash_key_env": None,
+            "actions": {}, "record_fields": None, "record_fields_allow": [],
+        }
+        for key, default in defaults.items():
+            if data.get(key) == default:
+                data.pop(key, None)
+        return data
 
 
 class HttpConfig(StrictModel):
@@ -1006,6 +1192,18 @@ class HttpConfig(StrictModel):
 
 class McpConfig(StrictModel):
     transports: list[Literal["stdio", "streamable_http"]] = Field(default_factory=lambda: ["stdio"])
+    # the enabled log tools (tools.enabled) are MCP tools too, read-only (addendum A2 §4.5.1)
+    log_tools: bool = True
+    # mount the streamable-HTTP MCP app at /mcp on the HTTP app (one process, one engine; N14)
+    mount_on_http: bool = False
+    # a separate bearer token for /mcp (else the HTTP resolver is used)
+    token_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,127}$")
+
+    @model_validator(mode="after")
+    def mount_needs_http(self):
+        if self.mount_on_http and "streamable_http" not in self.transports:
+            raise ValueError("serving.mcp.mount_on_http needs streamable_http in transports")
+        return self
 
 
 class ActionsServingConfig(StrictModel):
@@ -1047,10 +1245,86 @@ class ActionsConfig(StrictModel):
         return value
 
 
+class AccessConfig(StrictModel):
+    """The access policy (``runtime/acl.py``) selected by name; no class is loaded from config.
+
+    * ``none``: every principal sees the whole dataset (single-tenant serving, the default).
+    * ``tenant``: every arm, tool, value listing and graph read is restricted to records whose
+      ``field`` equals the principal's ``tenant``. A principal without a tenant sees nothing
+      (fail closed) unless its id is listed in ``unrestricted`` (an operator)."""
+
+    policy: Literal["none", "tenant"] = "none"
+    field: str = Field(default="tenant", pattern=IDENTIFIER)
+    unrestricted: list[str] = Field(default_factory=list, max_length=100)
+
+
+HOST_NAME = r"^(?:\[[0-9a-fA-F:.]{2,45}\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$"
+
+
+class UiConfig(StrictModel):
+    """The static web UI (addendum A2 §4.4; wheel ``su-multi-arm-ui``). ``enabled`` mounts it at
+    ``mount`` on the HTTP app; without the wheel the server refuses to start (``ConfigError``). The
+    UI needs bearer auth (or an injected resolver) unless ``allow_unauthenticated_loopback`` is set
+    explicitly for single-user development."""
+
+    enabled: bool = False
+    mount: str = Field(default="/ui", pattern=r"^/[a-z][a-z0-9_-]{0,31}$")
+    display_timezone: str | None = Field(default=None, max_length=64)  # display only; never changes partition dates
+    session_storage_token: bool = False  # keep the token in sessionStorage (never localStorage or a cookie)
+    allow_unauthenticated_loopback: bool = False
+
+    @field_validator("mount")
+    @classmethod
+    def not_api(cls, value):
+        if value in {"/v2", "/mcp", "/health", "/ready", "/docs", "/redoc", "/openapi.json", "/search", "/answer"}:
+            raise ValueError(f"ui mount {value!r} collides with a server route")
+        return value
+
+    @field_validator("display_timezone")
+    @classmethod
+    def known_zone(cls, value):
+        if value is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(value)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError(f"unknown IANA timezone {value!r}") from None
+        return value
+
+
+class ServingAnswersSpend(StrictModel):
+    """``serving.answers`` (addendum A2 rev 4): answer-time model calls (planner, generator,
+    reviewer) reserve on a persistent per-day ledger under their own scope ``serving.answers``,
+    separate from the learning scopes, and on ``budgets.providers.<provider>.max_usd_total`` when
+    the provider has one. Off by default (per-request ``budgets`` only). A refused reservation fails
+    the call before it is sent; there is no fallback to another provider."""
+
+    enabled: bool = False
+    max_usd_per_day: float | None = Field(default=None, gt=0)
+    max_calls_per_day: int = Field(default=10_000, ge=1, le=10_000_000)
+    ledger: Path | None = None  # default <state dir of the first sqlite backend>/.answers_spend.sqlite, else ./.answers_spend.sqlite
+    timezone: str = "UTC"
+
+
 class ServingConfig(StrictModel):
     http: HttpConfig = Field(default_factory=HttpConfig)
+    answers: ServingAnswersSpend = Field(default_factory=ServingAnswersSpend)
     mcp: McpConfig = Field(default_factory=McpConfig)
     actions: ActionsServingConfig = Field(default_factory=ActionsServingConfig)
+    # Extra Host names admitted by the Host allow-list (reverse proxy names), exact match; the list
+    # is active when the UI is enabled or the list is non-empty (addendum A2 B10, n-r3-4;
+    # ``serving/hosts.py``).
+    allowed_hosts: list[str] = Field(default_factory=list)
+    ui: UiConfig = Field(default_factory=UiConfig)
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def host_names(cls, value):
+        for host in value:
+            if not re.fullmatch(HOST_NAME, host) or host == "*":
+                raise ValueError(f"allowed host {host!r} must be an exact host name or address (no port, no wildcard)")
+        return [h.lower() for h in value]
 
 
 # --- root --------------------------------------------------------------------------------------
@@ -1078,6 +1352,7 @@ class Config(StrictModel):
     serving: ServingConfig = Field(default_factory=ServingConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     actions: ActionsConfig = Field(default_factory=ActionsConfig)
+    access: AccessConfig = Field(default_factory=AccessConfig)
     # Read-only log sources (addendum A1 §3.1, slice L1). Consumed by ``su-multi-arm sources``; the
     # engine never opens a source on the request path.
     sources: dict[str, SourceConfig] = Field(default_factory=dict)
@@ -1085,6 +1360,29 @@ class Config(StrictModel):
     learning: LearningConfig = Field(default_factory=LearningConfig)
     # Daily log analytics (addendum A1 L3a/L3b; ``core/config_logs.py``): partitions, compose, retention.
     logs: LogsConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def log_count_fields(cls, data):
+        """``logs_example`` profile: the per-unit source counts ``count_<query>`` (integer) and their
+        basis ``basis_<query>`` (``role: basis``) are declared for every count query of the logs
+        source unless the configuration declares them itself (the names depend on the source)."""
+        if not isinstance(data, dict) or data.get("profile") != "logs_example" or not isinstance(data.get("logs"), dict):
+            return data
+        source = (data.get("sources") or {}).get(data["logs"].get("source"))
+        schema = data.get("metadata_schema")
+        if not isinstance(source, dict) or not isinstance(schema, dict) or not isinstance(schema.get("fields"), list):
+            return data
+        declared = {f.get("name") for f in schema["fields"] if isinstance(f, dict)}
+        extra = []
+        for name in sorted(source.get("counts") or {}):
+            if f"count_{name}" not in declared:
+                extra.append({"name": f"count_{name}", "type": "integer", "sortable": True})
+            if f"basis_{name}" not in declared:
+                extra.append({"name": f"basis_{name}", "type": "string", "role": "basis"})
+        if not extra:
+            return data
+        return {**data, "metadata_schema": {**schema, "fields": [*schema["fields"], *extra]}}
 
     @model_validator(mode="before")
     @classmethod
@@ -1193,6 +1491,8 @@ class Config(StrictModel):
         if self.pipeline.arms.dense is not None:
             projections = self.ingestion.projections or ProjectionsConfig()
             for kind, fields in LINE_TEXT_FIELDS.items():
+                if kind == "signature_examples" and logs.compose.exemplars != "per_tenant":
+                    continue  # not composed
                 embedded = [f for f in fields if projections.embeds(kind, f)]
                 if embedded:
                     raise ConfigError(
@@ -1200,10 +1500,47 @@ class Config(StrictModel):
                         f"or set ingestion.projections.embed_fields.{kind} without them (retention invariant)",
                         "ingestion.projections",
                     )
+        raw = logs.partitions.raw
+        if raw.enabled and raw.path is not None:
+            from .config_logs import _absolute
+
+            root = _absolute(raw.path)
+            readers = {f"backends.{n}.path": b.path for n, b in self.backends.items() if getattr(b, "path", None) is not None and isinstance(b.path, Path)}
+            if self.extraction.pattern_library is not None:
+                readers["extraction.pattern_library.path"] = self.extraction.pattern_library.path
+            readers["the installed package (served code)"] = Path(__file__).resolve().parents[1]
+            try:  # the static UI bundle, when the wheel is installed
+                import su_multi_arm_ui  # type: ignore[import-not-found]
+
+                readers["the web UI bundle (served files)"] = Path(su_multi_arm_ui.STATIC_DIR)
+            except ImportError:
+                pass
+            for key, path in readers.items():
+                other = _absolute(path)
+                if other == root or root in other.parents or other in root.parents:
+                    raise ConfigError(f"logs.partitions.raw.path overlaps {key}; raw copies must sit where nothing else reads", "logs.partitions.raw.path")
         if self.privacy.trace_masking != "privacy":
             raise ConfigError("logs requires privacy.trace_masking: privacy (traces hold no passages)", "privacy.trace_masking")
         if self.sessions.memory.store_text:
             raise ConfigError("logs refuses sessions.memory.store_text (sessions keep ids and hashes only)", "sessions.memory.store_text")
+        kinds = logs.compose.kinds
+        if logs.intents.enabled:
+            missing = [k for k in ("log_day", "endpoint_day", "exception_day", "coverage_day") if not getattr(kinds, k)]
+            if missing:
+                raise ConfigError(f"logs.intents needs the analytics kinds {missing} (logs.compose.kinds)", "logs.compose.kinds")
+            if logs.compose.exemplars != "per_tenant":
+                raise ConfigError("logs.intents needs logs.compose.exemplars: per_tenant (no cross-tenant lines in one document)", "logs.compose.exemplars")
+        if kinds.incident:
+            try:
+                import networkx  # noqa: F401
+            except ImportError:
+                raise ConfigError("logs.compose.kinds.incident needs networkx (install the communities extra)", "logs.compose.kinds.incident") from None
+        if self.profile == "logs_example" and self.access.policy != "none":
+            raise ConfigError("the logs profile serves a single tenant (addendum A2 B4): access.policy must be none", "access.policy")
+        if self.access.policy == "tenant":
+            spec = self.metadata_schema.field(self.access.field)
+            if spec is None or not spec.filterable:
+                raise ConfigError(f"access.field {self.access.field!r} must be a declared filterable metadata field", "access.field")
         return self
 
     def capability_problem(self, backend_name: str, capability: str, flag: str | None = None) -> str | None:
@@ -1296,8 +1633,19 @@ def _resolve_paths(config: Config, base: Path) -> Config:
         library.path = (base / library.path.expanduser()).resolve()
     if config.learning.patterns is not None and config.learning.patterns.spend_ledger is not None:
         config.learning.patterns.spend_ledger = (base / config.learning.patterns.spend_ledger.expanduser()).resolve()
+    if config.learning.patterns is not None and config.learning.patterns.stop_file is not None:
+        config.learning.patterns.stop_file = (base / config.learning.patterns.stop_file.expanduser()).resolve()
+    if config.serving.answers.ledger is not None:
+        config.serving.answers.ledger = (base / config.serving.answers.ledger.expanduser()).resolve()
+    if config.learning.extraction is not None:
+        for name in ("spend_ledger", "reply_cache", "stop_file"):
+            value = getattr(config.learning.extraction, name)
+            if value is not None:
+                setattr(config.learning.extraction, name, (base / value.expanduser()).resolve())
     if config.logs is not None:
         config.logs.partitions.path = (base / config.logs.partitions.path.expanduser()).resolve()
+        if config.logs.partitions.raw.path is not None:
+            config.logs.partitions.raw.path = (base / config.logs.partitions.raw.path.expanduser()).resolve()
     embedder = config.models.roles.embedder
     if embedder is not None and embedder.precomputed is not None:
         embedder.precomputed.vectors = (base / embedder.precomputed.vectors.expanduser()).resolve()
@@ -1331,7 +1679,13 @@ def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
         add(source, "ca_bundle", f"sources.{name}.ca_bundle")
     add((data.get("extraction") or {}).get("pattern_library"), "path", "extraction.pattern_library.path")
     add((data.get("learning") or {}).get("patterns"), "spend_ledger", "learning.patterns.spend_ledger")
+    add((data.get("learning") or {}).get("patterns"), "stop_file", "learning.patterns.stop_file")
+    add((data.get("learning") or {}).get("extraction"), "spend_ledger", "learning.extraction.spend_ledger")
+    add((data.get("learning") or {}).get("extraction"), "reply_cache", "learning.extraction.reply_cache")
+    add((data.get("learning") or {}).get("extraction"), "stop_file", "learning.extraction.stop_file")
+    add((data.get("serving") or {}).get("answers"), "ledger", "serving.answers.ledger")
     add((data.get("logs") or {}).get("partitions"), "path", "logs.partitions.path")
+    add(((data.get("logs") or {}).get("partitions") or {}).get("raw"), "path", "logs.partitions.raw.path")
     embedder = ((data.get("models") or {}).get("roles") or {}).get("embedder")
     precomputed = embedder.get("precomputed") if isinstance(embedder, dict) else None
     add(precomputed, "vectors", "models.roles.embedder.precomputed.vectors")

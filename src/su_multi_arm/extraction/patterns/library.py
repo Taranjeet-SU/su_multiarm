@@ -149,6 +149,10 @@ class PatternEntry(StrictModel):
     attribute_links: list[AttributeLink] = Field(default_factory=list)
     signature: SignatureDecl | None = None
     then: Then | None = None
+    # ``noise`` only: ``before_message`` makes the entry run before the message stage and win over
+    # any message match (health checks, heartbeats); unset is ``after_message`` (only lines that no
+    # message matched). Unset is omitted from the identity, so existing identities are unchanged.
+    precedence: Literal["before_message", "after_message"] | None = None
     examples: Examples = Field(default_factory=Examples)
     provenance: dict[str, JsonScalar] = Field(default_factory=dict)
     evidence: dict[str, Any] | None = None  # gate summary of a system-written entry
@@ -219,6 +223,8 @@ class LoadedEntry:
 
     def canonical(self) -> dict[str, Any]:
         data = self.entry.model_dump(mode="json", exclude={"examples", "provenance", "evidence", "status"})
+        if data.get("precedence") is None:
+            data.pop("precedence", None)
         data["regex"] = self.regex
         return data
 
@@ -234,6 +240,13 @@ class Library:
     applied_decisions: list[Decision]
     issues: list[LintIssue]
     file_shas: dict[str, str]
+
+    def reviewed(self, entry: LoadedEntry) -> bool:
+        """A user-owned entry, or one a human approved (an ``approve`` decision by ``user:*``).
+        Only a reviewed entry's relations may become ``fact`` edges (addendum A2 review B7)."""
+        if entry.owner == "user":
+            return True
+        return any(d.op == "approve" and d.human and d.id == entry.entry.id for d in self.applied_decisions)
 
     def approved(self, kind: str | None = None) -> list[LoadedEntry]:
         """Effective approved entries, ordered by priority (high first) then id."""
@@ -505,6 +518,10 @@ def lint_entry(loaded: LoadedEntry, engine: PatternEngine, min_literal_chars: in
         error("relations_kind", f"{kind} patterns cannot declare relations or attribute links")
     if kind == "noise" and entry.entities:
         error("noise_entities", "noise patterns mark lines; they declare no entities")
+    if kind != "noise" and entry.precedence is not None:
+        error("precedence_kind", "only noise patterns take precedence (before_message or after_message)")
+    if kind == "continuation" and any(entry.selector(key) is not None for key in entry.applies_to):
+        error("continuation_selector", "continuation patterns apply to every stream; multiline joining has no line attributes to select on")
     for relation in entry.relations:
         ends = (relation.subject, relation.object)
         if any(end.startswith("$") for end in ends):

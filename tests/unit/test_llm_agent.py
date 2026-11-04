@@ -62,7 +62,7 @@ def test_total_question_answered_with_a_count_is_refused(v2_ctx, v2_backend, v2_
 def test_explicit_caller_aggregate_cannot_be_changed_and_validate_checks_secret(v2_ctx, v2_backend, v2_schema, monkeypatch):
     def respond(self, system, payload, schema, budget, stage):
         budget.reserve()
-        assert payload["explicit_aggregate"] == {"kind": "sum", "field": "amount", "unit": None, "granularity": None}
+        assert payload["explicit_aggregate"] == {"kind": "sum", "field": "amount", "unit": None, "granularity": None, "of": None}
         return schema.model_validate({"steps": [{"arm": "structured", "scope": {"measure": {"kind": "count"}}}]})
 
     monkeypatch.setattr(JsonModel, "call", respond)

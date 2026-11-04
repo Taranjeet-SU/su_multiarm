@@ -225,6 +225,9 @@ def test_values_cardinality_cap_fails_closed(pg_factory):
 def test_records_use_native_types(pg_factory):
     backend = pg_factory()
     kit.check_records(backend)
+    # check_records ends with the text-count check, which rewrites GEN's records without the typed
+    # fields; the typed rows are written again so their storage types can be inspected
+    backend.records.upsert(kit.GEN, kit.record_rows(), kit.SCHEMA)
     with backend.tx("test") as cur:
         schema = backend.generation_info(cur, kit.GEN)["schema"]
         cur.execute(f"SELECT pg_typeof(ts_value)::text, ts_value FROM {schema}.record_fields WHERE owner_id = 'd2' AND field = 'touched_at'")

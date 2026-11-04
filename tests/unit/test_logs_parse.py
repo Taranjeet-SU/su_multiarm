@@ -59,7 +59,7 @@ def test_statuses_signatures_cells_and_queue(library):
     assert parsed.counts["parsed"] == 2 and parsed.counts["noise"] == 1 and parsed.counts["records"] == 5
     (row,) = parsed.aggregates["signatures"]
     assert row["signature_id"] == "dependency.connect_failed" and row["lines"] == 2 and row["row_exactness"] == "exact"
-    assert parsed.hourly_cells == [{"signature_id": "dependency.connect_failed", "tenant": "t001", "env": "prod", "service": "query-gateway", "hour": "2026-01-05T10:00:00+00:00", "lines": 2}]
+    assert parsed.hourly_cells == [{"signature_id": "dependency.connect_failed", "tenant": "t001", "env": "prod", "service": "query-gateway", "deployment": "t001-prod", "hour": "2026-01-05T10:00:00+00:00", "lines": 2, "row_exactness": "exact"}]
     assert [u["status"] for u in parsed.unparsed] == ["format_only", "unparsed"]
     exemplar = parsed.exemplars["dependency.connect_failed"][0]["text"]
     assert exemplar.endswith("at Handler.route (/srv/app/x.js:1:2)") and "\n\n" not in exemplar

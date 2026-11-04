@@ -84,8 +84,11 @@ class CascadeAgent(DecisionAgent):
         on_failure = self.config.on_failure  # type: ignore[attr-defined]
         with ctx.trace.span("decision", agent=self.name, policy=on_failure, stages=list(self.stages)) as span:
             try:
-                decision = self.attempt(ctx, request, intents, capabilities)
-                decision = self.check_qualifiers(ctx, request, intents, capabilities, decision)
+                decision = self.log_step(ctx, request, intents, capabilities)
+                if decision is None:
+                    decision = self.attempt(ctx, request, intents, capabilities)
+                    decision = self.require_intent(request, capabilities, decision)
+                    decision = self.check_qualifiers(ctx, request, intents, capabilities, decision)
             except _StageAbstain as stop:
                 decision = abstain(
                     intents,

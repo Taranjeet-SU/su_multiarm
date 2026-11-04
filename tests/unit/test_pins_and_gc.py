@@ -149,10 +149,10 @@ def test_a_pin_from_another_process_blocks_gc_until_it_expires(tmp_path):
     time.sleep(0.01)
     from su_multi_arm.ingestion.retention import Retention
 
-    result = Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).run(span[2])
+    result = Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).run(span[2] + timedelta(days=1))
     assert [d["generation"] for d in result["deleted_generations"]] == [pinned_generation]
     assert "2026-01-01" not in pipe.store.keys()
-    assert Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).verify(span[2])["ok"]
+    assert Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).verify(span[2] + timedelta(days=1))["ok"]
 
 
 def test_pinned_retention_waits_up_to_the_bound(tmp_path):
@@ -180,7 +180,7 @@ def test_pinned_retention_waits_up_to_the_bound(tmp_path):
     library = pipe.library()
     pipe.pull(span[2], library)
     pipe.compose(span[2], library)
-    result = Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now, sleep=sleep, pins=pins).run(span[2])
+    result = Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now, sleep=sleep, pins=pins).run(span[2] + timedelta(days=1))
     assert slept == [10, 10, 10] and [d["generation"] for d in result["deleted_generations"]] == [generation]
 
 
@@ -236,7 +236,7 @@ def test_compose_failure_skips_expiry(tmp_path):
     from su_multi_arm.ingestion.retention import Retention
 
     with pytest.raises(ConfigError):
-        Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).run(span[2])
+        Retention(cfg, pipe.store, pipe.write_path, backends={"local": backend}, now=pipe.now).run(span[2] + timedelta(days=1))
 
 
 def test_pin_token_model():

@@ -15,8 +15,10 @@ Only text that the configured ``privacy`` redaction has processed may reach a mo
 - ``Pseudonymiser`` replaces the values of the ``pseudonymise`` attributes with stable per-run
   aliases (``tenant-1``, ``host-2`` …), in the attributes and wherever the value occurs in the text.
 
-The redaction is today's privacy engine (the ``legacy`` path, Python ``re``); the safe engine with
-named built-in redactors is slice B11. Nothing in a model reply is executed except its regex, which
+Under ``privacy.engine: safe`` the redaction is the safe redactor (``privacy/redactors.py``) and the
+stamp is its ``safe:<sha16>``; records a ``LogMapping`` redacted with the same redactor are already
+stamped by ``lines_from_records`` and are not redacted twice. Under ``legacy`` it is the
+``redact_emails``/``patterns`` path with Python ``re`` (stamp ``privacy:<sha16>``). Nothing in a model reply is executed except its regex, which
 goes through the validator and the gate.
 """
 
@@ -53,6 +55,13 @@ class LineRedactor:
     """The configured privacy redaction applied to log lines (and their attribute values)."""
 
     def __init__(self, privacy: Any):
+        from ...privacy import safe_redactor
+
+        self.safe = safe_redactor(privacy) if getattr(privacy, "engine", "legacy") == "safe" else None
+        if self.safe is not None:
+            self.patterns = []
+            self.stamp = self.safe.stamp
+            return
         patterns = dict(getattr(privacy, "patterns", {}) or {})
         if getattr(privacy, "redact_emails", False):
             patterns["EMAIL"] = EMAIL_PATTERN
@@ -65,6 +74,9 @@ class LineRedactor:
         self.stamp = f"privacy:{digest}"
 
     def text(self, text: str) -> tuple[str, int]:
+        if self.safe is not None:
+            out, made = self.safe.redact(text)
+            return out, sum(made.values())
         total = 0
         for label, pattern in self.patterns:
             text, count = pattern.subn(f"[REDACTED_{label}]", text)
@@ -83,18 +95,30 @@ class LineRedactor:
         return [self.redact(line) for line in lines]
 
 
-def lines_from_records(records: Iterable[Any], mapping: Any, attributes: Iterable[str] = ("service", "tenant", "env", "host")) -> list[LogLine]:
-    """``LogRecord``s as ``LogLine``s, refusing records mapped without a redactor (L1 open item)."""
+def lines_from_records(
+    records: Iterable[Any], mapping: Any, attributes: Iterable[str] = ("service", "tenant", "env", "host"), redactor: "LineRedactor | None" = None
+) -> list[LogLine]:
+    """``LogRecord``s as ``LogLine``s, refusing records mapped without a redactor (L1 open item).
+    When ``redactor`` carries the same stamp as the mapping (the same safe redaction), the lines are
+    returned as ``RedactedLine``s with that stamp: the egress policy admits them as they are."""
     if getattr(mapping, "redaction", "none") == "none":
         raise EgressRefused("the source mapping applied no redaction (LogMapping.redaction is 'none'); its records cannot reach the pattern learner")
-    out = []
+    stamped = redactor is not None and getattr(mapping, "redaction", None) == redactor.stamp
+    out: list[LogLine] = []
     for record in records:
         attrs = {k: v for k, v in record.attributes.items() if k in attributes and isinstance(v, str)}
         if record.host and "host" in attributes:
             attrs["host"] = record.host
         if record.level:
             attrs["level"] = record.level.casefold()
-        out.append(LogLine(record.id, record.message, attrs))
+        if stamped:
+            # attribute values come from index names and fields the mapping did not redact
+            redacted = {}
+            for key, value in attrs.items():
+                redacted[key], _ = redactor.text(value)  # type: ignore[union-attr]
+            out.append(RedactedLine(record.id, record.message, redacted, "message", redactor.stamp, 0))  # type: ignore[union-attr]
+        else:
+            out.append(LogLine(record.id, record.message, attrs))
     return out
 
 
@@ -106,33 +130,94 @@ class Pseudonymiser:
     aliases: dict[tuple[str, str], str] = field(default_factory=dict)
 
     def alias(self, key: str, value: str) -> str:
-        if (key, value) not in self.aliases:
+        # Case-insensitive identity (real-run fix): "Tenant-Alpha" and "tenant-alpha" are one value.
+        folded = value.casefold()
+        if (key, folded) not in self.aliases:
             count = sum(1 for k, _ in self.aliases if k == key) + 1
-            self.aliases[(key, value)] = f"{key}-{count}"
-        return self.aliases[(key, value)]
+            self.aliases[(key, folded)] = f"{key}-{count}"
+        return self.aliases[(key, folded)]
 
     def attributes(self, attributes: dict[str, str]) -> dict[str, str]:
         return {k: (self.alias(k, v) if k in self.keys and v else v) for k, v in sorted(attributes.items())}
 
     def text(self, text: str) -> str:
-        # Longest value first, so a value that contains another is replaced whole.
+        """Every known value replaced by its alias: case-insensitive and on token boundaries (a value
+        is not replaced inside a longer identifier). Longest value first, so a value that contains
+        another is replaced whole."""
         for (key, value), alias in sorted(self.aliases.items(), key=lambda item: (-len(item[0][1]), item[0])):
             if value and key in self.keys:
-                text = text.replace(value, alias)
+                pattern = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(value) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
+                text = pattern.sub(alias, text)
         return text
+
+
+# B11 built-ins used as an egress detector (real-run fix): every secret, personal and payload class,
+# cookies, session and tracking ids included. ``uuid`` and ``request_id`` are identifiers that log
+# templates legitimately carry, so they are not egress refusals.
+EGRESS_SCAN_EXCLUDED = frozenset({"uuid", "request_id"})
+_SCANNER: list[Any] = []
+
+
+def _scanner() -> Any:
+    if not _SCANNER:
+        from ...extraction.patterns.engine import re2_available, select_engine
+        from ...privacy.redactors import ORDER, SafeRedactor, builtin_redactors
+
+        # Detection only (never the configured redaction): RE2 when installed, else the stdlib
+        # engine over the same linear, linted patterns.
+        engine = select_engine("re2" if re2_available() else "regex")
+        _SCANNER.append(SafeRedactor(builtin_redactors([n for n in ORDER if n not in EGRESS_SCAN_EXCLUDED]), engine))
+    return _SCANNER[0]
+
+
+def egress_shapes(text: str) -> list[str]:
+    """Names of every unredacted shape in ``text``: the library's PII shapes plus every B11
+    built-in redactor (cookie headers, session and tracking ids, secrets, payload classes) that
+    would still replace a span. Existing redaction tokens are not findings."""
+    names = set(pii_shapes(text))
+    names.update(name for name, _, _ in _scanner().findings(text))
+    return sorted(names)
 
 
 class EgressPolicy:
     def __init__(self, settings: PatternEgressConfig, redactor: LineRedactor):
         self.settings, self.redactor = settings, redactor
 
-    def check_role(self, role: Any) -> None:
+    def check_role(self, role: Any, name: str = "pattern_learner", setting: str = "learning.patterns.egress.allow_hosted") -> None:
         if role is None:
-            raise EgressRefused("models.roles.pattern_learner is not configured")
+            raise EgressRefused(f"models.roles.{name} is not configured")
         if not self.settings.allow_hosted and not loopback_role(role):
-            raise EgressRefused(
-                f"the pattern_learner role ({role.provider}) is not a loopback openai_compatible model and learning.patterns.egress.allow_hosted is false"
-            )
+            raise EgressRefused(f"the {name} role ({role.provider}) is not a loopback openai_compatible model and {setting} is false")
+
+    def refusal(self, line: Any) -> str | None:
+        """Why ``line`` may not leave the process, or ``None``."""
+        if not isinstance(line, RedactedLine):
+            return "not processed by the configured redaction"
+        if line.redaction != self.redactor.stamp:
+            return f"redacted under another privacy configuration ({line.redaction or 'none'})"
+        shapes = sorted({s for text in (line.text, *line.attributes.values()) for s in egress_shapes(text)})
+        if shapes:
+            return f"unredacted {', '.join(shapes)} shape after redaction"
+        return None
+
+    def split(self, lines: Iterable[Any], max_refused_share: float) -> tuple[list[RedactedLine], dict[str, str]]:
+        """Per-line egress (A2 rev 2 §4.2.4, N6): ``(admitted, refused id -> why)``. A refused line
+        is never sent and never repaired; the whole batch is refused (``EgressRefused``) only when
+        the refused share exceeds ``max_refused_share``."""
+        admitted: list[RedactedLine] = []
+        refused: dict[str, str] = {}
+        total = 0
+        for line in lines:
+            total += 1
+            why = self.refusal(line)
+            if why is None:
+                admitted.append(line)
+            else:
+                refused[str(getattr(line, "id", "?"))] = why
+        if total and len(refused) / total > max_refused_share:
+            shown = "; ".join(f"{k}: {v}" for k, v in list(refused.items())[:10])
+            raise EgressRefused(f"{len(refused)} of {total} line(s) refused by the egress policy (share above {max_refused_share}): {shown}")
+        return admitted, refused
 
     def admit(self, lines: Iterable[Any]) -> list[RedactedLine]:
         """Every line, or ``EgressRefused`` naming the refused ones (nothing is dropped)."""
@@ -145,7 +230,7 @@ class EgressPolicy:
             if line.redaction != self.redactor.stamp:
                 refused.append(f"{line.id}: redacted under another privacy configuration ({line.redaction or 'none'})")
                 continue
-            shapes = sorted(set(pii_shapes(line.text)) | {s for v in line.attributes.values() for s in pii_shapes(v)})
+            shapes = sorted({s for text in (line.text, *line.attributes.values()) for s in egress_shapes(text)})
             if shapes:
                 refused.append(f"{line.id}: unredacted {', '.join(shapes)} shape after redaction")
                 continue

@@ -32,6 +32,7 @@ Every dated document also records ``date_basis`` (``index_date`` or ``event_time
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 from typing import Any, Iterable
 
@@ -57,7 +58,24 @@ def render_header(kind: str, values: dict[str, Any]) -> str:
     parts = [f"kind: {kind}"]
     if "date" in values:
         parts.append(f"date: {values['date']} ({values.get('date_basis', 'index_date')}, {values.get('date_timezone', 'UTC')})")
-    for key in ("ts_hour", "tenant", "env", "service", "signature_id", "category", "pattern_id", "first_seen", "last_seen", "services"):
+    for key in (
+        "ts_hour",
+        "tenant",
+        "env",
+        "service",
+        "level",
+        "status",
+        "signature_id",
+        "category",
+        "pattern_id",
+        "endpoint",
+        "http_method",
+        "status_class",
+        "exception_class",
+        "first_seen",
+        "last_seen",
+        "services",
+    ):
         if values.get(key) not in (None, ""):
             parts.append(f"{key.replace('_id', '')}: {values[key]}")
     for key in ("lines", "lines_total", "lines_window", "tenants_affected"):
@@ -125,6 +143,7 @@ def day_documents(dataset: str, day: DayInputs, *, signature_hour: bool = False)
             "lines": row["lines"],
             "row_exactness": row["row_exactness"],
             "method": row["method"],
+            "pattern_owner": row.get("pattern_owner"),
         }
         docs.append(_document(dataset, "signature_day", [day.key, row["unit_id"], row["signature_id"]], f"{row['signature_id']} {attrs.get('service')} {day.key}", meta))
         service_name = attrs.get("service") or "unknown"
@@ -152,7 +171,7 @@ def day_documents(dataset: str, day: DayInputs, *, signature_hour: bool = False)
     return docs
 
 
-def window_documents(dataset: str, days: list[DayInputs], library: Any, *, max_exemplars: int = 3) -> list[Document]:
+def window_documents(dataset: str, days: list[DayInputs], library: Any, *, max_exemplars: int = 3, exemplars_mode: str = "signature") -> list[Document]:
     """Window rollups (``signature_window``, ``signature_tenant_window``) and the ``signature``
     documents. Exemplars come from the newest days first; templates are rendered from the library
     entry (no line text)."""
@@ -191,20 +210,57 @@ def window_documents(dataset: str, days: list[DayInputs], library: Any, *, max_e
         loaded = entries.get(sig)
         author = str((loaded.entry.provenance or {}).get("author", "unknown")) if loaded else "unknown"
         exemplars: list[str] = []
-        for day in sorted(days, key=lambda d: d.key, reverse=True):
-            for row in day.exemplars.get(sig, []):
-                if len(exemplars) < max_exemplars:
-                    exemplars.append(row["text"])
-        template = f"{sig} ({entry['category']}) pattern {entry['pattern_id']}: {loaded.regex}" if loaded else f"{sig} ({entry['category']}) pattern {entry['pattern_id']}"
+        newest: list[dict[str, Any]] = [row for day in sorted(days, key=lambda d: d.key, reverse=True) for row in day.exemplars.get(sig, [])]
+        for row in newest:
+            if len(exemplars) < max_exemplars:
+                exemplars.append(row["text"])
+        # review N9: the dense/lexical template is the masked human template (variable tokens of the
+        # newest exemplar's head line masked); the regex moves into metadata
+        masked = mask_template(newest[0]["text"].split("\n", 1)[0]) if newest else None
+        template = f"{sig} ({entry['category']}): {masked}" if masked else f"{sig} ({entry['category']})"
         fields = {"template": template}
-        if exemplars:
+        if exemplars and exemplars_mode == "signature":
             fields["exemplars"] = "\n\n".join(exemplars)
-        signature_meta = {"signature_id": sig, "pattern_id": entry["pattern_id"], "category": entry["category"], "author": author, "reviewed": loaded is not None and loaded.owner == "user"}
+        signature_meta = {
+            "signature_id": sig,
+            "pattern_id": entry["pattern_id"],
+            "category": entry["category"],
+            "author": author,
+            "reviewed": loaded is not None and library.library.reviewed(loaded),
+            "pattern_owner": "none" if loaded is None else ("user" if loaded.owner == "user" else "learned"),
+            "regex": loaded.regex if loaded else None,
+        }
         docs.append(_document(dataset, "signature", [sig], sig, signature_meta, fields))
+        if exemplars_mode == "per_tenant":
+            by_tenant: dict[str, list[str]] = defaultdict(list)
+            for row in newest:
+                tenant = row.get("tenant") or "unknown"
+                if len(by_tenant[tenant]) < max_exemplars:
+                    by_tenant[tenant].append(row["text"])
+            for tenant, texts in sorted(by_tenant.items()):
+                meta_examples = {"signature_id": sig, "tenant": tenant, "category": entry["category"], "pattern_id": entry["pattern_id"]}
+                docs.append(_document(dataset, "signature_examples", [sig, tenant], f"{sig} examples {tenant}", meta_examples, {"exemplars": "\n\n".join(texts)}))
     for (sig, tenant), per in sorted(tenants.items()):
         meta = {"signature_id": sig, "tenant": tenant, "lines_window": per["lines"], "first_seen": per["first"], "last_seen": per["last"], "row_exactness": worst(per["exactness"]), **basis}
         docs.append(_document(dataset, "signature_tenant_window", [sig, tenant], f"{sig} {tenant} window", meta))
     return docs
+
+
+_MASKS = (
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9:.,]+Z?"), "<ts>"),
+    (re.compile(r"\b[0-9a-fA-F]{12,}\b"), "<hex>"),
+    (re.compile(r"(?<![A-Za-z])[0-9]+(?:\.[0-9]+)?"), "<num>"),
+)
+
+
+def mask_template(line: str) -> str:
+    """A human-readable template of a redacted line: uuids, stamps, long hex and numbers masked
+    (deterministic, review N9). Never a regex."""
+    out = line.strip()
+    for pattern, token in _MASKS:
+        out = pattern.sub(token, out)
+    return out[:512]
 
 
 def _entries_by_signature(library: Any) -> dict[str, Any]:

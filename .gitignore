@@ -14,3 +14,9 @@ state/
 *.npy
 /.astra_recommendations.md
 .claude/worktrees/
+# web UI (ui/): dependencies and test artefacts are never committed; the built bundle in
+# ui/python/su_multi_arm_ui/static/ is committed so the UI wheel builds offline without Node
+ui/node_modules/
+ui/python/dist/
+ui/test-results/
+ui/playwright-report/

@@ -102,6 +102,22 @@ ROUTES: tuple[Route, ...] = (
 )
 
 
+# Content-free path templates per row, for request logs (no index name, id or host).
+ROW_TEMPLATES = {
+    1: "/_resolve/index/{expr}",
+    2: "/{expr}/_alias",
+    3: "/{idx}/_mapping",
+    4: "/{expr}/_count",
+    5: "/{idx}/_search",
+    6: "/_search/scroll",
+    7: "/_search/scroll",
+    8: "/{idx}/_pit",
+    9: "/_pit",
+    10: "/",
+    11: "/_security/user/_has_privileges",
+}
+
+
 @dataclass(frozen=True)
 class Checked:
     route: Route
@@ -126,8 +142,10 @@ class RequestRecord:
 class AllowList:
     """The pure check. ``known_indices`` and ``own_ids`` are owned by the transport."""
 
-    def __init__(self, keepalive_max_seconds: float):
+    def __init__(self, keepalive_max_seconds: float, disallowed_rows: Iterable[int] = ()):
         self.keepalive_max_seconds = keepalive_max_seconds
+        # Rows a deployment forbids on top of the table (``sources.<n>.disallow``): refused before I/O.
+        self.disallowed_rows = frozenset(disallowed_rows)
 
     def check(
         self,
@@ -146,6 +164,8 @@ class AllowList:
             match = route.pattern.fullmatch(canonical)
             if match is None or method not in route.methods:
                 continue
+            if route.row in self.disallowed_rows:
+                raise SourceRequestRefused(method, canonical, f"row {route.row} ({route.purpose}) is disallowed by this source's configuration")
             groups = match.groupdict()
             if "idx" in groups and groups["idx"] not in set(known_indices):
                 raise SourceRequestRefused(method, canonical, f"index {groups['idx']!r} was not returned by discovery")
@@ -334,13 +354,14 @@ class SourceTransport:
         rate_limiter: RateLimiter | None = None,
         http_transport: httpx.BaseTransport | None = None,
         record_limit: int = 2000,
+        disallowed_rows: Iterable[int] = (),
     ):
         parts = urlsplit(base_url)
         if parts.scheme not in {"http", "https"} or not parts.hostname:
             raise SourceUnavailable("the source URL must be an absolute http(s) URL", "connect")
         if parts.username or parts.password or parts.query or parts.fragment:
             raise SourceAuthError("the source URL must not carry credentials, a query or a fragment; use the *_env credential variables", "connect")
-        self.allow = AllowList(keepalive_max_seconds)
+        self.allow = AllowList(keepalive_max_seconds, disallowed_rows)
         self.known_indices: set[str] = set()
         self.own_ids: set[str] = set()
         self.records: deque[RequestRecord] = deque(maxlen=record_limit)
@@ -362,6 +383,14 @@ class SourceTransport:
 
     def close(self) -> None:
         self._client.close()
+
+    def request_log(self) -> list[dict[str, Any]]:
+        """The sent requests as content-free rows: method, allow-list row, path template, status,
+        milliseconds and response bytes (never an index name, body, header or host)."""
+        return [
+            {"method": r.method, "row": r.row, "path": ROW_TEMPLATES.get(r.row, "?"), "status": r.status, "ms": round(r.ms, 1), "bytes": r.bytes}
+            for r in self.records
+        ]
 
     def register_indices(self, names: Iterable[str]) -> None:
         self.known_indices.update(names)

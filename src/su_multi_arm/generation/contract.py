@@ -90,6 +90,9 @@ class AggregateEvidence(StrictModel):
 
     id: str = Field(min_length=1)
     result: ScopeResult
+    # The deterministic sentence of the aggregate (``generation/rendering.py`` or a log tool's
+    # rendering): what replaces model-written numbers that the aggregate does not back.
+    rendering: str | None = None
 
     def exact(self) -> bool:
         # Defence in depth: a result with a dropped predicate never backs a count/list claim,
@@ -200,6 +203,17 @@ class AnswerContract:
                         numbers.append(float(group.value))
                 if result.groups:
                     values.add(float(sum(g.count for g in result.groups)))  # "these sum to 1400"
+                    # Grouped measures (a sum of ``lines`` per signature, B2+B3 regression from a
+                    # live deployment): the groups' measure values add up ("the top two account
+                    # for 2,878 lines"), and a grouped result's population is a number the answer
+                    # may restate ("900 records were counted"): neither is a group count, both are
+                    # backed by the cited exact aggregate.
+                    group_values = [float(g.value) for g in result.groups if isinstance(g.value, (int, float)) and not isinstance(g.value, bool)]
+                    if group_values:
+                        values.add(sum(group_values))
+                    values.add(float(result.denominator))
+                    # "the top 10 signatures": the number of groups shown (with boundary ties)
+                    values.update({float(len(result.groups)), float(len(result.groups) + len(result.ties))})
                 # Query-compiler results (2.0.0a3): the matched total ("showing 10 of 42"), a share's
                 # numerator, the records listed, null counts and a two-period difference.
                 values.update(float(n) for n in (result.total, result.numerator) if n is not None)
@@ -322,6 +336,14 @@ class AnswerContract:
         )
         findings = self._findings(answer, evidence_ids=evidence_ids, aggregates=aggregates, intents=intents, statements=statements)
         outcome, result_answer = self._apply(answer, findings, statements, aggregate_question=intents.asks_aggregate())
+        if outcome == "abstained" and self.on_violation != "fail" and any(f.violation.rule == "answer_number_mismatch" for f in findings):
+            rendered = self._rendered(answer, aggregates, statements)
+            if rendered is not None:
+                checked = detect_statements(rendered.answer, units=units_for(targets, question), list_intent=intents.asks_list(), passages=passages, fields=targets)
+                if not self._findings(rendered, evidence_ids=evidence_ids, aggregates=aggregates, intents=intents, statements=checked):
+                    # The model's numbers are replaced by the aggregate's own rendering (the numbers
+                    # of an aggregate answer come from the aggregate); recorded as a strip.
+                    outcome, result_answer = "stripped", rendered
         violations = [f.violation.model_copy(update={"action": "strip" if outcome == "stripped" else "abstain"}) for f in findings]
         if trace is not None:
             trace.event(
@@ -346,6 +368,27 @@ class AnswerContract:
             insufficient_evidence=True,
         )
         return AnswerResult(answer=abstained, unsupported_constraints=flagged, coverage=coverage, violations=violations, contract="abstained")
+
+    @staticmethod
+    def _rendered(answer: Answer, aggregates: list[AggregateEvidence], statements: list[Statement]) -> Answer | None:
+        """The answer rebuilt from the deterministic renderings of the exact aggregates the model
+        cited (all exact rendered aggregates when it cited none), followed by the model's
+        sentences that state no number. ``None`` when no exact aggregate has a rendering."""
+        cited = {e for c in answer.claims for e in c.evidence_ids} | set(answer.citations)
+        usable = [a for a in aggregates if a.exact() and a.rendering]
+        chosen = [a for a in usable if a.id in cited] or usable
+        if not chosen:
+            return None
+        spans = [(st.start, st.end) for st in statements]
+        narrative = [
+            m.group(0).strip()
+            for m in _SENTENCE.finditer(answer.answer)
+            if m.group(0).strip() and not re.search(r"\d", m.group(0)) and not any(a < m.end() and m.start() < b for a, b in spans)
+        ]
+        text = " ".join([*(a.rendering for a in chosen), *narrative])  # type: ignore[misc]
+        claims = [Claim(text=a.rendering or a.id, kind="count", evidence_ids=[a.id]) for a in chosen]
+        citations = list(dict.fromkeys([*(a.id for a in chosen), *(c for c in answer.citations if c not in {a.id for a in aggregates})]))
+        return Answer(answer=text, claims=claims, citations=citations, insufficient_evidence=False, short_answer=None)
 
     def _apply(self, answer: Answer, findings: list[_Finding], statements: list[Statement], *, aggregate_question: bool = False) -> tuple[str, Answer]:
         """``("passed" | "stripped" | "abstained", answer)`` under the configured policy."""

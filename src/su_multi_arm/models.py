@@ -211,6 +211,7 @@ UnsupportedReason = Literal[
     "not_supported_by_backend",
     "aggregate_intent_without_scope",
     "qualifier_not_applied",  # a question qualifier the compiled scope does not express (QA-01)
+    "intent_required",  # logs profile: an ad-hoc scope over several log kinds (A2 rev 3, R2-B4)
 ]
 
 

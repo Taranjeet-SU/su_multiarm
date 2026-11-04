@@ -1,3 +1,168 @@
+## History tier H1, lineage H2, read latency — 2026-11-04 (branch `v2-logs-h1` from `dacd166`; A2 rev 4 §4.8, §11.R4)
+
+Evidence level: **synthetic / contract** on sqlite, **real-service (isolated)** for the history rows
+on OpenSearch 3.9.0 (own compose project `su-l5-claude`, removed afterwards; synthetic gold data).
+No paid call.
+
+- Contract (`tests/contract/test_logs_history_tier.py`, 17 tests): with the tier, the generation holds
+  only window kinds (125 documents for the 10-day gold) and references one day shard per served day;
+  all 11 surface-parity questions give the same rows and rendering as without the tier; imported day
+  rows equal the derived snapshot (signature lines per day, unit counts), including a **format-1**
+  snapshot whose partition has expired (A1 kinds only, analytics `source_unavailable`); appending a
+  day writes that day's rows only; a library change that alters no document reparses (delta) and
+  writes 0 rows; a change of one day's documents writes one new shard, and the previous generation
+  still reads its own shard (shard filter); gc keeps every shard a registry generation references
+  and removes the rest; graph links cover the history with per-day weights from the shards; a
+  supersede decision yields one `signature_lineage` row and answers fold the superseded signature
+  into its successor; `signature_history` holds one row per signature and library identity.
+- OpenSearch (`tests/services/test_history_tier_opensearch.py`, `external`): the history rows in a
+  shard-tagged OpenSearch collection answer all 11 questions exactly like the sqlite tier; graph
+  weights present; gc deletes a dead shard's rows by query (0 left).
+- Day N+1 append (`scripts/bench_log_tools.py --days 180 --append`, external workspace): 180 pulled
+  days (90,701 history rows, generation 125 documents), then day 181 pulled and composed: **504 rows
+  written, all for day 181; every older shard unchanged**; 1.6 s (sqlite) / 12.9 s (OpenSearch
+  history rows); peak RSS of the whole benchmark process 663 MiB / 786 MiB.
+- Read latency, same questions with fixed 10-day windows, p95 over 20 calls, one process:
+
+  | tool | sqlite 10 d | sqlite 180 d | OpenSearch 10 d | OpenSearch 180 d |
+  |---|---:|---:|---:|---:|
+  | log_top | 4.3 | 9.1 | 11.4 | 22.6 |
+  | log_new | 2.2 | 2.0 | 2.9 | 2.1 |
+  | log_affected | 2.2 | 4.6 | 8.0 | 9.7 |
+  | log_trend | 3.6 | 8.1 | 8.1 | 13.7 |
+  | log_compare | 2.3 | 4.3 | 7.5 | 15.0 |
+  | log_tenants | 2.0 | 2.8 | 10.4 | 5.2 |
+  | log_around | 2.7 | 3.7 | 6.1 | 8.4 |
+  | log_endpoints | 2.7 | 5.7 | 8.4 | 13.6 |
+  | log_signature | 2.8 | 3.6 | 6.3 | 5.6 |
+  | log_coverage | 11.4 | 15.6 | 48.5 | 58.4 |
+  | graph_neighbourhood | 11.3 | 36.3 | 35.1 | 61.2 |
+
+  Every log tool is far under 200 ms and the graph neighbourhood under 500 ms at 180 days (before
+  H1: `log_compare` 232 ms, `log_coverage` 433 ms). Ratio 180 d / 10 d: OpenSearch 0.5–2.0x for every
+  tool (within 2x); sqlite 0.9–2.25x for the log tools (`log_top` 2.1x, `log_affected` 2.1x,
+  `log_trend` 2.25x, `log_endpoints` 2.1x over 2x) and 3.2x for the graph neighbourhood. The gold
+  generator's error ramp (svc-api logs `d` errors on day `d`) makes the last 10 days of the 180-day
+  run hold more rows than the 10-day run's window, so part of that ratio is data volume, not
+  history size; not separated in this run.
+- Full suite: 2289 passed, 94 skipped (not external); ruff clean.
+
+## Logs analytics profile, log intents and tools, MCP log tools, count semantics — 2026-11-04 (A2 L5a–L5d, M1, B2+B3; base `v2/logs` `106d4b0` merged with `fdb7c4a` and `42627b0`)
+
+Evidence level: **synthetic / contract** (fake source, sqlite backend, hash embedder, scripted
+planner; no model and no real service called). The gold set is the in-repo generator
+`testing/fixtures/logs/gold` (10 days x 4 tenants x 6 services, planted structure; expected answers
+computed from the generator's plan, never from the engine).
+
+- Gold questions (`tests/contract/test_logs_gold_questions.py`): 66 cases over the 10 intents plus
+  incidents, all equal to the plan: per-day top services by level (18), top error signatures per
+  service (16), row-count order != sum order, FATAL tenants, exception classes, new signatures per
+  day (9; first seen over all served history), affected tenants (per window and per day), signature
+  template and examples, per-day trends with the missing day listed `source_unavailable` (never
+  zero), hourly trend on the incident day, period comparisons (3), FATAL tenants on the
+  `level_field` basis and the token-only service rendered "lines containing 'error'", the planted
+  incident (the only one; 3 cells, exact), endpoint latency regression (max 904 ms), 5xx (20 lines),
+  per-row p95 (sum of p95 refused, `measure_unsupported`), coverage equal to a recount; the capped
+  unit is `approximate` with its sample method; endpoint ranking without a service is refused.
+- Surface parity (`tests/contract/test_logs_surface_parity.py`): 11 plain-language questions give the
+  same rows and rendering in `rules`, `llm` and `cascade` modes (planner never called) as
+  `Engine.call_tool`; an llm-selected intent (scripted reply) equals the tool call; the HTTP tool route
+  and in-process MCP are byte-identical to the tool call; an MCP stdio subprocess and streamable HTTP
+  mounted at `/mcp` on the HTTP app return the same structured output and list the same tools;
+  `Host: attacker.example` on `/mcp` is refused; all log tools carry `readOnlyHint: true`.
+- Scope guard: kind-less, negated and multi-kind scopes refused with `intent_required` on the
+  request aggregate, the Python, HTTP and MCP `aggregate` tool and an llm free scope; a single-kind
+  scope passes. Single-tenant refusal in config validation, `Engine`, `create_app`, `create_mcp`.
+- Graph (`test_logs_graph_and_communities.py`): every header-link edge's quote names both endpoints;
+  per-day weights from the day documents; `raises` gives exactly the planted exception classes;
+  exemplar facts are `fact`/`trigger_in_span` for a user entry and `co_occurrence`/`unchecked` for a
+  learned entry (B7); `co_fires_with` edges only when `co_firing` is admitted. Co-firing incidents
+  are byte-identical under `PYTHONHASHSEED` 0, 1 and 4242 and recover the planted incident only.
+- Delta reparse (`test_logs_delta_reparse.py`): 12 seeded random library changes (1–3 of 6
+  mutation kinds: steal, residue parse, retire, edit, annotate, noise edit): the delta reparse equals
+  the full reparse in matches, aggregates and cells, and re-matches fewer rows than the partition
+  holds; a format change is a full reparse (class A). A library change composed on day 10 of the gold
+  window keeps >= 95 % of the dated day documents by id and content (delta mode on every partition).
+  A format-1 partition in the window is reparsed (full) before compose; the derived snapshot round
+  trip carries the typed-value aggregates. The property test is seeded `random`, not `hypothesis`
+  (not installed).
+- Count semantics (`test_count_semantics_b2b3.py`, client path): worst-row exactness, applied basis
+  and extraction, `$measure` ranking by the sum (row count order differs), bucket-of-sum per day, hour
+  buckets. The Lucene native path flags `bucket.of` as unsupported (bounded) and reads the role
+  fields through a terms aggregation: **not run against OpenSearch/Elasticsearch in this slice**.
+- Grouped-sum answers (`test_grouped_sum_contract.py`): stated group sums, their total, the number of
+  groups and the population pass; a wrong number is replaced by the deterministic rendering
+  (`stripped`), or abstains when no rendering exists. Contract level with a real memory-adapter
+  result; no live model.
+- Read latency (`scripts/bench_log_tools.py`, sqlite client path, one process, 20 calls each,
+  external workspace): 10 days (4,582 documents): log tools p95 4–28 ms, graph neighbourhood 6 ms.
+  180 days (`keep_days: 180`, 90,771 documents, build 189 s): log tools p95 70–433 ms (8 of 10 within
+  200 ms; `log_compare` 232 ms and `log_coverage` 433 ms are not), graph neighbourhood 122 ms
+  (within 500 ms). The "within 2x of the 10-day baseline" acceptance is **not met**: the sqlite typed
+  scope is linear in the generation's records; the H1 shard filter that would bound it is not
+  implemented. Before the sqlite owner-index fix the 10-day `log_around` took 1.8 s.
+- Full suite: 2272 passed, 94 skipped (not external); ruff clean.
+
+## Raw tier hardening and the interim derived archive — 2026-11-04 (branch `v2-logs-raw-hardening`, base `fdb7c4a`; A2 §11.0, §11.R4)
+
+Evidence level: **synthetic** (contract tests on a local sqlite backend). No real service, no paid call.
+
+- Raw tier: a group- or world-writable parent is refused; a raw path under the installed package
+  is refused; `retention verify` fails on a raw file with mode 0640 or 0400 and on a raw day older
+  than `raw_days`; an AST import-graph test asserts that only `ingestion/raw_reparse.py` imports the
+  raw store, that `schedule.py` and `learning/` never do, and that raw content is read only there
+  and by `privacy scan --raw`; a redaction change re-derives exactly the days still in the raw tier
+  (4-day test: days 2–3 re-derived, day 1 listed `stale_redaction`).
+- Derived archive: snapshot round trip with fallback-overlay rows (identity change → rewrite,
+  unchanged → no rewrite), format-1 snapshots read and marked, the `serve_days` bound (7 days,
+  keep 3: 3 served, 7 archived), `max_serve_rows`, window rollups equal to the masked window's day
+  rows and smaller than all served days, and the multi-identity flag after a library change.
+- Compose cost over **60 synthetic days** (`derived: forever`, default `serve_days` 10, 1 tenant x
+  2 services x 4 lines a day): compose 0.105 s average for days 11–20 and 0.14 s for days 51–60;
+  73 documents served on day 60; every unchanged day taken from the day-document cache; 0.13 GiB
+  peak RSS for the whole test process. Small synthetic days: this shows the bound (no growth with
+  history), not production throughput.
+- Host guard: API-only process with `allowed_hosts` behind a LAN forwarder: the forwarder's Host
+  passes, another Host gets 421, a cross-origin write 403; a loopback API without a list stays
+  unguarded.
+
+## Deployment-run package fixes, B11 safe redaction, retention scopes — 2026-11-04 (branch `v2/logs`, base `106d4b0`)
+
+Evidence level: **synthetic and mocked**, plus three real-service checks on throwaway local
+containers. No paid call, no private data: every bug from the private run reports was reproduced
+with synthetic names and lines.
+
+- Unit and contract tests (synthetic): probe PIT opt-in and `disallow`, one privilege request,
+  request log, index-name prefix / `before_service` / `after_env` / `unparsed: exclude`,
+  continuation rules and library continuation entries, multiline-aware `patterns coverage|mine`,
+  noise precedence, full lint report, record-key filters, grammar false positives (both reproduced
+  first), aggregate `measure`, manifest counts, retention semantics, safe redactors (each named
+  redactor including the payload classes, custom redactors, ReDoS refusal, idempotence, timeout fails
+  closed), leak scan, B11 through `run-daily` (CLI against a localhost fake cluster), egress
+  admission of stamped records, serving pins (a stream holds its generation while a concurrent
+  retention run reports it pinned), `serve` binding, readiness and logged 503 causes, retention
+  scopes over 13 synthetic days (raw 3, partitions 10, derived forever: day-1 rollups still
+  queryable; derived days count variant), the raw tier (modes, purposes, reparse `--from-raw`, no
+  reader module references it, scan skips raw unless `--raw`).
+- Louvain determinism: the base code gave 20, 18, 19, 20 communities on one synthetic graph under four
+  `PYTHONHASHSEED` values; after the fix the output of both strategies is byte-identical across
+  four seeds (subprocess test).
+- RE2: the redaction, B11 pipeline and package-run test files pass with google-re2 1.1.20251105 from
+  the isolated copy in the external workspace (100 passed, 1 skipped: the missing-engine test).
+- PostgreSQL (`pgvector:0.8.0-pg17`, throwaway container): `tests/conformance/test_postgres_conformance.py`
+  25 passed, including `test_records_use_native_types` (the failure was a test-ordering bug: the kit's
+  text-count check rewrote the records before the type query).
+- OpenSearch 3.9.0 (throwaway container): the new end-to-end test (dataset `my_data`, prefix with
+  `_`: build, activate with pointer read-back, query) fails at base `106d4b0` with the
+  "foreign index" BackendError and passes after the fix; `tests/services/test_opensearch_adapter.py`
+  passes (7 passed together).
+- N10 compose scale (`scripts/compose_scale.py`, sqlite, external workspace, 10 days x 100 units x
+  1000 signatures = 10^6 aggregate rows, 1,113,100 documents): **1096.5 s compose, 3.94 GiB peak RSS**
+  (budget: 20 min, 8 GB; met). Before the change: 1118.8 s, 10.28 GiB (previous entry). At 10^5 rows:
+  1.07 GiB at base, 0.92 GiB with copy-on-write redaction only.
+- Not measured: redaction throughput on a real log volume, the `after_env` grammar on a real index
+  inventory, derived-forever growth over months, multi-shard or security-enabled clusters.
+
 
 
 ## Day partitions, compose, retention and pins — 2026-11-04 (addendum A1 slices L3a + L3b)
@@ -2027,3 +2192,188 @@ non-synthetic corpus or on a multi-node or security-enabled cluster.
   - `percentiles` (not in the measure contract);
   - DST-gap zones for calendar buckets (the engine and Python may label a bucket whose local
     midnight does not exist differently; not tested).
+
+## Web UI MVP (read-only) — 2026-11-04 (addendum A2 §4.4, branch `v2/logs` base `106d4b0`)
+
+Evidence level: **synthetic + mocked model**. No real service, no real model, no customer data.
+
+- **Python (mount and guards)**: `tests/contract/test_ui_mount.py`, 21 tests. A synthetic bundle (and
+  the real built bundle when present) is served at `/ui` with the strict CSP and security headers;
+  assets are public, while every `/v2/*` route the UI calls answers 401 without the bearer token;
+  path traversal outside the bundle is a 404; `Host: attacker.example` gets 421 and a foreign
+  `Origin` on a write or on the answer stream gets 403; `nosniff` is on `/v2/*` responses (errors
+  included); `ui.enabled` without auth, without the wheel or with an empty bundle refuses to start;
+  `serve` resolves host and port from `serving.http.bind`; the core distribution excludes `ui/`.
+- **Frontend (vitest, jsdom)**: 40 tests. The XSS corpus (`<script>`, `<img onerror>`, `<svg
+  onload>`, iframes, `javascript:`/`data:`/`vbscript:` URLs with case and whitespace tricks,
+  markdown-image and link tricks, `<style>`, ANSI escapes, RTL overrides, a 20 000-character token)
+  rendered through hit cards, every evidence tab, aggregate cards and the trace panel: no script,
+  iframe, image or style element, no `on*` attribute, no non-http(s) `href`, `window.__xss` never set.
+  A source guard rejects raw-HTML APIs and `localStorage`/cookie use. Also the SSE parser (chunk
+  boundaries, CRLF split across chunks, heartbeats), typed error mapping, contract-shape rejection, a
+  missing terminal event, token storage policy, feature detection, chart series (no coercion of
+  non-numeric values), graph construction (no edge between co-mentioned entities; server edges to
+  unknown nodes dropped) and trace spend (unpriced calls counted, not summed).
+- **Browser smoke (manual harness, Playwright chromium, not in CI)**: `ui/e2e/serve_synthetic.py`
+  built 2 synthetic log days with `LogsPipeline.run_daily` (fake cluster), served them with the
+  loopback `FakeChatServer` as the streaming generator under bearer auth, and `ui/e2e/smoke.mjs`
+  entered the token, streamed an answer (contract `passed`, citation jump), opened the evidence, graph
+  and trace tabs, charted `group_count` by service (structured arm, exactness `exact`) and explored the
+  entity `redis` in the graph explorer: **0 CSP violations, 0 page errors**, 6 screenshots (kept in the
+  external workspace). The first run found cytoscape injecting an inline `<style>`; it is now
+  pre-empted (rule in the bundle CSS), with no CSP relaxation.
+- **Not established**: Playwright in CI, accessibility audit (axe), behaviour on a real deployment or
+  a real model, the A2 inspect routes (`/v2/info`, graph neighbourhood, communities, patterns, spend,
+  runs), log-intent views, `aggregates[].rendering` sentences (shown when present; the L5 slice adds
+  them), and the large-graph layout.
+
+## Accounted coverage and LLM fallback extraction — 2026-11-04 (addendum A2 rev 2–4, slices C1–C4; branch base `fdb7c4a`)
+
+**Evidence level: synthetic data and mocked providers only** (`httpx.MockTransport` on the
+OpenAI-compatible and OpenAI wire formats). No real model was called, no paid key was used, and no
+real log was read. No coverage number below is a deployment result.
+
+- **Accounting** (`tests/contract/test_fallback_daily.py`, 7 tests, real puller over the fake log
+  cluster): with `multiline.max_lines: 2` the pulled documents include joined, overflow and fragment
+  documents, and identities Q, D and H hold for every unit. A source wrapper that hands over one
+  document fewer than the puller counted refuses the seal (`AccountingImbalance`, identity Q); the
+  version stays open and `logs coverage` reports `ok: false`. A missing head fails identity H. The
+  exact, `hourly_quota`, partition-capped and `random_score` pulls all balance (probe in the
+  external workspace).
+- **Fallback** (`tests/unit/test_fallback_extraction.py`, 27 tests; `test_fallback_realrun_fixes.py`,
+  10 tests), on an 18-head synthetic day:
+  - labelled clusters become `provisional` with `line[start:end] == value` for every value;
+  - invalid labels (unknown group, wrong type) and a regex citing an unsupplied line are rejected by
+    the gate;
+  - the field-gap `fix` passes `fix_target` and keeps pattern values; the declined-fix line tier
+    asks only for the gap;
+  - hallucinated quotes, quotes containing a pseudonym and unknown reply ids are dropped;
+  - an out-of-range value is `range_invalid`;
+  - day 2 with new line ids makes **0 cluster calls** through the cache and is re-gated;
+  - a pending proposal is reused without a call, while a changed template gets one;
+  - the call cap gives `budget_deferred` and the retry resolves it;
+  - no route gives `capacity_deferred` and the retry resolves it;
+  - a down local route is skipped;
+  - the paid route is unused by default and stops at the provider total cap;
+  - a paid route without finite daily caps is refused at load;
+  - an e-mail or tracking-id line is `egress_refused` on its own, and the run is refused above the
+    share;
+  - the stop file pauses between calls;
+  - the report is persisted per cluster and stage;
+  - two runs with the fixed mock give byte-identical overlay content;
+  - the overlay keeps H, and `rows()` returns the same accounting.
+- **Daily path**: `run_daily` runs `fallback` after the seal and writes an overlay. A failed
+  fallback leaves heads `fallback_pending` and compose still builds. `apply_decisions` (RE2, auto
+  promotion) reparses once into v2 and rebuilds the overlay with **0** calls.
+- **Throughput**: per-route `calls_per_min`/`tokens_per_s` is measured around each call and reported
+  per run. In the harness it measures the mock transport only and says nothing about a model; the
+  real measurement belongs to the deployment.
+- **Totals**: 44 new tests. The full suite (`-m 'not external'`) gives 2253 passed and 1 skipped
+  (a base test that skips when google-re2 is installed), with `ruff check src tests` clean, on the
+  merged base `fdb7c4a`.
+- **Not established**: any real-model behaviour (label quality, regex quality, reply validity rate,
+  cost per day); compose reading overlays (the L5 arm mapping); `ScopeResult.applied_extraction`;
+  `learning.bootstrap` with measured throughput and `learn measure-throughput`; LAN tier and
+  `egress.allow_lan`; time windows and invalid-reply limits per route; the `serving.answers` spend
+  scope; a counted `rest` for identity S; the 11-day gold set (E1).
+
+## Web UI follow-up: inspect routes, pattern review, ops and log views — 2026-11-04 (A2 S1a/S1b, U2, U3)
+
+Evidence level: **synthetic + contract fakes**. No real deployment, model or customer data.
+
+- `tests/contract/test_inspect_routes.py` (9): on a 2-day synthetic logs generation, `/v2/info`
+  reports window, date basis, timezone, served days and one library identity; run reports are
+  content-free and newest first; spend is `available: false` without a ledger and exact (micro-USD)
+  with one; the patterns view equals the generation snapshot even after the working `library.yaml`
+  is overwritten; the review queue lists synthetic noise proposals with examples, matched lines,
+  gate checks and effective status, and leaves every library file byte-identical; the graph
+  neighbourhood on this generation names the seed and draws no edge (the fixture has no relations),
+  and against a contract fake store it returns only stored edges with bounded, deduplicated spans;
+  missing communities are reported, not zero; `inspect` scope and the single-tenant 403 hold.
+- `tests/contract/test_ui_forwarder.py` (2): a forwarder name passes the Host list on any port and
+  its Origin is accepted when Host is rewritten; look-alike hosts, other ports on loopback, `null`
+  and non-http origins are 403; unknown Hosts 421.
+- vitest 54: review view (XSS strings inert in examples, gate details and reasons; copied command
+  equals the shlex-quoted builder), served/archived days and multi-library note, schema-driven tool
+  forms (no coercion), tool output → aggregate card with the server's `rendering`.
+- Playwright smoke: review queue, runs & spend and communities pages added; 0 CSP violations.
+- **Not established**: the real L5 log tools (not on this branch; the Logs view is hidden without
+  them), real proposals at the owner's scale (63 noise proposals: rendering cost not measured), the
+  rev 3 fallback-state/tier/burn panels (data not present), axe accessibility.
+
+## Fallback rev 4: route tiers, bootstrap, throughput, answers scope, E1b gold set — 2026-11-04 (merged on `dacd166`)
+
+**Evidence level: synthetic data and mocked providers only.** The gold set uses an oracle model built
+from the generator's truth. It measures the machinery (clustering, gate, grounding, caps, backlog,
+egress), not a model. Throughput figures time the mock transport.
+
+- **E1b gold set** (`tests/contract/test_fallback_gold.py`, 4 synthetic days, 6 planted templates,
+  3 singletons, 4 field gaps, 3 injection lines and 2 PII/tracking lines per day):
+
+  | Run | Slot precision | Slot recall | Values span-grounded | PII/tracking refused | Injection patterns | Backlog (deferred clusters, heads) per day |
+  |---|---|---|---|---|---|---|
+  | no cap | 1.0 | 1.0 (268/268) | 300/300 | 8/8 | 0 | 0,0 all days |
+  | cluster cap 4 | 1.0 | 1.0 (268/268) | 300/300 | 8/8 | 0 | (3, 13) on day 1, then 0 |
+  | model obeys the injection (`^.*$`) | 1.0 | 1.0 | 300/300 | 8/8 | 0 (gate refuses) | 0 |
+
+  The gold set found a ranking defect. The cluster cap counted clusters that cost nothing (pending
+  proposals, cached replies), so the same top clusters filled the cap every day and the deferred
+  ones never got a slot (backlog grew 13 → 64 heads over 4 days). The cap now counts only clusters
+  that need a call.
+- **Routes** (`tests/unit/test_fallback_routes_bootstrap.py`, 13 tests):
+  - `lan` needs `allow_lan`, both at config load and at run time before any call;
+  - a `lan` route takes work after a down local route, at USD 0;
+  - `local` must be loopback;
+  - a route outside its UTC window is skipped;
+  - a route is marked down after its invalid-reply limit.
+- **Bootstrap**:
+  - off by default;
+  - an unmeasured start is refused;
+  - reaching a paid route without a finite `learning.bootstrap.max_usd_per_day` is refused at load;
+  - `measure-throughput` (2 calls on the mock) records `throughput.json`, writes nothing to the
+    library, and its replies make the next run's clusters free;
+  - the measured cap binds clusters that need a call;
+  - paid routes are skipped during bootstrap.
+- **`serving.answers`** (`tests/unit/test_answers_spend.py`, 2 tests): two answer calls commit on the
+  `serving.answers` day ledger and the provider total. The third is refused by the persistent day
+  cap before its request, and the request budget is released. Config load refuses a paid answer role
+  whose provider has a lifetime cap without a finite answers cap.
+- **`patterns learn` run control** (`tests/unit/test_pattern_learning_run_control.py`, 3 tests):
+  - the stop file pauses between calls (not a failure);
+  - `--output` progress is written per cluster;
+  - pending templates are not re-asked.
+  The existing day-cap test now sees run 2 skip the two pending templates, and the persisted day cap
+  is still asserted in run 3.
+- **Merges**:
+  - `42627b0`: snapshot round trip through `OverlayStore.rows()`; the snapshot holds row aggregates,
+    never field values.
+  - `dacd166`: match rows keep L5's `pattern_owner`/`pattern_reviewed`/`gaps`, and the accounting
+    keys are `account_owner`/`required_gaps`.
+- **Overlay selection**: a second full run under the `regex` engine found that `OverlayStore.rows()`
+  without an identity broke ties on `created_at` by identity text, so a rebuilt overlay could lose to
+  the stale one under one clock value. It now breaks ties on the manifest's write time, with a test.
+  The gold scorer reads the current identity.
+- **Suite on the merged head**: `regex` engine (no google-re2 on the path): 2338 passed, 95 skipped,
+  0 failed. With the isolated google-re2 path: 2457 passed, 1 skipped and 1 failed. The failure is `test_mcp_stdio_subprocess_and_mounted_streamable_http_agree`, whose
+  subprocess environment drops that path. The same file passes 24/24 when parent and child use the
+  same engine. `ruff check src tests` is clean.
+- **Not established**: real-model label and regex quality, reply validity, cost per day and real
+  throughput per tier (the deployment measures these with `measure-throughput`); compose reading
+  overlays into rollups (`applied_extraction` from overlays); a counted `rest` for identity S.
+
+## Logs branch integration: history tier merge and a fresh `[dev]`-only test run — 2026-11-04 (branch `v2/logs`)
+
+Evidence level: **synthetic / contract** (test-suite runs only; no service, no paid call).
+
+- Merge of `v2-logs-h1` (H1/H2 and latency, built from `dacd166`) into `v2/logs` at `312e314`: no
+  textual conflicts; the fallback slice's `account_owner`/`required_gaps` row keys and L5's
+  `pattern_owner`/`pattern_reviewed`/`gaps` both stay. Regenerated `docs/config.schema.json`: no change.
+  Full development venv (networkx, regex, fastapi, uvicorn, mcp; no google-re2), `-m "not external"`:
+  **2355 passed, 95 skipped, 0 failed**, identical skip set with and without the test fixes below.
+- Fresh venv with `pip install "<git archive of HEAD>[dev]"` (core + dev only), bare `pytest -q` from
+  the archive directory: before the fixes 59 failed and 89 errors (at `312e314`, as reported); after
+  them **1791 passed, 651 skipped, 0 failed, 0 errors**. The skips are tests that need an optional
+  extra (communities, a pattern engine, api, mcp, backend clients); the ConfigError for a logs
+  profile without networkx and the typed `PatternEngineUnavailable` are unchanged.
+- Limitation: the fresh run covers what the core package does without extras; everything behind an
+  extra is covered only by the full-venv run (and google-re2 paths by neither).

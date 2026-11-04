@@ -41,12 +41,18 @@ def parse_documents(records: list[dict], config: Any) -> list[Document]:
     return [Document.model_validate(r) for r in records]
 
 
-def redact_document(document: Any, config: Any) -> tuple[Any, dict[str, int]]:
-    """Works for v1 and v2 documents (both carry title/fields/metadata)."""
-    document = document.model_copy(deep=True)
+def redact_document(document: Any, config: Any, safe: Any = None) -> tuple[Any, dict[str, int]]:
+    """Works for v1 and v2 documents (both carry title/fields/metadata). ``safe`` is the
+    ``SafeRedactor`` of ``privacy.engine: safe``; it replaces the legacy ``re`` path. A document
+    without any replacement is returned as is (no copy)."""
+    if safe is not None:
+        return _redact_safe(document, config, safe)
     patterns = dict(config.patterns)
     if config.redact_emails:
         patterns["EMAIL"] = r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+    if not patterns:
+        return document, {}  # nothing to redact: no copy (compose of 10^6 rollup documents, N10)
+    document = document.model_copy(deep=True)
     counts = {}
 
     def redact(text):
@@ -61,3 +67,23 @@ def redact_document(document: Any, config: Any) -> tuple[Any, dict[str, int]]:
         if isinstance(document.metadata.get(field), str):
             document.metadata[field] = redact(document.metadata[field])
     return document, counts
+
+
+def _redact_safe(document: Any, config: Any, safe: Any) -> tuple[Any, dict[str, int]]:
+    counts: dict[str, int] = {}
+
+    def redact(text: str) -> str:
+        out, made = safe.redact(text)
+        for label, count in made.items():
+            counts[label] = counts.get(label, 0) + count
+        return out
+
+    title = redact(document.title)
+    fields = {key: redact(value) for key, value in document.fields.items()}
+    metadata = dict(document.metadata)
+    for name in config.metadata_fields:
+        if isinstance(metadata.get(name), str):
+            metadata[name] = redact(metadata[name])
+    if not counts:
+        return document, counts
+    return document.model_copy(update={"title": title, "fields": fields, "metadata": metadata}), counts

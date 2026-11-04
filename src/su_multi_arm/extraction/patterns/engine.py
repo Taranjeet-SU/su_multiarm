@@ -511,6 +511,10 @@ class PatternEngine:
     def build_set(self, patterns: list[str]) -> Any:
         return None
 
+    def finditer(self, compiled: Any, text: str) -> list[Hit]:  # pragma: no cover - interface
+        """Every non-overlapping match, left to right (redaction)."""
+        raise NotImplementedError
+
     def prefilter(self, prefilter: Any, text: str, count: int) -> set[int]:
         """Indexes of the patterns that may match ``text``; every index without a ``Set``."""
         return set(range(count))
@@ -549,6 +553,18 @@ class Re2Engine(PatternEngine):
             groups[name] = None if start < 0 else (start, end)
         start, end = match.span(0)
         return Hit(start, end, groups)
+
+    def finditer(self, compiled: Any, text: str) -> list[Hit]:
+        regex, index = compiled
+        hits = []
+        for match in regex.finditer(text):
+            groups = {}
+            for name, number in index.items():
+                start, end = match.span(number)
+                groups[name] = None if start < 0 else (start, end)
+            start, end = match.span(0)
+            hits.append(Hit(start, end, groups))
+        return hits
 
     def build_set(self, patterns: list[str]) -> Any:
         if not patterns:
@@ -595,6 +611,20 @@ class RegexEngine(PatternEngine):
             start, end = match.span(name)
             groups[name] = None if start < 0 else (start, end)
         return Hit(match.start(), match.end(), groups)
+
+    def finditer(self, compiled: Any, text: str) -> list[Hit]:
+        try:
+            matches = list(compiled.finditer(text, timeout=self.timeout))
+        except TimeoutError:
+            raise PatternTimeout(f"regex search exceeded {self.timeout * 1000:.0f} ms") from None
+        hits = []
+        for match in matches:
+            groups = {}
+            for name in compiled.groupindex:
+                start, end = match.span(name)
+                groups[name] = None if start < 0 else (start, end)
+            hits.append(Hit(match.start(), match.end(), groups))
+        return hits
 
 
 def select_engine(kind: EngineKind, *, timeout_ms: int = 100) -> PatternEngine:

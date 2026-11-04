@@ -6,9 +6,16 @@ cut on a character boundary, flagged ``truncated``) and matched on its own:
 
 1. ``format``: the first approved format pattern (priority, then id) whose selectors apply. Its
    ``then.field_from_group`` group is the *body*; without a format match the body is the whole line.
-2. ``message``: the first message pattern matching the body sets the signature.
-3. ``annotate``: every matching annotate pattern adds entities.
-4. ``noise``: when no message matched, the first matching noise pattern marks the line benign.
+2. ``noise`` with ``precedence: before_message``: the first matching one marks the line benign and
+   ends matching (no message, no annotations). This is how a health-check or heartbeat line wins
+   over a broad message pattern that would otherwise give it a signature.
+3. ``message``: the first message pattern matching the body sets the signature.
+4. ``annotate``: every matching annotate pattern adds entities.
+5. ``noise`` (default precedence ``after_message``): when no message matched, the first matching
+   noise pattern marks the line benign.
+
+Within a stage the order is priority (high first), then id. Across stages the order above is fixed;
+priority never compares entries of different kinds.
 
 Status: ``parsed`` (message), ``noise``, ``format_only`` (format but no message), ``unparsed`` or
 ``timeout`` (``regex`` engine only; the line's result is non-deterministic). ``fragment`` is assigned
@@ -48,8 +55,9 @@ from .library import ATTRIBUTE_ENDPOINTS, Library, LoadedEntry, load_library
 
 LineStatus = Literal["parsed", "format_only", "unparsed", "noise", "fragment", "timeout"]
 HEADER_FIELD = "header"
-STAGES = ("format", "message", "annotate", "noise")
+STAGES = ("format", "noise_first", "message", "annotate", "noise")
 _VALUE_EDGE = r"[A-Za-z0-9_.\-]"
+LOG_LINKS_VERSION = 1
 
 
 def truncate_line(line: str, max_bytes: int) -> tuple[str, bool]:
@@ -125,10 +133,17 @@ class CompiledLibrary:
         self.library, self.engine, self.max_line_bytes = library, engine, max_line_bytes
         self.stages: dict[str, list[tuple[LoadedEntry, Any]]] = {}
         self.sets: dict[str, Any] = {}
-        for kind in STAGES:
-            rows = [(e, engine.compile(e.regex)) for e in library.approved(kind)]
-            self.stages[kind] = rows
-            self.sets[kind] = engine.build_set([e.regex for e, _ in rows])
+        for stage in STAGES:
+            kind = "noise" if stage == "noise_first" else stage
+            entries = library.approved(kind)
+            if kind == "noise":
+                first = stage == "noise_first"
+                entries = [e for e in entries if (e.entry.precedence == "before_message") == first]
+            rows = [(e, engine.compile(e.regex)) for e in entries]
+            self.stages[stage] = rows
+            self.sets[stage] = engine.build_set([e.regex for e, _ in rows])
+        # approved ``continuation`` entries: multiline joining (``sources.multiline.assemble``)
+        self.continuations = [(e, engine.compile(e.regex)) for e in library.approved("continuation")]
         self.identity = library.identity()
 
     def provenance(self) -> dict[str, Any]:
@@ -143,6 +158,19 @@ class CompiledLibrary:
         return self.library.snapshot(self.provenance())
 
     # matching ------------------------------------------------------------------------------
+    def is_continuation(self, text: str) -> bool:
+        """Whether an approved ``continuation`` entry matches ``text`` (a line that continues the
+        open multiline head). ``applies_to`` selectors on continuation entries are refused by the
+        lint, so the test needs no attributes. A ``regex``-engine timeout is not a continuation."""
+        line, _ = truncate_line(text, self.max_line_bytes)
+        for _, compiled in self.continuations:
+            try:
+                if self.engine.search(compiled, line) is not None:
+                    return True
+            except PatternTimeout:
+                return False
+        return False
+
     @staticmethod
     def _applies(entry: LoadedEntry, field_name: str, attributes: dict[str, str]) -> bool:
         for key in entry.entry.applies_to:
@@ -187,12 +215,16 @@ class CompiledLibrary:
                 body = result.format.groups.get(result.format.entry.entry.then.field_from_group)  # type: ignore[union-attr]
                 body_start, body_end = body if body is not None else (0, 0)
             body_text = text[body_start:body_end]
-            messages = self._stage("message", body_text, body_start, field_name, attrs, True)
-            result.message = messages[0] if messages else None
-            result.annotations = self._stage("annotate", body_text, body_start, field_name, attrs, False)
-            if result.message is None:
-                noise = self._stage("noise", body_text, body_start, field_name, attrs, True)
-                result.noise = noise[0] if noise else None
+            first = self._stage("noise_first", body_text, body_start, field_name, attrs, True)
+            if first:
+                result.noise = first[0]
+            else:
+                messages = self._stage("message", body_text, body_start, field_name, attrs, True)
+                result.message = messages[0] if messages else None
+                result.annotations = self._stage("annotate", body_text, body_start, field_name, attrs, False)
+                if result.message is None:
+                    noise = self._stage("noise", body_text, body_start, field_name, attrs, True)
+                    result.noise = noise[0] if noise else None
         except PatternTimeout:
             result.status = "timeout"
             return result
@@ -241,7 +273,10 @@ class PatternExtractor:
         return self._compiled if self._compiled is not None else self.load()
 
     def reuse_salt(self) -> str:
-        return self.compiled().reuse_salt()
+        salt = self.compiled().reuse_salt()
+        if getattr(self.ref, "log_links", False):  # header outputs differ: never reuse across the switch
+            salt = hashlib.sha256(f"{salt}|log_links:{LOG_LINKS_VERSION}".encode()).hexdigest()
+        return salt
 
     def provenance(self) -> dict[str, Any]:
         return self.compiled().provenance()
@@ -252,6 +287,13 @@ class PatternExtractor:
         attributes = document_attributes(document)
         if chunk.field == HEADER_FIELD:
             entities, relations = self._attribute_links(compiled, chunk, document)
+            if getattr(self.ref, "log_links", False):
+                from .log_links import header_links
+
+                extra_entities, extra_relations = header_links(self, chunk, document)
+                known = {e.id for e in entities}
+                entities = [*entities, *(e for e in extra_entities if e.id not in known)]
+                relations = [*relations, *extra_relations]
             return PatternChunkResult(entities, relations, chunk.text, not chunk.text.strip(), {"pattern": {"header": True, "links": len(relations)}}, [])
         mentions: dict[str, Entity] = {}
         relations: list[Relation] = []
@@ -304,6 +346,8 @@ class PatternExtractor:
         return Provenance(extractor=f"pattern:{entry.entry.id}", recipe_sha=recipe)
 
     def _line_outputs(self, line: LineResult, chunk: Chunk, offset: int, mentions: dict[str, Entity], relations: list[Relation]) -> None:
+        library = self.compiled().library
+        reviewed = getattr(library, "reviewed", lambda _entry: True)
         bound: dict[str, dict[str, Entity]] = {}
         for hit in line.hits():
             own: dict[str, Entity] = {}
@@ -332,7 +376,11 @@ class PatternExtractor:
                 low, high = min(p[0] for p in points), max(p[1] for p in points)
                 span = self._span(chunk, low - chunk.start, high - chunk.start)
                 rel = lambda e: (e.span.start - low, e.span.end - low)  # noqa: E731
-                if trigger is not None:
+                if not reviewed(hit.entry):
+                    # review B7: an auto-learned, provisional or otherwise unreviewed entry's relation
+                    # is co-occurrence until a human approves the entry
+                    support = "unchecked"
+                elif trigger is not None:
                     negated = self.support.negated(span.text, 0, len(span.text))
                     support = "unchecked" if negated else "trigger_in_span"
                 else:

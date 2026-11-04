@@ -44,6 +44,7 @@ from ..core.types import (
     UnsupportedConstraint,
     UnsupportedReason,
 )
+from ..backends._scope import RECORD_KEYS
 from ..models import StrictModel
 
 Granularity = Literal["day", "month", "year"]
@@ -239,6 +240,15 @@ class ValueResolver:
     def resolve(self, predicate: Predicate, *, from_request: bool = False) -> Resolution:
         origin: Literal["request", "agent"] = "request" if from_request else "agent"
         spec = self.schema.field(predicate.field)
+        if spec is None and predicate.field in RECORD_KEYS and predicate.op in {"eq", "in"}:
+            values = predicate.value if predicate.op == "in" and isinstance(predicate.value, list) else [predicate.value]
+            if all(isinstance(v, str) for v in values):
+                # record identity, always filterable without a schema entry (string equality)
+                return Resolution(predicate=predicate, origin=origin)
+            return Resolution(
+                unsupported=UnsupportedConstraint(constraint_text=_constraint(predicate), reason="type_mismatch", suggestion=f"{predicate.field!r} is a record key; compare it with strings"),
+                origin=origin,
+            )
         if spec is None or not spec.filterable:
             return Resolution(
                 unsupported=UnsupportedConstraint(
@@ -489,6 +499,9 @@ def check_request_filters(resolver: ValueResolver, filters: dict[str, JsonScalar
       ``field_not_filterable``). Datetime/date values are parsed but pushed down as given, so the
       backend's stored-value comparison is unchanged. A string/id value on a listable field under
       its catalog cap that no record holds is applied but reported as ``value_not_observed``.
+    * the record keys ``id``, ``source``, ``dataset`` and ``kind`` (``RECORD_KEYS``), when the
+      schema does not declare them: string equality, always available (a non-string value is
+      ``type_mismatch``).
     * undeclared field under ``unknown_fields: reject``: ``field_not_filterable``.
     * undeclared field under ``unknown_fields: allow``: applied as untyped string equality,
       labelled in ``untyped`` and reported (``field_not_filterable``) because its aggregate cannot be
@@ -497,6 +510,16 @@ def check_request_filters(resolver: ValueResolver, filters: dict[str, JsonScalar
     check = FilterCheck()
     for field, value in filters.items():
         spec = schema.field(field)
+        if spec is None and field in RECORD_KEYS:
+            # Record identity (``id``/``source``/``dataset``/``kind``) is filterable on every
+            # document without a schema entry: string equality, applied as given.
+            if not isinstance(value, str):
+                check.applied[field] = value
+                check.invalid[field] = "type_mismatch"
+                check.unsupported.append(UnsupportedConstraint(constraint_text=f"{field} eq {value!r}", reason="type_mismatch", suggestion=f"{field!r} is a record key; filter it with a string"))
+                continue
+            check.applied[field] = value
+            continue
         if spec is None:
             check.applied[field] = value
             check.invalid[field] = "field_not_filterable"

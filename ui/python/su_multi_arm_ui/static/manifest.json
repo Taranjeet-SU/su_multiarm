@@ -1,0 +1,11 @@
+{
+  "name": "su-multi-arm-ui",
+  "version": "2.0.0a3",
+  "content_sha256": "900f753a17831045755a02f01fd035d29914db58976ffb885450c0509a3291fc",
+  "files": {
+    "assets/GraphView-BMgs34q7.js": "63a2071f065a517a8f05bbaf62ea07ccf416477508f223c8aae859c3d976edb5",
+    "assets/index-D4UxXUyN.css": "c19d8cfb5460e129404ecc4c1dbd023c2d54a3df3938443639c13d10e34edeab",
+    "assets/index-d7prvB5y.js": "0607ecf0c3c41e00e8d699a67ad9eda07b752e3f0d315fce4bb666c078076f43",
+    "index.html": "a863fb162eed6d20246ed49892bd2f5decb95bf3666c6e4686bbf2ae777a2386"
+  }
+}
