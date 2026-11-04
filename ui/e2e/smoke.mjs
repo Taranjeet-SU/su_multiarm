@@ -27,7 +27,7 @@ await page.getByRole("button", { name: "Use token" }).first().click();
 await page.getByTestId("dataset").filter({ hasText: "generation" }).waitFor();
 await page.locator("#question").fill("db-client failed to connect redis");
 await page.getByRole("button", { name: "Ask", exact: true }).click();
-await page.getByTestId("contract-badge").waitFor({ timeout: 30000 });
+await page.getByTestId("answer-card").waitFor({ timeout: 30000 });
 await page.screenshot({ path: `${out}/01-ask-answer.png`, fullPage: true });
 await page.locator(".chip.cite").first().click();
 await page.screenshot({ path: `${out}/02-citation-evidence.png`, fullPage: true });

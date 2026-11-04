@@ -1,7 +1,7 @@
 import type { Aggregate } from "../api/schema";
 import { seriesOf } from "../lib/charts";
 import { clip, displayText, formatNumber } from "../lib/text";
-import { Chart } from "./Chart";
+import { RankedBars, TrendLine } from "./Charts";
 import { ExactnessBadge, JsonBlock, KeyValues, Text } from "./common";
 
 /** One structured aggregate: exactness badge, basis, denominator, truncated-ids flag, value/table, chart. */
@@ -76,7 +76,9 @@ export function AggregateCard({ aggregate, timeFields, flash = false }: { aggreg
           value: <strong>{aggregate.value === null || aggregate.value === undefined ? "none" : formatNumber(aggregate.value)}</strong>
         </p>
       ) : null}
-      {series ? <Chart series={series} title={title} /> : null}
+      {series && series.kind === "line" ? <TrendLine title={title} points={series.points} unit={series.measure === "count" ? "records" : ""} /> : null}
+      {series && series.kind === "bar" ? <RankedBars title={title} bars={series.points.map((p) => ({ ...p, approximate: aggregate.exactness === "approximate" }))} unit={series.measure === "count" ? "records" : ""} /> : null}
+      {series && series.skipped.length ? <p className="muted small">Not plotted (non-numeric value): {clip(series.skipped.join(", "), 400)}</p> : null}
       <details>
         <summary>raw aggregate record</summary>
         <JsonBlock value={aggregate} />

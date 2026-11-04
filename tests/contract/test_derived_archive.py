@@ -84,7 +84,11 @@ def test_snapshot_round_trip_with_overlay_rows_and_identity(tmp_path):
     assert entry["identity"] != snapshot["identity"] == snapshot_identity(manifest)
     assert rewritten["overlay_identity"] == identity
     assert rewritten["overlay"]["rows"] == {"heads": 1, "by_status": {"model_line": 1}, "by_signature_source": {}, "by_field_source": {"endpoint|model_line": 1}}
-    assert "/secret-path" not in json.dumps(rewritten)  # a snapshot holds no field values (no line-level rows)
+    # a snapshot holds no line-level rows: no head ids, reply shas or per-line values; a model-extracted
+    # value appears only as an aggregate dimension, like a deterministic endpoint template (A2 L5/B7)
+    text = json.dumps(rewritten)
+    assert '"head_id"' not in text and '"reply_sha"' not in text and '"h1"' not in text
+    assert [(r["endpoint"], r["lines"]) for r in rewritten["overlay"]["aggregates"]["endpoints"]] == [("/secret-path", 1)]
     assert write_derived(pipe.store, manifest)["identity"] == entry["identity"]  # unchanged: not rewritten
 
 

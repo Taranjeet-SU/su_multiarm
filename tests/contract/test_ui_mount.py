@@ -73,7 +73,9 @@ def test_ui_settings_name_the_auth_kind_and_nothing_secret(monkeypatch, bundle):
     client = TestClient(bearer_app(monkeypatch, bundle, session_storage_token=True), base_url=LOCAL)
     settings = client.get("/ui/ui-config.json")
     assert settings.status_code == 200 and settings.headers["cache-control"] == "no-store"
-    assert settings.json() == {"auth": "bearer", "mount": "/ui", "session_storage_token": True, "display_timezone": None}
+    body = settings.json()
+    assert {k: body[k] for k in ("auth", "mount", "session_storage_token", "display_timezone")} == {"auth": "bearer", "mount": "/ui", "session_storage_token": True, "display_timezone": None}
+    assert body["theme"]["name"] == "neutral" and body["theme"]["logo"] is False
     assert "s3cret" not in settings.text and TOKEN_ENV not in settings.text
 
 

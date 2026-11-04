@@ -7,6 +7,7 @@ import { z } from "zod";
 import type { Features } from "../api/features";
 import { Aggregate } from "../api/schema";
 import { AggregateCard } from "../components/AggregateCard";
+import { LogResult } from "../components/LogResult";
 import { ErrorBanner, JsonBlock, Text } from "../components/common";
 import { useApp } from "../context";
 import { formFields, initialValues, toArgs, type FormField } from "../lib/schemaForm";
@@ -54,10 +55,11 @@ export function asAggregate(tool: string, output: Output): Aggregate | null {
   return parsed.success ? parsed.data : null;
 }
 
-function ToolResult({ tool, output }: { tool: string; output: Output }) {
+function ToolResult({ tool, output, compact = false }: { tool: string; output: Output; compact?: boolean }) {
   const { capabilities } = useApp();
-  const aggregate = asAggregate(tool, output);
   const timeFields = useMemo(() => timeFieldsOf(capabilities?.fields), [capabilities]);
+  if (Array.isArray(output.rows) || typeof output.status === "string") return <LogResult tool={tool} output={output} compact={compact} />;
+  const aggregate = asAggregate(tool, output);
   return aggregate ? (
     <AggregateCard aggregate={aggregate} timeFields={timeFields} />
   ) : (

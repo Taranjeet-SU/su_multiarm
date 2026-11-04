@@ -91,6 +91,16 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
   of the served history, per-day weights from the shards).
 - `graph_neighbourhood.days` (default 30) bounds the per-day weights.
 
+### Fallback overlay into the arms (addendum A2 L5/B7)
+
+- Model-assisted heads of the fallback overlay become rollup rows (`log_day`, `log_hour`,
+  `endpoint_day`, `exception_day`) with `extraction_source: model_assisted`; heads without a
+  signature go to `signature_id: unknown`; they never produce graph edges. `coverage_day` adds
+  `extracted_coverage` and the model-assisted counts next to the unchanged deterministic coverage.
+  Answers that include model-assisted rows state their share; `extraction: deterministic` excludes
+  them. Snapshots and history shards carry them.
+- **Fixed:** a newly sealed overlay did not change the compose identity.
+
 ### Fixed (logs analytics)
 
 - Generated answers to grouped-sum questions no longer abstain when they state the group values,
@@ -103,6 +113,16 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
   0.02 s for 4.6×10³ records).
 
 ### Web UI (preview, addendum A2 §4.4)
+
+- **Design and theming.** `serving.ui.theme` names a JSON theme (brand colours, product name,
+  tagline, fonts, chart series, SVG logo), served as `/ui/theme.css` (custom properties only) and
+  `/ui/theme-logo.svg`; unsafe values refuse the start. A neutral default ships; branding stays in
+  the deployment. New visual system, live run timeline (plan, arms with counts and server time,
+  evidence, drafting, contract, answer; from the stream events only), answer card with inline
+  citation chips, exactness badges and rendering sentences, graph mini-map and a typed legend.
+- **Charts and overview.** Ranked bars (approximate bars hatched and marked ≈), gap-aware trend
+  lines, tenant × service heatmap, coverage gauges (regex-only and with-model apart) and an
+  incident timeline; an Overview dashboard over the log tools, shown only when they exist.
 
 - **Read-only web UI** in the separate wheel `su-multi-arm-ui` (`ui/`, Vite + React + TypeScript; the
   built bundle is committed under `ui/python/su_multi_arm_ui/static`). `serving.ui.enabled: true`

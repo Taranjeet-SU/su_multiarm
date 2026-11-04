@@ -94,6 +94,8 @@ def _overlay(store: FilePartitionStore, manifest: PartitionManifest) -> dict[str
         if head.signature_id and head.extraction_source:
             by_signature[f"{head.signature_id}|{head.extraction_source}"] += 1
         by_field_source.update(f"{f.name}|{f.source}" for f in head.fields)
+    from .log_rollups import overlay_aggregates
+
     return {
         "identity": overlay.identity,
         "format": overlay.format,
@@ -107,6 +109,9 @@ def _overlay(store: FilePartitionStore, manifest: PartitionManifest) -> dict[str
             "by_signature_source": dict(sorted(by_signature.items())),
             "by_field_source": dict(sorted(by_field_source.items())),
         },
+        # the model-assisted heads aggregated like the deterministic aggregates (content-free rows):
+        # what compose turns into ``extraction_source: model_assisted`` rollup rows (L5/B7)
+        "aggregates": overlay_aggregates(store, manifest, heads),
     }
 
 
@@ -394,8 +399,9 @@ def compose(
     if not manifests:
         raise ComposeRefused(f"no sealed partition of source {logs.source!r} in the window ending {as_of.isoformat()}")
     result.partitions = [{"key": m.key, "version": m.version, "library_identity": m.library_identity} for m in manifests]
-    for m in manifests:
-        write_derived(store, m)
+    # the window days' snapshot identities include their fallback overlay: a newly sealed overlay
+    # changes the composition even when no partition version changed
+    snapshot_identities = {m.key: write_derived(store, m)["identity"] for m in manifests}
     # Derived days (``retention.derived`` beyond the partition window): composed from their masked
     # derived snapshots; a day whose library identity is stale cannot be reparsed (its partition is
     # gone) and is served as composed, listed under ``derived`` with its identity.
@@ -427,7 +433,7 @@ def compose(
         result.derived = kept
     result.derived.sort(key=lambda e: e["key"])
     recipe = compose_recipe(config)
-    identity_input: dict[str, Any] = {"partitions": result.partitions, "recipe": recipe}
+    identity_input: dict[str, Any] = {"partitions": result.partitions, "recipe": recipe, "snapshots": snapshot_identities}
     if result.derived:
         identity_input["derived"] = result.derived  # absent under the single window: identities unchanged
     result.identity = hashlib.sha256(json.dumps(identity_input, sort_keys=True).encode()).hexdigest()
@@ -462,7 +468,11 @@ def compose(
         snapshot = read_derived(store, entry["key"])
         identities[entry["key"]] = str(snapshot.get("library_identity"))
         age = (as_of - date.fromisoformat(entry["key"])).days
-        day = downsample(DayInputs(entry["key"], snapshot["aggregates"], snapshot["hourly_cells"], snapshot["exemplars"], date_basis), age)
+        aggregates = snapshot["aggregates"]
+        model_rows = ((snapshot.get("overlay") or {}).get("aggregates")) if isinstance(snapshot.get("overlay"), dict) else None
+        if model_rows:  # the fallback overlay's model-assisted rows ride with the day (B7)
+            aggregates = {**aggregates, "model_assisted": model_rows}
+        day = downsample(DayInputs(entry["key"], aggregates, snapshot["hourly_cells"], snapshot["exemplars"], date_basis), age)
         unavailable = analytics and int(day.aggregates.get("format", 1)) < PARTITION_FORMAT
         if unavailable:
             # a derived day snapshotted before format 2 whose partition is gone: the analytics

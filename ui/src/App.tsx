@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiClient, ApiError, TokenStore } from "./api/client";
 import { EMPTY_FEATURES, loadFeatures, type Features } from "./api/features";
-import { Capabilities, UiSettings, type AnswerResult, type SearchResult } from "./api/schema";
+import { Capabilities, DEFAULT_THEME, UiSettings, type AnswerResult, type SearchResult, type UiTheme } from "./api/schema";
 import { ErrorBanner, NotAvailable } from "./components/common";
 import { AppContext, type AppState } from "./context";
-import { displayText } from "./lib/text";
+import { displayText, short } from "./lib/text";
 import { VIEWS } from "./views/registry";
 import { TokenForm } from "./views/SettingsView";
 
@@ -25,6 +25,29 @@ function useHashRoute() {
     return () => window.removeEventListener("hashchange", on);
   }, []);
   return state;
+}
+
+/** Logo (``theme-logo.svg`` as an image: SVG never runs script there) or a monogram, then the
+ * product name and tagline from the deployment's theme, as text. */
+function Brand({ theme }: { theme: UiTheme }) {
+  useEffect(() => {
+    document.title = theme.product_name;
+  }, [theme.product_name]);
+  return (
+    <div className="brand">
+      {theme.logo ? (
+        <img src="./theme-logo.svg" alt="" />
+      ) : (
+        <span className="brand-mark" aria-hidden="true">
+          {displayText(theme.product_name).slice(0, 1).toUpperCase()}
+        </span>
+      )}
+      <div>
+        <div className="brand-name">{displayText(theme.product_name)}</div>
+        {theme.tagline ? <div className="brand-tagline">{displayText(theme.tagline)}</div> : null}
+      </div>
+    </div>
+  );
 }
 
 type Boot = { phase: "loading" } | { phase: "error"; error: unknown } | { phase: "ready"; settings: UiSettings };
@@ -94,7 +117,7 @@ export function App({ api: injected }: { api?: ApiClient }) {
   return (
     <AppContext.Provider value={state}>
       <header className="topbar">
-        <strong>su_multi_arm</strong>
+        <Brand theme={boot.settings.theme ?? DEFAULT_THEME} />
         <nav aria-label="views">
           {VIEWS.filter((v) => !v.hidden?.(features)).map((v) => {
             const why = v.unavailable?.(features) ?? null;
@@ -106,9 +129,13 @@ export function App({ api: injected }: { api?: ApiClient }) {
             );
           })}
         </nav>
-        <span className="muted small" data-testid="dataset">
-          {dataset ? `${displayText(dataset.name)} · generation ${displayText(dataset.generation ?? "none")}` : ""}
-        </span>
+        {dataset ? (
+          <span className="context-chip" data-testid="dataset" title="active dataset and published generation">
+            <span className="status-dot" aria-hidden="true" />
+            <strong>{displayText(dataset.name)}</strong>
+            <span>generation {short(dataset.generation ?? "none", 12)}</span>
+          </span>
+        ) : null}
       </header>
       <main>
         {needsToken ? (

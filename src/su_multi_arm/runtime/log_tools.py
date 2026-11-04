@@ -331,6 +331,25 @@ def _exactness_text(output: LogToolOutput) -> str:
     return output.exactness
 
 
+def _model_share(ops: Any, ctx: Any, compiled: CompiledIntent) -> tuple[int, int] | None:
+    """``(model-assisted lines, all lines)`` of the main scope (principle 15: an answer that
+    includes model-assisted rows says how much)."""
+    from ..core.types import Measure, Predicate
+
+    spec = compiled.scopes["main"]
+    if spec.limit is not None or spec.periods:
+        return None
+    base = spec.model_copy(update={"group_by": [], "order": None, "top_n": None, "nth": None, "sort": None, "measure": Measure(kind="sum", field="lines")})
+    try:
+        total = ops.log_execute(ctx, base).value
+        model = ops.log_execute(ctx, base.model_copy(update={"predicates": [*base.predicates, Predicate(field="extraction_source", op="eq", value="model_assisted")]})).value
+    except BackendError:
+        return None
+    if not isinstance(total, (int, float)) or not isinstance(model, (int, float)) or not total or not model:
+        return None
+    return int(model), int(total)
+
+
 def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled: CompiledIntent) -> str:
     window = output.window
     where = ""
@@ -341,6 +360,9 @@ def render(output: LogToolOutput, basis_note: str, ops: Any, ctx: Any, compiled:
     if span:  # H2: days built under different library versions
         tail.append(f"spans {span['identities']} library identities")
     tail.extend(n for n in output.notes if n.startswith("folds superseded"))
+    share = _model_share(ops, ctx, compiled) if "model_assisted" in (output.result.applied_extraction if output.result else []) else None
+    if share:
+        tail.append(f"includes {share[0]} model-assisted lines ({share[0] / share[1]:.0%} of {share[1]}; extracted by the fallback, labelled extraction_source=model_assisted)")
     if output.source_unavailable:
         tail.append("source_unavailable (no composed data, not zero): " + ", ".join(output.source_unavailable))
     if output.status == "bounded":

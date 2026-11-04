@@ -48,6 +48,8 @@ def _find(text: str, value: str, start: int = 0, end: int | None = None) -> re.M
 def header_links(extractor: Any, chunk: Chunk, document: Document) -> tuple[list[Entity], list[Relation]]:
     mentions: dict[str, Entity] = {}
     relations: list[Relation] = []
+    if document.metadata.get("extraction_source") == "model_assisted":
+        return [], []  # B7: model-extracted rows produce no graph edges
     provenance = Provenance(extractor=f"log_links:{document.kind}")
     for subject_field, subject_type, predicate, object_field, object_type in HEADER_LINKS.get(document.kind, []):
         ends = []

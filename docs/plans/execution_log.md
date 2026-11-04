@@ -1,3 +1,25 @@
+### 2026-11-04 — A2/L5-B7: fallback overlay into the arms — DONE (contract evidence)
+
+Branch `v2-logs-overlay` from `4d5a652`.
+
+**Done.** `log_rollups.overlay_aggregates` turns the sealed overlay's model-assisted heads into
+content-free aggregate rows in the derived snapshot (`overlay.aggregates`): `provisional` and
+`model_line` heads become `log_day`/`log_hour` rows with their status and signature (`unknown` when
+the model named none) and feed `endpoint_day`/`exception_day` with their typed values; `parsed_filled`
+heads feed only their model-filled fields. Every such row has `extraction_source: model_assisted`
+(deterministic rows: `deterministic`), and per-field sources are counted (`fields`). `coverage_day`
+adds `lines_provisional`, `lines_model_line`, `lines_parsed_filled` and `extracted_coverage`; the
+deterministic `coverage` is unchanged. Model rows produce no graph edges (header links and the
+history shard summaries skip them). Log intents: totals read deterministic rows only (they count
+every head once); signature questions read `parsed` plus `provisional`/`model_line` rows;
+`extraction: deterministic` restricts to deterministic rows; the rendering states the model-assisted
+share when `applied_extraction` includes it. The compose identity now includes the window days'
+snapshot identities, so a new overlay recomposes.
+
+**Deviations.** `log_affected` reads `log_day` (which has the model rows) instead of `signature_day`.
+`signature_catalog`, `signature_window` and `graph_link` stay deterministic. A provisional row's
+exactness and scale follow the deterministic rows of its unit and level.
+
 ### 2026-11-04 — A2/H1 + H2: history tier and lineage — DONE except the overlay into the arms (synthetic/contract; OpenSearch real-service for the history rows)
 
 Branch `v2-logs-h1` from `dacd166`.
@@ -1738,3 +1760,22 @@ weakened.
 **Notes.** With the anaconda `pytest` on `PATH` instead of the venv's, `tests/qa` qa10/qa11 fail.
 Their subprocess runs `sys.executable`, which has no `su_multi_arm`. This comes from the
 environment, not the code: run with `.venv/bin/python -m pytest`.
+
+### 2026-11-04 — A2/U4-design: theme system, live timeline, answer card, charts, overview dashboard — DONE (synthetic)
+
+Base `v2/logs` at `e6d3b79`. Commits: `326f428` theme system and visual system, `89d426a` timeline
+and answer card (+ graph mini-map, legend), `5279aaf` chart set, `29647d4` overview dashboard, typed
+graph styling, gold-fixture tour. Owner feedback "too bare bone": studied the private reference
+console read-only (layout and interaction ideas only; no code or strings copied) and the dataviz and
+frontend-design guidance (palette validated: WARN pairs only, so every chart uses direct labels).
+
+Deviations / notes:
+- Fonts: the CSP forbids remote fonts, so a theme names locally installed families only.
+- Brand colour is never a chart mark (an orange brand fails mark contrast); charts use `series`.
+- The heatmap is assembled from one `log_top by tenant` call per service (top 20 each): a blank
+  cell means "not in that service's top 20", stated under the chart.
+- The neighbourhood route now accepts every stored `EdgeKind` (was `fact`/`co_occurrence`).
+- The timeline shows no model narrative: the API exposes none (tokens are the raw provisional reply).
+
+Tests: pytest `not external` 2338 passed, 110 skipped; vitest 62 passed; ruff clean; tour and smoke
+0 CSP violations, 0 page errors.

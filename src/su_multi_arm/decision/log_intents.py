@@ -225,6 +225,21 @@ def _eq(field: str, value: str | None) -> list[Predicate]:
     return [] if value is None else [Predicate(field=field, op="eq", value=value)]
 
 
+SIGNED = ["parsed", "provisional", "model_line"]
+
+
+def _signed() -> Predicate:
+    """Rows with a signature: deterministic ``parsed`` rows and the fallback's model-assisted
+    ``provisional``/``model_line`` rows (those heads are ``unparsed`` in the deterministic rows, so
+    no head is counted twice)."""
+    return Predicate(field="status", op="in", value=list(SIGNED))
+
+
+def _deterministic() -> Predicate:
+    """Totals over all heads read the deterministic rows only (they count every pulled head once)."""
+    return Predicate(field="extraction_source", op="eq", value="deterministic")
+
+
 def _sum(field: str = "lines") -> Measure:
     return Measure(kind="sum", field=field)
 
@@ -237,7 +252,8 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         window = out.window = resolve_window(args, ctx)
         common = [window.predicate(), *_in("service", args.service), *_eq("tenant", args.tenant)]
         if args.by == "exception_class":
-            out.scopes["main"] = ScopeSpec(predicates=[_kind("exception_day"), *common], group_by=["exception_class"], measure=_sum(), order="desc", top_n=args.top_n)
+            extra = [_deterministic()] if args.extraction == "deterministic" else []
+            out.scopes["main"] = ScopeSpec(predicates=[_kind("exception_day"), *common, *extra], group_by=["exception_class"], measure=_sum(), order="desc", top_n=args.top_n)
         elif args.by == "endpoint":
             if not args.service:
                 out.refusal = "ranking endpoints needs a service (endpoint cardinality, review N7); use log_endpoints without a service for the window ranking"
@@ -250,9 +266,9 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
             field = {"service": "service", "tenant": "tenant", "signature": "signature_id"}[args.by]
             preds = [_kind("log_day"), *common, *_in("level", args.level)]
             if args.by == "signature":
-                preds.append(Predicate(field="status", op="eq", value="parsed"))
-            if args.extraction == "deterministic":
-                preds.append(Predicate(field="extraction_source", op="eq", value="deterministic"))
+                preds.append(_signed())
+            if args.by != "signature" or args.extraction == "deterministic":
+                preds.append(_deterministic())
             if args.owner == "reviewed":
                 preds.append(Predicate(field="pattern_owner", op="eq", value="user"))
             out.scopes["main"] = ScopeSpec(predicates=preds, group_by=[field], measure=_sum(), order="desc", top_n=args.top_n)
@@ -272,7 +288,7 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         window = out.window = resolve_window(args, ctx)
         group = ["tenant", "date"] if args.per_day else ["tenant"]
         out.scopes["main"] = ScopeSpec(
-            predicates=[_kind("signature_day"), window.predicate(), Predicate(field="signature_id", op="eq", value=args.signature_id)],
+            predicates=[_kind("log_day"), window.predicate(), _signed(), Predicate(field="signature_id", op="eq", value=args.signature_id)],
             group_by=group,
             measure=_sum(),
             **({"sort": Sort(field="date")} if args.per_day else {"order": "desc"}),
@@ -283,7 +299,9 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         kind, key = ("log_hour", "ts_hour") if args.granularity == "hour" else ("log_day", "date")
         preds = [_kind(kind), window.predicate(), *_eq("service", args.service), *_in("level", args.level)]
         if args.signature_id:
-            preds += [Predicate(field="signature_id", op="eq", value=args.signature_id)]
+            preds += [_signed(), Predicate(field="signature_id", op="eq", value=args.signature_id)]
+        else:
+            preds.append(_deterministic())
         out.scopes["main"] = ScopeSpec(predicates=preds, group_by=[key], measure=_sum(), sort=Sort(field=key))
     elif call.intent == "log_compare":
         assert isinstance(args, LogCompareInput)
@@ -297,7 +315,9 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         # the union of the periods bounds the rows read (the periods split them)
         preds = [_kind("log_day"), out.window.predicate(), *_eq("service", args.service), *_in("level", args.level)]
         if args.signature_id:
-            preds.append(Predicate(field="signature_id", op="eq", value=args.signature_id))
+            preds += [_signed(), Predicate(field="signature_id", op="eq", value=args.signature_id)]
+        else:
+            preds.append(_deterministic())
         out.scopes["main"] = ScopeSpec(predicates=preds, measure=_sum(), time_basis="date", periods=periods)
     elif call.intent == "log_tenants":
         assert isinstance(args, LogTenantsInput)
@@ -314,7 +334,7 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
             out.notes.append(f"source counts of the {query!r} count query (basis per row)")
         else:
             out.scopes["main"] = ScopeSpec(
-                predicates=[_kind("log_day"), window.predicate(), *_eq("service", args.service), Predicate(field="level", op="eq", value=level)],
+                predicates=[_kind("log_day"), window.predicate(), *_eq("service", args.service), Predicate(field="level", op="eq", value=level), _deterministic()],
                 group_by=["tenant"],
                 measure=_sum(),
                 order="desc",
@@ -328,7 +348,7 @@ def compile_intent(call: LogIntentCall, ctx: CompileContext) -> CompiledIntent:
         hour_window = Predicate(field="ts_hour", op="date_interval", lower=lower.isoformat(), upper=upper.isoformat(), granularity="day")
         out.window = Window(start=lower.date(), end=upper.date() + timedelta(days=1), label=f"{lower.isoformat()} to {upper.isoformat()}")
         out.scopes["main"] = ScopeSpec(
-            predicates=[_kind("log_hour"), hour_window, Predicate(field="status", op="eq", value="parsed"), *_eq("tenant", args.tenant)],
+            predicates=[_kind("log_hour"), hour_window, _signed(), *_eq("tenant", args.tenant)],
             group_by=["signature_id"],
             measure=_sum(),
             order="desc",

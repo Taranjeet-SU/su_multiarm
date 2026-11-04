@@ -96,7 +96,19 @@ def mount_ui(app, ui_config, resolver: Any, static_dir: Path | None = None) -> P
     check_auth(ui_config, resolver)
     root = check_bundle(static_dir) if static_dir is not None else bundle_dir()
     mount = ui_config.mount
-    settings = json.dumps({"auth": auth_kind(resolver), "mount": mount, "session_storage_token": ui_config.session_storage_token, "display_timezone": ui_config.display_timezone}).encode()
+    from .ui_theme import load_theme, theme_css, theme_public
+
+    theme, logo = load_theme(ui_config.theme)  # ConfigError at start-up, never a half-themed UI
+    css = theme_css(theme)
+    settings = json.dumps(
+        {
+            "auth": auth_kind(resolver),
+            "mount": mount,
+            "session_storage_token": ui_config.session_storage_token,
+            "display_timezone": ui_config.display_timezone,
+            "theme": theme_public(theme, logo is not None),
+        }
+    ).encode()
 
     def respond(body: bytes, media_type: str, cache: str, status: int = 200) -> Response:
         return Response(content=body, status_code=status, media_type=media_type, headers={**SECURITY_HEADERS, "Cache-Control": cache})
@@ -114,6 +126,13 @@ def mount_ui(app, ui_config, resolver: Any, static_dir: Path | None = None) -> P
             return respond((root / "index.html").read_bytes(), TYPES[".html"], "no-store")
         if path == "ui-config.json":
             return respond(settings, TYPES[".json"], "no-store")
+        if path == "theme.css":
+            return respond(css, TYPES[".css"], "no-cache")
+        if path == "theme-logo.svg":
+            if logo is None:
+                return not_found()
+            # An SVG document of its own: no script, no style injection, no subresources.
+            return Response(content=logo, media_type="image/svg+xml", headers={**SECURITY_HEADERS, "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'", "Cache-Control": "no-cache"})
         if "\\" in path or "\x00" in path:
             return not_found()
         candidate = (root / path).resolve()

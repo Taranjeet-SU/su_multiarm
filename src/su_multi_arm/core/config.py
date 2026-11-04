@@ -1272,6 +1272,9 @@ class UiConfig(StrictModel):
     display_timezone: str | None = Field(default=None, max_length=64)  # display only; never changes partition dates
     session_storage_token: bool = False  # keep the token in sessionStorage (never localStorage or a cookie)
     allow_unauthenticated_loopback: bool = False
+    # A JSON theme file (brand colours, product name, logo, fonts; ``serving/ui_theme.py``). None: the
+    # neutral default. Branding is deployment data and stays outside this repository.
+    theme: Path | None = None
 
     @field_validator("mount")
     @classmethod

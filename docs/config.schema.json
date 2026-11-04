@@ -5545,6 +5545,19 @@
           "default": false,
           "title": "Allow Unauthenticated Loopback",
           "type": "boolean"
+        },
+        "theme": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Theme"
         }
       },
       "title": "UiConfig",

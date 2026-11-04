@@ -149,5 +149,10 @@ export const Capabilities = z
   .passthrough();
 export type Capabilities = z.infer<typeof Capabilities>;
 
-export const UiSettings = z.object({ session_storage_token: z.boolean(), mount: z.string(), auth: z.enum(["none", "bearer", "custom"]) }).passthrough();
+export const UiTheme = z.object({ name: z.string(), product_name: z.string(), tagline: z.string(), logo: z.boolean() }).passthrough();
+export type UiTheme = z.infer<typeof UiTheme>;
+export const DEFAULT_THEME: UiTheme = { name: "neutral", product_name: "Multi-arm console", tagline: "", logo: false };
+export const UiSettings = z
+  .object({ session_storage_token: z.boolean(), mount: z.string(), auth: z.enum(["none", "bearer", "custom"]), theme: UiTheme.optional() })
+  .passthrough();
 export type UiSettings = z.infer<typeof UiSettings>;

@@ -8,6 +8,7 @@ import { ChartsView } from "./ChartsView";
 import { CommunitiesView, RunsView } from "./OpsViews";
 import { PatternsView } from "./PatternsView";
 import { hasLogTools, LogsView } from "./LogsView";
+import { DashboardView } from "./DashboardView";
 import { SettingsView } from "./SettingsView";
 
 // cytoscape is loaded only when the graph explorer opens (a separate hashed chunk).
@@ -30,7 +31,8 @@ function needs(method: string, path: string): (features: Features) => string | n
 }
 
 export const VIEWS: ViewDef[] = [
-  { id: "ask", label: "Ask", render: (p) => <AskView initialQuestion={p.q ?? ""} /> },
+  { id: "overview", label: "Overview", render: () => <DashboardView />, hidden: (f) => !hasLogTools(f), unavailable: (f) => (hasLogTools(f) ? null : "this server has no log_* tools") },
+  { id: "ask", label: "Ask", render: (p) => <AskView initialQuestion={p.q ?? ""} initialAsOf={p.as_of ?? ""} /> },
   {
     id: "graph",
     label: "Graph explorer",
@@ -41,7 +43,7 @@ export const VIEWS: ViewDef[] = [
     ),
   },
   { id: "charts", label: "Charts", render: () => <ChartsView /> },
-  { id: "logs", label: "Logs", render: () => <LogsView />, hidden: (f) => !hasLogTools(f), unavailable: (f) => (hasLogTools(f) ? null : "this server has no log_* tools") },
+  { id: "logs", label: "Log shortcuts", render: () => <LogsView />, hidden: (f) => !hasLogTools(f), unavailable: (f) => (hasLogTools(f) ? null : "this server has no log_* tools") },
   { id: "patterns", label: "Patterns", render: () => <PatternsView />, unavailable: needs("GET", "/v2/patterns/review") },
   { id: "communities", label: "Communities", render: () => <CommunitiesView />, unavailable: needs("GET", "/v2/communities") },
   { id: "runs", label: "Runs & spend", render: () => <RunsView />, unavailable: needs("GET", "/v2/runs") },

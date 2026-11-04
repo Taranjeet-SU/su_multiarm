@@ -26,10 +26,11 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, get_args
 
 from pydantic import Field
 
+from ..core.types import EdgeKind
 from ..models import StrictModel
 
 MAX_SPANS = 20
@@ -39,7 +40,7 @@ class NeighbourhoodRequest(StrictModel):
     entity_ids: list[str] = Field(default_factory=list, max_length=50)
     query: str | None = Field(default=None, min_length=1, max_length=500)
     hops: int = Field(default=1, ge=0, le=3)
-    edge_kinds: list[Literal["fact", "co_occurrence"]] = Field(default_factory=lambda: ["fact"], min_length=1)
+    edge_kinds: list[EdgeKind] = Field(default_factory=lambda: ["fact"], min_length=1)
     predicates: list[str] = Field(default_factory=list, max_length=50)
     max_nodes: int = Field(default=300, ge=1, le=300)
     max_edges: int = Field(default=1000, ge=1, le=1000)
@@ -418,7 +419,7 @@ def graph_edge(store, gen, parts: tuple[str, str, str, str]) -> dict[str, Any] |
     from ..core.types import TraversalSpec
 
     subject, predicate, obj, kind = parts
-    if kind not in {"fact", "co_occurrence"}:
+    if kind not in get_args(EdgeKind):
         return None
     paths = store.traverse(gen, TraversalSpec(seed_entity_ids=[subject], hops=1, predicates=[predicate], direction="out", edge_kinds=[kind], limit=1000), None)
     for path in paths:

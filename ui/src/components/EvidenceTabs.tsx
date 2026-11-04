@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { SearchResult } from "../api/schema";
-import { displayText } from "../lib/text";
+import { displayText, short } from "../lib/text";
 import { AggregateCard } from "./AggregateCard";
 import { KeyValues, Tabs, Text } from "./common";
 import { HitCard, queryTerms } from "./HitCard";
 import { TracePanel } from "./TracePanel";
+
+const MiniGraph = lazy(() => import("./MiniGraph"));
 
 // Tabs per arm. ``community`` is the arm name in ``arm_hits``; any other arm the server returns gets
 // its own tab too, so a new arm is shown without a UI change (extension point).
@@ -56,7 +58,7 @@ export function EvidenceTabs({ result, answerTrace, focus, timeFields }: { resul
           <div>
             <KeyValues
               rows={[
-                ["generation", result.generation],
+                ["generation", short(result.generation, 16)],
                 ["decision", `${displayText(decision.agent)} → ${displayText(decision.outcome)}`],
                 ["intents", Array.isArray(decision.intents) && decision.intents.length ? decision.intents.join(", ") : "none"],
                 ["arms with hits", Object.entries(result.arm_hits).filter(([, h]) => h.length).map(([a, h]) => `${a} (${h.length})`).join(", ") || "none"],
@@ -67,6 +69,11 @@ export function EvidenceTabs({ result, answerTrace, focus, timeFields }: { resul
           </div>
         ) : null}
         {active === "fused" ? <HitList hits={result.hits} terms={terms} flashId={flashId} /> : null}
+        {active === "graph" && (result.arm_hits.graph ?? []).length ? (
+          <Suspense fallback={<p className="muted">loading the graph map…</p>}>
+            <MiniGraph hits={result.arm_hits.graph ?? []} />
+          </Suspense>
+        ) : null}
         {[...ARM_TABS.map((t) => t.id), ...extraArms].includes(active) ? <HitList hits={result.arm_hits[active] ?? []} terms={active === "lexical" ? terms : []} flashId={flashId} empty={`The ${active} arm returned no hits for this request (or did not run).`} /> : null}
         {active === "structured" ? (
           result.aggregates.length ? (

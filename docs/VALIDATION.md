@@ -1,3 +1,25 @@
+## Fallback overlay into the arms — 2026-11-04 (branch `v2-logs-overlay` from `4d5a652`; A2 L5/B7)
+
+Evidence level: **contract** (synthetic overlay rows written with the fallback slice's
+`OverlayStore` on one gold day; no model called).
+
+- `tests/contract/test_logs_overlay_arms.py` (5 tests): 23 `provisional` heads (signature from a
+  learned entry), 1 `model_line` head (no signature, model-extracted endpoint/method/status/latency)
+  and 1 `parsed_filled` head (model-filled exception class) on day 9. The derived snapshot carries
+  them as aggregate rows and the day's history shard as `extraction_source: model_assisted` rows
+  (`applied_extraction == ["model_assisted"]`); signature answers include `payload.opaque` (23) and
+  `unknown` (1) and state the model-assisted share; `extraction: deterministic` excludes them;
+  deterministic per-service totals and the deterministic coverage are unchanged (no head counted
+  twice), the model-assisted counts and `extracted_coverage` are separate and higher; the model
+  endpoint reaches the 5xx ranking and the filled exception class the exception ranking; no graph
+  edge comes from a model row (no `serves`/`raises` edge, no edge for the provisional signature).
+- Found and fixed: a newly sealed overlay did not change the compose identity, so compose stayed
+  `unchanged`; the identity now includes the window days' snapshot identities.
+- `test_derived_archive` adjusted: a snapshot still holds no line-level rows (no head ids, reply
+  shas or per-line values), but a model-extracted value can now appear as an aggregate dimension,
+  like a deterministic endpoint template.
+- Full suite: 2359 passed, 95 skipped (not external); ruff clean.
+
 ## History tier H1, lineage H2, read latency — 2026-11-04 (branch `v2-logs-h1` from `dacd166`; A2 rev 4 §4.8, §11.R4)
 
 Evidence level: **synthetic / contract** on sqlite, **real-service (isolated)** for the history rows
@@ -2377,3 +2399,25 @@ Evidence level: **synthetic / contract** (test-suite runs only; no service, no p
   profile without networkx and the typed `PatternEngineUnavailable` are unchanged.
 - Limitation: the fresh run covers what the core package does without extras; everything behind an
   extra is covered only by the full-venv run (and google-re2 paths by neither).
+
+## Web UI design pass: theme, live timeline, charts, overview — 2026-11-04 (A2 U4-design)
+
+Evidence level: **synthetic + mocked model** (the 10-day synthetic gold set, the loopback fake
+streaming model). No real deployment, model or customer data; no paid calls.
+
+- `tests/contract/test_ui_theme.py` (20): default and deployment themes become `theme.css` with
+  custom properties only and an SVG logo with its own `default-src 'none'` policy; injection-shaped
+  colours, font stacks, series, control characters, logo paths outside the theme directory and
+  logos with script, event attributes, `foreignObject`, entities or external references refuse the
+  start; the committed `ui/public/theme.css` equals the generated default.
+- vitest 62: timeline steps advance only from events (no reasoning text written by the UI), an
+  error marks the final step; inline citation chips; answer numbers with exactness and rendering;
+  charts (sorting, ≈ hatching, line gaps for days without composed data, quantised heatmap,
+  coverage numbers printed apart); log-row adapters; XSS corpus inert in every new component.
+- Browser tour (`ui/e2e/serve_synthetic.py --fixture gold --theme …` + `ui/e2e/tour.mjs`, local
+  Playwright chromium): overview, streamed log question, structured and lexical tabs, graph tab and
+  explorer (stored `native_link` edges), log shortcuts, pattern review, runs: **0 CSP violations,
+  0 page errors**. Screenshots and the reference-console comparison stay in the external workspace.
+- **Not established**: the deployment theme on the real server, axe accessibility, large graphs
+  (> 80 nodes fall back to a grid layout), the with-model coverage numbers (the gold set reports
+  regex-only coverage; the gauge shows "model n/a").

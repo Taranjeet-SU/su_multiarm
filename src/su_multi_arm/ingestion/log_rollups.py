@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from datetime import timezone
 from typing import Any
 
 from ..core.types import Document
@@ -67,7 +68,24 @@ def analytics_day_documents(dataset: str, day: DayInputs, kinds: Any, *, max_end
         raise ValueError(f"partition {day.key} has format {aggregates.get('format', 1)}; the analytics kinds need format 2 (reparse first)")
     stamp = {"date": day.key, **day.basis}
     docs: list[Document] = []
+    model = aggregates.get("model_assisted") or {}
     if kinds.log_day:
+        for row in model.get("levels", []):
+            meta = {
+                **stamp,
+                **_unit_dims(row),
+                "level": row["level"],
+                "status": row["status"],
+                "signature_id": row["signature_id"],
+                "pattern_owner": row.get("pattern_owner"),
+                "lines": row["lines"],
+                "lines_pulled": row["lines_pulled"],
+                "extraction_source": "model_assisted",
+                "row_exactness": row["row_exactness"],
+                "method": row["method"],
+            }
+            parts = [day.key, row["unit_id"], row["level"], row["status"], row["signature_id"], "model_assisted"]
+            docs.append(_document(dataset, "log_day", parts, f"{row['level']} {row['status']} {meta['service']} {day.key} (model-assisted)", meta))
         for row in aggregates["levels"]:
             meta = {
                 **stamp,
@@ -87,6 +105,22 @@ def analytics_day_documents(dataset: str, day: DayInputs, kinds: Any, *, max_end
             parts = [day.key, row["unit_id"], row["level"], row["status"], row["signature_id"] or ""]
             docs.append(_document(dataset, "log_day", parts, f"{row['level']} {row['status']} {meta['service']} {day.key}", meta))
     if kinds.log_hour:
+        for row in model.get("level_hours", []):
+            meta = {
+                **stamp,
+                **_unit_dims(row),
+                "ts_hour": row["hour"],
+                "level": row["level"],
+                "status": row["status"],
+                "signature_id": row["signature_id"],
+                "lines": row["lines"],
+                "lines_pulled": row["lines_pulled"],
+                "extraction_source": "model_assisted",
+                "row_exactness": row["row_exactness"],
+                "method": row["method"],
+            }
+            parts = [row["hour"], row["unit_id"], row["level"], row["status"], row["signature_id"], "model_assisted"]
+            docs.append(_document(dataset, "log_hour", parts, f"{row['level']} {meta['service']} {row['hour']} (model-assisted)", meta))
         for row in aggregates["level_hours"]:
             meta = {
                 **{k: v for k, v in stamp.items()},
@@ -125,7 +159,23 @@ def analytics_day_documents(dataset: str, day: DayInputs, kinds: Any, *, max_end
                     bucket["latency_ms_max"] = max(bucket["latency_ms_max"] or 0.0, row["latency_ms_max"])
             for (_m, _c), bucket in sorted(other.items()):
                 docs.append(_endpoint_doc(dataset, day, stamp, bucket, OTHER_ENDPOINT, None, "approximate"))
+        for row in model.get("endpoints", []):
+            docs.append(_endpoint_doc(dataset, day, stamp, row, row["endpoint"], row["latency_ms_p95"], row["row_exactness"], model_assisted=True))
     if kinds.exception_day:
+        for row in model.get("exceptions", []):
+            meta = {
+                **stamp,
+                **_unit_dims(row),
+                "signature_id": row["signature_id"],
+                "exception_class": row["exception_class"],
+                "lines": row["lines"],
+                "lines_pulled": row["lines_pulled"],
+                "extraction_source": "model_assisted",
+                "row_exactness": row["row_exactness"],
+                "method": row["method"],
+            }
+            parts = [day.key, row["unit_id"], row["signature_id"], row["exception_class"], "model_assisted"]
+            docs.append(_document(dataset, "exception_day", parts, f"{row['exception_class']} {meta['service']} {day.key} (model-assisted)", meta))
         for row in aggregates["exceptions"]:
             meta = {
                 **stamp,
@@ -134,6 +184,7 @@ def analytics_day_documents(dataset: str, day: DayInputs, kinds: Any, *, max_end
                 "exception_class": row["exception_class"],
                 "lines": row["lines"],
                 "lines_pulled": row["lines_pulled"],
+                "extraction_source": "deterministic",
                 "row_exactness": row["row_exactness"],
                 "method": row["method"],
             }
@@ -155,6 +206,8 @@ def analytics_day_documents(dataset: str, day: DayInputs, kinds: Any, *, max_end
                 "lines_timeout": statuses["timeout"],
                 "fragments": unit["fragments"],
                 "coverage": round((statuses["parsed"] + statuses["noise"]) / pulled, 6) if pulled else None,
+                # the fallback overlay, kept separate from the deterministic numbers above
+                **_model_coverage(model.get("statuses", {}).get(unit["unit_id"], {}), statuses, pulled),
                 "row_exactness": "exact",
                 "method": unit["method"],
             }
@@ -162,7 +215,20 @@ def analytics_day_documents(dataset: str, day: DayInputs, kinds: Any, *, max_end
     return docs
 
 
-def _endpoint_doc(dataset: str, day: DayInputs, stamp: dict[str, Any], row: dict[str, Any], endpoint: str, p95: Any, exactness: str) -> Document:
+def _model_coverage(model: dict[str, int], statuses: dict[str, int], pulled: int) -> dict[str, Any]:
+    if not model:
+        return {}
+    provisional, model_line, filled = model.get("provisional", 0), model.get("model_line", 0), model.get("parsed_filled", 0)
+    extracted = statuses["parsed"] + statuses["noise"] + provisional + model_line
+    return {
+        "lines_provisional": provisional,
+        "lines_model_line": model_line,
+        "lines_parsed_filled": filled,
+        "extracted_coverage": round(extracted / pulled, 6) if pulled else None,
+    }
+
+
+def _endpoint_doc(dataset: str, day: DayInputs, stamp: dict[str, Any], row: dict[str, Any], endpoint: str, p95: Any, exactness: str, *, model_assisted: bool = False) -> Document:
     meta = {
         **stamp,
         **_unit_dims(row),
@@ -177,8 +243,9 @@ def _endpoint_doc(dataset: str, day: DayInputs, stamp: dict[str, Any], row: dict
         "latency_ms_p95": p95,
         "row_exactness": exactness,
         "method": row["method"],
+        "extraction_source": "model_assisted" if model_assisted else "deterministic",
     }
-    parts = [day.key, row["unit_id"], endpoint, row["http_method"], row["status_class"]]
+    parts = [day.key, row["unit_id"], endpoint, row["http_method"], row["status_class"], *(["model_assisted"] if model_assisted else [])]
     return _document(dataset, "endpoint_day", parts, f"{row['http_method']} {endpoint} {meta['service']} {day.key}", meta)
 
 
@@ -369,3 +436,107 @@ def signature_lineage_documents(dataset: str, library: Any) -> list[Document]:
         meta = {"signature_id": old_sig, "successor_id": new_sig, "pattern_id": decision.target, "successor_pattern_id": decision.id, "decided_at": decision.at.isoformat(), "decided_by": decision.by}
         docs.append(_document(dataset, "signature_lineage", [old_sig, new_sig], f"{old_sig} -> {new_sig}", meta))
     return docs
+
+
+# --- model-assisted rows from the fallback overlay (L5/B7) ----------------------------------------
+
+MODEL_STATUSES = ("provisional", "model_line")  # heads the deterministic parse left unresolved
+FIELD_STATUSES = ("parsed_filled",)  # parsed heads whose missing fields a model filled
+
+
+def overlay_aggregates(store: Any, manifest: Any, heads: list[Any]) -> dict[str, Any]:
+    """The overlay's model-assisted heads aggregated per unit like ``logs_parse`` aggregates the
+    deterministic ones (content-free rows: counts and typed-value statistics, no line text).
+
+    * ``provisional`` / ``model_line`` heads: ``levels`` / ``level_hours`` rows with that status and
+      the head's signature, or ``unknown`` when the model named none; their typed values feed
+      ``endpoints`` / ``exceptions`` rows. The same heads stay ``unparsed`` in the deterministic
+      rows, so a deterministic total never counts them twice.
+    * ``parsed_filled`` heads: only the model-filled fields (``model_fill``) feed ``endpoints`` /
+      ``exceptions`` rows; the heads are already counted as parsed.
+    * ``fields``: per unit, the values by name and source (``extraction_source`` per field).
+    Every row carries ``extraction_source: model_assisted``."""
+    from collections import Counter
+
+    from .logs_parse import ENDPOINT, EXCEPTION_CLASS, HTTP_METHOD, LATENCY_MS, STATUS_CODE, endpoint_template, p95, status_class
+
+    if not heads:
+        return {}
+    matches = {m["id"]: m for m in store.read(manifest.key, "matches.jsonl.gz", manifest.version)}
+    aggregates = store.read(manifest.key, "aggregates.json", manifest.version)
+    attrs = {u["unit_id"]: u["attributes"] for u in aggregates.get("units", [])}
+    # per (unit, level): the deterministic scale and exactness, applied to the model rows
+    scale: dict[tuple[str, str], tuple[float, str, str]] = {}
+    for row in aggregates.get("levels", []):
+        key = (row["unit_id"], row["level"])
+        lines, pulled, exact, method = scale.get(key, (0.0, 0.0, "exact", row["method"]))
+        scale[key] = (lines + row["lines"], pulled + row["lines_pulled"], "approximate" if row["row_exactness"] == "approximate" else exact, row["method"])  # type: ignore[assignment]
+    hours: dict[str, str] = {}
+    wanted = {h.head_id for h in heads}
+    for unit in store.units(manifest.key, manifest.version):
+        for record in unit.records:
+            if record.id in wanted:
+                hours[record.id] = record.ts.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+    levels: Counter[tuple] = Counter()
+    by_hour: Counter[tuple] = Counter()
+    endpoints: dict[tuple, dict[str, Any]] = {}
+    exceptions: Counter[tuple] = Counter()
+    fields: Counter[tuple] = Counter()
+    for head in heads:
+        if head.final_status not in (*MODEL_STATUSES, *FIELD_STATUSES):
+            continue
+        match = matches.get(head.head_id, {})
+        level = match.get("level") or "unknown"
+        signature = head.signature_id or "unknown"
+        owner = head.pattern_owner
+        values = {f.name: f.value for f in head.fields}
+        model_values = {f.name: f.value for f in head.fields if f.source != "pattern"}
+        for f in head.fields:
+            fields[(head.unit_id, f.name, f.source)] += 1
+        if head.final_status in MODEL_STATUSES:
+            levels[(head.unit_id, level, head.final_status, signature, owner)] += 1
+            by_hour[(head.unit_id, hours.get(head.head_id, ""), level, head.final_status, signature)] += 1
+            typed = values
+        else:
+            typed = model_values  # parsed_filled: only what the model added
+        if isinstance(typed.get(ENDPOINT), str):
+            key = (head.unit_id, endpoint_template(typed[ENDPOINT]), str(values.get(HTTP_METHOD) or "").upper() or "UNKNOWN", status_class(values.get(STATUS_CODE)) or "unknown")
+            bucket = endpoints.setdefault(key, {"lines": 0, "latencies": []})
+            bucket["lines"] += 1
+            latency = values.get(LATENCY_MS)
+            if isinstance(latency, (int, float)) and not isinstance(latency, bool):
+                bucket["latencies"].append(float(latency))
+        if isinstance(typed.get(EXCEPTION_CLASS), str):
+            exceptions[(head.unit_id, signature, typed[EXCEPTION_CLASS])] += 1
+
+    def row(unit_id: str, scale_level: str | None, lines: int, **values: Any) -> dict[str, Any]:
+        total, pulled, exactness, method = scale.get((unit_id, scale_level or ""), (0.0, 0.0, "approximate", "unknown"))
+        if scale_level is None:  # endpoint/exception rows: the unit's worst level exactness
+            rows = [v for (u, _l), v in scale.items() if u == unit_id]
+            exactness = "approximate" if any(v[2] == "approximate" for v in rows) or not rows else "exact"
+            method = rows[0][3] if rows else "unknown"
+            factor = 1.0
+        else:
+            factor = (total / pulled) if pulled else 1.0
+        return {
+            "unit_id": unit_id,
+            "attributes": dict(attrs.get(unit_id, {})),
+            **values,
+            "lines": lines if exactness == "exact" else int(round(lines * factor)),
+            "lines_pulled": lines,
+            "row_exactness": exactness,
+            "method": method,
+            "extraction_source": "model_assisted",
+        }
+
+    return {
+        "levels": [row(u, lv, n, level=lv, status=st, signature_id=sig, pattern_owner=own) for (u, lv, st, sig, own), n in sorted(levels.items())],
+        "level_hours": [row(u, lv, n, hour=h, level=lv, status=st, signature_id=sig) for (u, h, lv, st, sig), n in sorted(by_hour.items()) if h],
+        "endpoints": [
+            row(u, None, b["lines"], endpoint=e, http_method=m, status_class=c, latency_ms_sum=float(sum(b["latencies"])), latency_ms_count=len(b["latencies"]), latency_ms_max=max(b["latencies"]) if b["latencies"] else None, latency_ms_p95=p95(b["latencies"]))
+            for (u, e, m, c), b in sorted(endpoints.items())
+        ],
+        "exceptions": [row(u, None, n, signature_id=sig, exception_class=k) for (u, sig, k), n in sorted(exceptions.items())],
+        "statuses": {u: dict(sorted(Counter(h.final_status for h in heads if h.unit_id == u).items())) for u in sorted({h.unit_id for h in heads})},
+        "fields": [{"unit_id": u, "name": name, "source": source, "lines": n} for (u, name, source), n in sorted(fields.items())],
+    }

@@ -4,6 +4,7 @@ import { hasRoute } from "../api/features";
 import { SearchResult } from "../api/schema";
 import { ErrorBanner, KeyValues, Text } from "../components/common";
 import { GraphCanvas } from "../components/GraphCanvas";
+import { GraphLegend } from "../components/GraphLegend";
 import { useApp } from "../context";
 import { fromNeighbourhood, fromProvenance, type GraphData } from "../lib/graph";
 import { displayText } from "../lib/text";
@@ -43,7 +44,7 @@ export function GraphView() {
       setEdgeDetail(null);
       try {
         if (native) {
-          setData(fromNeighbourhood(await api.post(NEIGHBOURHOOD, { query, hops: 1 }, GraphViewSchema)));
+          setData(fromNeighbourhood(await api.post(NEIGHBOURHOOD, { query, hops: 1, edge_kinds: ["fact", "native_link", "co_firing", "co_occurrence", "derived"] }, GraphViewSchema)));
         } else {
           const result = await api.post("/v2/search", { query }, SearchResult);
           setLastSearch(result);
@@ -117,6 +118,7 @@ export function GraphView() {
       {data && !data.nodes.length ? <p className="muted">The graph arm returned no entities or edges for this entity in the current generation.</p> : null}
       {data && data.truncated ? <p className="banner banner-warn">Truncated: the server applied its node/edge bounds.</p> : null}
       {data && data.skippedRows ? <p className="muted small">{data.skippedRows} provenance row(s) carried no edge or mention and are not drawn.</p> : null}
+      {data && data.nodes.length ? <GraphLegend kinds={kinds} types={[...new Set(data.nodes.map((n) => n.type))]} /> : null}
       {kinds.length ? (
         <fieldset className="row">
           <legend>edge kinds</legend>

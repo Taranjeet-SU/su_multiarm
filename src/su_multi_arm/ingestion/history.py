@@ -80,6 +80,8 @@ def summarise(documents: Iterable[Document]) -> dict[str, Any]:
     links: dict[str, int] = defaultdict(int)
     for doc in documents:
         m = doc.metadata
+        if m.get("extraction_source") == "model_assisted":
+            continue  # B7: model-extracted rows feed records, never graph links or the catalog
         lines = m.get("lines") if isinstance(m.get("lines"), int) else m.get("lines_total")
         lines = int(lines) if isinstance(lines, int) else 0
         if doc.kind == "signature_day":

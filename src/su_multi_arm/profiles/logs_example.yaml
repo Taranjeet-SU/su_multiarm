@@ -25,7 +25,7 @@ overlay:
       - {name: deployment, type: string, groupable: true, listable: true}
       - {name: service, type: string, groupable: true, listable: true}
       - {name: level, type: string, groupable: true, listable: true}
-      - {name: status, type: enum, enum_values: [parsed, noise, unparsed, format_only, timeout], groupable: true}
+      - {name: status, type: enum, enum_values: [parsed, noise, unparsed, format_only, timeout, provisional, model_line], groupable: true}
       - {name: signature_id, type: string, groupable: true, listable: true, max_catalog_cardinality: 2000}
       - {name: category, type: string, groupable: true, listable: true}
       - {name: pattern_id, type: string, groupable: true}
@@ -56,6 +56,10 @@ overlay:
       - {name: latency_ms_max, type: number, sortable: true}
       - {name: latency_ms_p95, type: number, sortable: true, additive: false}
       - {name: coverage, type: number, sortable: true, additive: false}
+      - {name: extracted_coverage, type: number, sortable: true, additive: false}
+      - {name: lines_provisional, type: integer, sortable: true}
+      - {name: lines_model_line, type: integer, sortable: true}
+      - {name: lines_parsed_filled, type: integer, sortable: true}
       - {name: row_exactness, type: enum, enum_values: [exact, approximate], role: exactness}
       - {name: basis, type: string, role: basis}
       - {name: extraction_source, type: enum, enum_values: [deterministic, model_assisted], role: extraction}

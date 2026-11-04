@@ -176,3 +176,40 @@ The UI never writes. Run the command where the library lives; the decision takes
 compose. Over plain HTTP on a LAN name the browser has no clipboard API; the command is then shown to
 copy by hand. With the UI behind a LAN forwarder, put the forwarder's host name in
 `serving.allowed_hosts` (the Host match ignores the port).
+
+### Theming the UI
+
+`serving.ui.theme` names a JSON theme file; without it the neutral default is used. The server
+validates the file at start-up (an invalid theme refuses the start) and serves it as
+`/ui/theme.css` (CSS custom properties only) and `/ui/theme-logo.svg`, so the strict CSP still
+holds. Keep your branding in the deployment's configuration directory, not in this repository.
+
+```json
+{
+  "name": "example-brand",
+  "product_name": "Example Log Desk",
+  "tagline": "Answers from your platform logs",
+  "colors": {
+    "brand": "#c2410c", "brand_ink": "#ffffff", "brand_soft": "#ffedd5", "brand_tint": "#fff7ed",
+    "ink": "#1f2937", "muted": "#6b7280", "surface": "#f8fafc", "card": "#ffffff", "border": "#e5e7eb"
+  },
+  "fonts": {"sans": "\"Source Sans 3\", system-ui, sans-serif", "mono": "ui-monospace, monospace"},
+  "series": ["#1d4ed8", "#b45309", "#166534", "#7c3aed", "#0891b2", "#be123c"],
+  "logo_svg_file": "logo.svg"
+}
+```
+
+- Colours are `#rrggbb`. A very light brand colour (an orange, for example) reads well on buttons
+  and accents but is too pale for chart marks: charts use `series`, never `brand`. Check a custom
+  `series` list with a palette validator for contrast on the card colour.
+- Fonts must be installed on the viewer's machine: the CSP allows no remote font. A stack holds
+  family names, quotes, commas, spaces and hyphens only.
+- `logo_svg_file` is relative to the theme file and must stay in its directory: at most 200 kB, an
+  `<svg>` root, no script, event attributes, `foreignObject`, entities or external references. It is
+  shown through an `<img>` tag.
+- `product_name` and `tagline` are plain text.
+
+```yaml
+serving:
+  ui: {enabled: true, theme: /etc/su-multi-arm/ui-theme.json}
+```

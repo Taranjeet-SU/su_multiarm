@@ -1,11 +1,14 @@
 {
   "name": "su-multi-arm-ui",
   "version": "2.0.0a3",
-  "content_sha256": "900f753a17831045755a02f01fd035d29914db58976ffb885450c0509a3291fc",
+  "content_sha256": "c7f75125548162825e2cad9b84570d138ff8395fc23fcb787a7d8f7a7cd0f37a",
   "files": {
-    "assets/GraphView-BMgs34q7.js": "63a2071f065a517a8f05bbaf62ea07ccf416477508f223c8aae859c3d976edb5",
-    "assets/index-D4UxXUyN.css": "c19d8cfb5460e129404ecc4c1dbd023c2d54a3df3938443639c13d10e34edeab",
-    "assets/index-d7prvB5y.js": "0607ecf0c3c41e00e8d699a67ad9eda07b752e3f0d315fce4bb666c078076f43",
-    "index.html": "a863fb162eed6d20246ed49892bd2f5decb95bf3666c6e4686bbf2ae777a2386"
+    "assets/GraphCanvas-D_2kK3-j.js": "533603d21bbc6c8594521ac4deaeb4f0bf93fea2b87a6eb66f0571529a43660e",
+    "assets/GraphView-BJsiHc7a.js": "fa0a3739f7bee0079b41c8a6d896400330a4698522331a83fe8344a91953676b",
+    "assets/MiniGraph-DdWP-t7P.js": "a57db19cc394856cf53e9ead178dd697570203c3d030e3bdc99fbc4d9f51c6ab",
+    "assets/index-CsD_Pzy-.js": "d41a6454de269ba647bd6fbf53ebf51b5c5b18c3df8da61d76b68f1d9a00e4fe",
+    "assets/index-DtYfqwQx.css": "7d9a03ae53e0e6791b79c50c0aab2eb2f97bcf68415f32acbd4f2732f181f065",
+    "index.html": "bf2862c157e3bbb5f61b46693e08ef9062a06a792ea1af4c544274ee6a85b3c4",
+    "theme.css": "cd22ca2d14bfe8cd24841427b0d1c8ec913c4335b207459b73e442cf1a0a6467"
   }
 }
