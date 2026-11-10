@@ -44,7 +44,7 @@ import numpy as np
 
 from ..backends import extras
 from ..backends._scope import document_values
-from ..communities.base import build_communities
+from ..communities.base import build_communities, declared_communities
 from ..communities.reports import ReportFailure, community_report, disabled_report
 from ..communities.stats import community_stats
 from ..core.errors import BackendError, BudgetExhausted, ConfigError, GenerationInUse, IndexNotReady, WriteConflict
@@ -63,13 +63,13 @@ from ..core.types import (
     StructuredRecord,
 )
 from ..extraction.base import BuiltinExtractor, ExtractionFailure, ExtractionInput, canonicalise
-from ..extraction.chunking import chunk_document, to_v2_document
+from ..extraction.chunking import LineRecordTooLong, chunk_with_recipes, to_v2_document
 from ..extraction.dedupe import dedupe_relations
 from ..providers import tokens
 from ..runtime.budget import load_price_table
 from .budget import IngestMeter, check_prices, require_ingest_cap
 from .normalize import redact_document
-from .generations import GenerationSet
+from .generations import GenerationSet, attached_read_only
 from .policy import ExtractionPolicy, PolicyViolation
 from .precomputed import IMPORTED_INPUT, PrecomputedVectorError, PrecomputedVectors, spot_check
 from .release import GenerationRegistry, generation_id
@@ -125,14 +125,24 @@ class WritePath:
         self.community_model = community_model
         self.profile = profile
         self.config_fingerprint = config_fingerprint or config.fingerprint()
+        self._patterns: dict[str, Any] | None = None  # pattern provenance of the current build
         storage, arms = config.storage, config.pipeline.arms
         self.slots: dict[str, str] = {"catalog": storage.catalog, "records": storage.records, "ledger": storage.ledger, "communities": storage.communities}
         if arms.lexical:
             self.slots["lexical"] = arms.lexical.backend
         if arms.dense:
             self.slots["vector"] = arms.dense.backend
-        if arms.graph:
+        if arms.graph and not attached_read_only(config, arms.graph.backend):  # an attached store is read, never written
             self.slots["graph"] = arms.graph.backend
+        projection = getattr(config, "projection", None)
+        self.projection_spec = None
+        if projection is not None and projection.enabled:
+            # typed projection (opt-in): its backend joins the recipe and the generation holders
+            from ..projection.spec import ProjectionSpec
+
+            self.slots["projection"] = projection.backend
+            access = config.access.field if config.access.policy == "tenant" else None
+            self.projection_spec = ProjectionSpec.build(projection, config.metadata_schema, access)
         for slot, name in self.slots.items():
             if name not in backends:
                 raise ConfigError(f"no backend instance named {name!r} for {slot}", f"storage.{slot}")
@@ -155,12 +165,20 @@ class WritePath:
 
     def index_fingerprint(self) -> str:
         """Composed from the index-affecting recipes: chunking, privacy, extractor, embedder, communities, backends."""
-        roles = self.cfg.models.roles
+        return recipe_fingerprint_of(WritePath.index_recipe(self))  # unbound: callers may pass a namespace (golden tests)
+
+    def index_recipe(self, config: Any = None) -> dict[str, Any]:
+        """The recipe ``index_fingerprint`` hashes. ``config`` (default: this write path's) computes
+        it for another configuration of the same deployment (``index adopt`` compares the recipe of
+        the configuration that built the store with this one); the extractor and the projection
+        slots are this write path's."""
+        cfg = self.cfg if config is None else config
+        roles = cfg.models.roles
         data = {
-            "dataset": self.cfg.dataset,
+            "dataset": cfg.dataset,
             "index_format": INDEX_FORMAT,
-            "chunking": self.cfg.ingestion.chunking.model_dump(mode="json"),
-            "privacy": self.cfg.privacy.model_dump(mode="json", exclude={"trace_masking"}),
+            "chunking": chunking_recipe(cfg),
+            "privacy": cfg.privacy.recipe(),
             "extractor": self.extractor.recipe_fingerprint(),
             # ``precomputed`` enters only when set (2.0.0a1 golden values unchanged) and only as its
             # content identity (file digests), never its paths: moving the files keeps the index.
@@ -168,11 +186,40 @@ class WritePath:
                 **roles.embedder.model_dump(mode="json", exclude={"pricing_key", "precomputed"}),
                 **({"precomputed": roles.embedder.precomputed.identity()} if roles.embedder.precomputed is not None else {}),
             },
-            "communities": self.cfg.communities.recipe(),
+            "communities": cfg.communities.recipe(),
             "community_model": None if roles.community is None else roles.community.model,
-            "backends": {slot: _backend_recipe(self.cfg.backends[name]) for slot, name in sorted(self.slots.items())},
+            "backends": {slot: _backend_recipe(cfg.backends[name]) for slot, name in sorted(self.slots.items())},
         }
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+        if getattr(self, "projection_spec", None) is not None:  # enters the recipe only when enabled
+            data["projection"] = cfg.projection.recipe()
+        return data
+
+    def _excluded(self, projection: str, kind: str) -> bool:
+        """``ingestion.projections.exclude_kinds``: catalog and records always hold every document."""
+        projections = self.cfg.ingestion.projections
+        return projections is not None and kind in projections.exclude_kinds.get(projection, [])
+
+    def _catalog_only(self, kind: str) -> bool:
+        """Only the catalog and the records read documents of this kind (excluded from lexical,
+        vector and graph by ``ingestion.projections``)."""
+        return all(self._excluded(p, kind) for p in ("lexical", "vector", "graph"))
+
+    def _embeds(self, kind: str, field: str) -> bool:
+        """Not excluded from vector, and (``ingestion.projections.embed_fields``) a listed field of its kind."""
+        projections = self.cfg.ingestion.projections
+        if projections is None:
+            return True
+        if self._excluded("vector", kind):
+            return False
+        allowed = projections.embed_fields.get(kind)
+        return allowed is None or field in allowed
+
+    def _chunk(self, document: Document) -> list[Chunk]:
+        chunking = self.cfg.ingestion.chunking
+        try:
+            return chunk_with_recipes(document, chunking.size, chunking.overlap, chunking.field_order, self.cfg.ingestion.line_recipe)
+        except LineRecordTooLong as exc:
+            raise ProjectionError("catalog", document.id, str(exc)) from exc
 
     def legacy_fingerprint(self) -> str | None:
         try:
@@ -220,16 +267,28 @@ class WritePath:
         delete_ids: Sequence[str] = (),
         rebuild: bool = False,
         allow_partial: bool = False,
+        manifest_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """``manifest_extra`` adds content-free sections to the generation manifest (log compose: the
+        partitions the generation was composed from); existing keys cannot be overridden."""
         started = time.perf_counter()
         cfg = self.cfg
         documents = [to_v2_document(d) for d in documents]
         if len({d.id for d in documents}) != len(documents):
             raise ValueError("duplicate document IDs in input")
+        attach_reports: list[dict[str, Any]] = []
+        if cfg.ingestion.attach:  # one-to-one attributes from pinned read-only SQLite files (opt-in)
+            from .attach import apply_attachments
+
+            documents, attach_reports = apply_attachments(documents, cfg.ingestion.attach)
         if any(d.dataset != cfg.dataset for d in documents):
             raise ValueError("document dataset must match configured dataset")
         if set(delete_ids) & {d.id for d in documents}:
             raise ValueError("cannot upsert and delete the same ID")
+        # The pattern library is (re)loaded once per build, before anything is written: a lint
+        # error fails the build here, and the whole build sees one library (one reuse salt).
+        prepare = getattr(self.extractor, "prepare_build", None)
+        self._patterns = prepare() if callable(prepare) else None
         with self.registry.lock() as lease:
             previous: GenerationId | None = None
             existing: dict[str, Document] = {}
@@ -246,8 +305,11 @@ class WritePath:
             for doc_id in delete_ids:
                 existing.pop(doc_id, None)
             redactions: dict[str, int] = {}
+            from ..privacy import safe_redactor
+
+            safe = safe_redactor(cfg.privacy)  # None under privacy.engine: legacy
             for document in documents:
-                document, counts = redact_document(document, cfg.privacy)
+                document, counts = redact_document(document, cfg.privacy, safe)
                 existing[document.id] = document
                 for label, count in counts.items():
                     redactions[label] = redactions.get(label, 0) + count
@@ -266,6 +328,12 @@ class WritePath:
             reached: list[tuple[str, str]] = []
             try:
                 manifest = self._build(gen, corpus, policy, reached, redactions, started)
+                if attach_reports:
+                    manifest["attach"] = attach_reports  # this build's input only (incremental builds attach new documents)
+                for key, value in (manifest_extra or {}).items():
+                    if key in manifest:
+                        raise ValueError(f"manifest_extra cannot override manifest key {key!r}")
+                    manifest[key] = value
                 if policy.coverage.incomplete and not allow_partial:
                     stage = next(n for n, s in policy.coverage.stages.items() if s.status == "incomplete")
                     raise PolicyViolation("incomplete_stage", policy.coverage.stages[stage].first_unprocessed, f"stage {stage} is incomplete; pass allow_partial to activate a partial generation", stage=stage)
@@ -316,6 +384,11 @@ class WritePath:
                 before = self.generations.active(holder, gen.dataset)
                 self.generations.activate(holder, gen, manifest, expected=before)
                 moved.append((holder, before))
+                # read the pointer back the way a request will: a backend that cannot recognise
+                # its own index names (O1) fails here, before CURRENT moves, and is compensated
+                served = self.generations.active(holder, gen.dataset)
+                if served != gen.generation:
+                    raise BackendError(holder.name, "activate", f"pointer reads back {served!r}, expected {gen.generation}")
             step = self.generations.authoritative.name
             self.registry.activate(manifest, expected=base)
         except BaseException as exc:
@@ -366,6 +439,10 @@ class WritePath:
                     left.append({"backend": name, "generation": generation, "error": str(exc)})
                     continue
                 deleted.append(name)
+            ledger = self._facet("ledger")
+            if isinstance(ledger, extras.LedgerRetention) and not left:
+                # the generation references nothing any more; unreferenced keys go at the next purge
+                ledger.purge(extras.PurgeSpec(drop_refs_of=[generation]))
             return {"generation": generation, "deleted": deleted, "left_for_cleanup": left}
 
     def _distinct_backends(self) -> list[Any]:
@@ -424,6 +501,12 @@ class WritePath:
         }
 
     def _cleanup(self, gen: GenerationId, failure: dict[str, Any]) -> None:
+        ledger = self._facet("ledger")
+        if isinstance(ledger, extras.LedgerRetention):
+            try:  # a failed build references nothing; its keys become unreferenced for retention
+                ledger.purge(extras.PurgeSpec(drop_refs_of=[gen.generation]))
+            except BackendError as exc:
+                failure["left_for_cleanup"].append({"backend": self.slots["ledger"], "kind": "ledger_refs", "generation": gen.generation, "error": str(exc)})
         for holder in self.generations.holders:
             try:
                 _delete_on(holder.backend, gen)
@@ -434,7 +517,6 @@ class WritePath:
 
     def _build(self, gen: GenerationId, corpus: list[Document], policy: ExtractionPolicy, reached: list[str], redactions: dict[str, int], started: float) -> dict[str, Any]:
         cfg = self.cfg
-        chunking = cfg.ingestion.chunking
         ledger = self._facet("ledger")
         meter = IngestMeter(cfg.budgets.ingest, self.price_table)
         roles = cfg.models.roles
@@ -445,32 +527,79 @@ class WritePath:
             sequence[0] += 1
 
         log("start", policy=policy.name, fingerprint=gen.fingerprint)
-        chunks_by_doc = {d.id: chunk_document(d, chunking.size, chunking.overlap, chunking.field_order) for d in corpus}
-        all_chunks = [c for d in corpus for c in chunks_by_doc[d.id]]
-        # 1. catalog (authoritative), then the scope mirrors on secondary backends
+        self._refs: set[str] = set()
+        # 1. catalog (authoritative), then the scope mirrors on secondary backends, written in
+        # batches. A document of a kind excluded from lexical, vector and graph (``ingestion.
+        # projections``: the log rollups) needs its chunks only in the catalog: after the batch is
+        # written they are dropped and only their field shapes are kept (N10 memory budget).
+        chunks_by_doc: dict[str, list[Any]] = {}
+        all_chunks: list[Chunk] = []  # chunks of documents some other projection reads
+        total_chunks = 0
+        sample_chunks: list[Chunk] = []  # the first chunks in corpus order (catalog round-trip sample)
         reached.append((self.slots["catalog"], "catalog"))
-        self._facet("catalog").put_documents(gen, corpus, all_chunks)
-        for holder in self.generations.mirrors():
+        mirrors = self.generations.mirrors()
+        for holder in mirrors:
             reached.append((holder.name, "scope_mirror"))
-            holder.backend.catalog.put_documents(gen, corpus, all_chunks)
+        for start in range(0, max(len(corpus), 1), BUILD_BATCH):
+            batch = corpus[start : start + BUILD_BATCH]
+            batch_chunks: list[Chunk] = []
+            for document in batch:
+                parts = self._chunk(document)
+                batch_chunks.extend(parts)
+                total_chunks += len(parts)
+                if len(sample_chunks) < SAMPLE:
+                    sample_chunks.extend(parts[: SAMPLE - len(sample_chunks)])
+                if self._catalog_only(document.kind):
+                    chunks_by_doc[document.id] = [_shape(c.field) for c in parts]
+                else:
+                    chunks_by_doc[document.id] = parts
+                    all_chunks.extend(parts)
+            self._facet("catalog").put_documents(gen, batch, batch_chunks)
+            for holder in mirrors:
+                holder.backend.catalog.put_documents(gen, batch, batch_chunks)
+            del batch_chunks
+        kinds = {d.id: d.kind for d in corpus}
+        # projection exclusions (``ingestion.projections``; catalog and records hold every document)
+        lexical_chunks = [c for c in all_chunks if not self._excluded("lexical", kinds[c.document_id])]
+        vector_chunks = [c for c in all_chunks if self._embeds(kinds[c.document_id], c.field)]
         # 2. lexical
         if "lexical" in self.slots:
             reached.append((self.slots["lexical"], "lexical"))
             lexical = self._facet("lexical")
-            lexical.index(gen, all_chunks, [])
+            lexical.index(gen, lexical_chunks, [])
             lexical.refresh(gen)
         # 3. records (storage.records and the structured arm's backend)
-        records = [StructuredRecord(schema_id="document", id=d.id, values=document_values(d), provenance=Provenance(extractor="catalog")) for d in corpus]
-        for holder in self.generations.targets("records"):
+        catalog_provenance = Provenance(extractor="catalog")
+        record_targets = self.generations.targets("records")
+        for holder in record_targets:
             reached.append((holder.name, "records"))
-            holder.backend.records.upsert(gen, records, cfg.metadata_schema)
+        builder = None
+        if self.projection_spec is not None:
+            from ..projection.builder import ProjectionBuilder
+
+            builder = ProjectionBuilder(self.projection_spec, cfg.metadata_schema)
+        for start in range(0, max(len(corpus), 1), BUILD_BATCH):  # batched: the rows of one batch at a time
+            batch_docs = corpus[start : start + BUILD_BATCH]
+            records = [StructuredRecord(schema_id="document", id=d.id, values=document_values(d), provenance=catalog_provenance) for d in batch_docs]
+            for holder in record_targets:
+                holder.backend.records.upsert(gen, records, cfg.metadata_schema)
+            if builder is not None:  # the same batches feed the typed projection (text columns: the documents)
+                builder.add(records, batch_docs)
+        del records
+        projection_manifest = None
+        if builder is not None:
+            files, projection_manifest = builder.seal(gen)
+            for holder in self.generations.targets("projection"):
+                reached.append((holder.name, "projection"))
+                builder.write(holder.backend.relational, gen, files, projection_manifest)
+            del files, builder
         # 4. extraction under policy
         extraction_meter = meter.role(roles.extractor.price_key() if roles.extractor else None, "extraction")
         outputs, reused, llm_calls = self._extract(gen, corpus, chunks_by_doc, policy, extraction_meter, ledger)
         # 5. embeddings (streamed in batches; unchanged inputs reuse their stored vectors)
         if "vector" in self.slots:
             reached.append((self.slots["vector"], "vector"))
-        embedded = self._embed(gen, corpus, all_chunks, policy, meter, ledger)
+        embedded = self._embed(gen, corpus, vector_chunks, policy, meter, ledger)
         # 6. graph: canonical mentions, deduped relations, communities
         mentions: list[Entity] = []
         relations: list[Relation] = []
@@ -491,7 +620,15 @@ class WritePath:
         for mention in mentions:
             membership_map.setdefault(mention.id, set()).add(mention.span.document_id)
             names.setdefault(mention.id, mention.name)
-        communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed, cfg.communities.hierarchy)
+        community_import: dict[str, Any] | None = None
+        if cfg.communities.strategy == "imported":
+            from ..communities.imported import imported_communities
+
+            communities, community_import = imported_communities(cfg.communities.imported, {d.id for d in corpus}, all_chunks)
+        elif cfg.communities.strategy == "declared":
+            communities = declared_communities(corpus, mentions, cfg.communities.min_documents)
+        else:
+            communities = build_communities(cfg.communities.strategy, membership_map, names, cfg.communities.min_documents, cfg.communities.seed, cfg.communities.hierarchy)
         if cfg.communities.stats is not None:
             stats_cfg = cfg.communities.stats
             by_id = {d.id: d for d in corpus}
@@ -500,8 +637,10 @@ class WritePath:
                     community, by_id, membership_map, len(corpus), cfg.metadata_schema, stats_cfg.time_basis, stats_cfg.granularity, stats_cfg.top_entities, names
                 )
         report_meter = meter.role(roles.community.price_key() if roles.community else None, "community_reports")
-        communities = self._reports(communities, all_chunks, policy, report_meter)
-        memberships = [Membership(community_id=c.id, member_id=doc_id, basis="entity") for c in communities for doc_id in c.document_ids]
+        if community_import is None:  # imported communities carry their grounded reports already
+            communities = self._reports(communities, all_chunks, policy, report_meter)
+        basis = "declared" if cfg.communities.strategy in {"declared", "imported"} else "entity"
+        memberships = [Membership(community_id=c.id, member_id=doc_id, basis=basis) for c in communities for doc_id in c.document_ids]
         community_count = {doc_id: 0 for doc_id in per_doc}
         for membership in memberships:
             community_count[membership.member_id] += 1
@@ -515,12 +654,13 @@ class WritePath:
         for document in corpus:
             parts = chunks_by_doc[document.id]
             counts = per_doc[document.id]
+            dense_parts = [c for c in parts if self._embeds(document.kind, c.field)]
             log(
                 "document_status",
                 document_id=document.id,
                 chunks=len(parts),
-                dense=("indexed" if embedded is not None and all(c.id in embedded.ids for c in parts) else "incomplete") if parts else "empty",
-                lexical="indexed" if parts else "empty",
+                dense=("indexed" if embedded is not None and all(c.id in embedded.ids for c in dense_parts) else "incomplete") if dense_parts else ("excluded" if parts else "empty"),
+                lexical=("excluded" if self._excluded("lexical", document.kind) else "indexed") if parts else "empty",
                 structured="canonical_record",
                 extraction=policy.document_status(document.id),
                 entities=counts["entities"],
@@ -535,8 +675,10 @@ class WritePath:
                 community_memberships=community_count[document.id],
             )
         # 8. per-projection validation
-        projections = self._validate_projections(gen, corpus, all_chunks, embedded)
+        projections = self._validate_projections(gen, corpus, sample_chunks, embedded, lexical_chunks, vector_chunks, total_chunks=total_chunks)
         projections.update(self._validate_graph(gen, corpus, mentions, communities, memberships))
+        if projection_manifest is not None:
+            projections["projection"] = self._validate_typed_projection(gen, projection_manifest)
         facts = [r for r in relations if r.edge_kind == "fact"]
         co_occurrences = [r for r in relations if r.edge_kind == "co_occurrence"]
         manifest = {
@@ -551,13 +693,16 @@ class WritePath:
             "policy": policy.name,
             "status": policy.manifest_status(),
             "documents": len(corpus),
-            "chunks": len(all_chunks),
+            "chunks": total_chunks,
             "entities": len(mentions),
             "relations": len(facts),
             "relation_occurrences": sum(len(r.occurrences) for r in facts),
             "co_occurrence_relations": len(co_occurrences),
+            # header-scoped attribute links of the pattern extractor (edge kind ``native_link``)
+            "native_link_relations": sum(1 for r in relations if r.edge_kind == "native_link"),
             "co_occurrence_occurrences": sum(len(r.occurrences) for r in co_occurrences),
             "communities": len(communities),
+            **({"community_import": community_import} if community_import is not None else {}),
             "reused_extractions": reused,
             "seconds": time.perf_counter() - started,
             "redactions_in_input": redactions,
@@ -567,9 +712,12 @@ class WritePath:
             "imported_embeddings": embedded.imported if embedded else 0,
             **({"precomputed_vectors": embedded.precomputed} if embedded and embedded.precomputed else {}),
             "budget": meter.summary(),
-            "incremental": INCREMENTAL,
+            "incremental": INCREMENTAL if projection_manifest is None else {**INCREMENTAL, "rebuilt": [*INCREMENTAL["rebuilt"], "projection"]},
+            # a local provider has no endpoint: its (default) base_url is not reported (P13)
             "embedding": {
-                **cfg.models.roles.embedder.model_dump(mode="json", exclude={"precomputed"}),
+                **cfg.models.roles.embedder.model_dump(
+                    mode="json", exclude={"precomputed", "base_url"} if cfg.models.roles.embedder.provider in {"hash", "sentence_transformers"} else {"precomputed"}
+                ),
                 **({"precomputed": cfg.models.roles.embedder.precomputed.identity()} if cfg.models.roles.embedder.precomputed is not None else {}),
             },
             "embedding_recipe": self.embedding_recipe(),
@@ -578,19 +726,55 @@ class WritePath:
             "backends": dict(sorted(self.slots.items())),
             "generations": self.generations.manifest_entry(gen),
         }
-        log("manifest", status=manifest["status"], documents=len(corpus), chunks=len(all_chunks))
+        if projection_manifest is not None:
+            manifest["projection"] = {
+                "fingerprint": projection_manifest["fingerprint"],
+                "tables": {name: t["rows"] for name, t in projection_manifest["tables"].items()},
+                "rejected": sum(sum(t["rejected"].values()) for t in projection_manifest["tables"].values()),
+                "dangling": {name: r["dangling"] for name, r in projection_manifest["relations"].items()},
+                "tenant_files": len(projection_manifest["tenant_files"]),
+            }
+        patterns = getattr(self, "_patterns", None)
+        if patterns is not None:
+            # Build provenance, not identity: the library snapshot is stored content-addressed in
+            # the ledger and named here, so the generation serves with the library it was built with.
+            snapshot = json.dumps(patterns["snapshot"], sort_keys=True, ensure_ascii=False)
+            snapshot_key = f"pattern_library:{hashlib.sha256(snapshot.encode()).hexdigest()}"
+            ledger.put_raw(snapshot_key, snapshot, True)
+            manifest["pattern_provenance"] = patterns["provenance"]
+            manifest["pattern_library_snapshot"] = snapshot_key
+            self._refs.add(snapshot_key)
+        if isinstance(ledger, extras.LedgerRetention):
+            # Reference-based retention (addendum A1 §3.8.3 B6/n2): every ledger key this generation
+            # uses goes to the ``ledger_refs`` side table; the manifest keeps only count and sha.
+            refs = sorted(self._refs)
+            ledger.add_refs(gen.generation, refs)
+            manifest["ledger_refs_count"] = len(refs)
+            manifest["ledger_refs_sha"] = hashlib.sha256("\n".join(refs).encode()).hexdigest()
+        log("manifest", status=manifest["status"], documents=len(corpus), chunks=total_chunks)
         return manifest
 
     def _extract(self, gen: GenerationId, corpus: list[Document], chunks_by_doc: dict[str, list[Chunk]], policy: ExtractionPolicy, budget: Any, ledger: Any):
         outputs: dict[str, list[ExtractionOutput]] = {}
         recipe = (self.extractor.recipe_fingerprint() or "none")[:16]
+        # Reuse salt (addendum §3.4.3): empty for every extractor but ``pattern``, so existing keys
+        # (and ledgers) are unchanged; a library change re-extracts without touching the fingerprint.
+        salt = (getattr(self, "_patterns", None) or {}).get("salt", "")
+        prefix = f"extraction:{recipe}:{salt[:16]}:" if salt else f"extraction:{recipe}:"
         reused = llm_calls = processed = 0
         total = sum(len(v) for v in chunks_by_doc.values())
+        refs = getattr(self, "_refs", set())
         for document in corpus:
             parts = chunks_by_doc[document.id]
             collected: list[ExtractionOutput] = []
+            if self._excluded("graph", document.kind):  # projection exclusion: no graph rows, no extraction
+                processed += len(parts)
+                policy.accept_document(document.id)
+                outputs[document.id] = []
+                continue
             for chunk in parts:
-                key = f"extraction:{recipe}:{chunk.id}"
+                key = f"{prefix}{chunk.id}"
+                refs.add(key)
                 cached = ledger.get_raw(key)
                 if cached is not None and cached.valid:
                     collected.append(ExtractionOutput.model_validate_json(cached.raw_reply))
@@ -614,6 +798,7 @@ class WritePath:
                     break
                 for raw in result.raw_replies:
                     ledger.put_raw(raw.key, raw.raw_reply, raw.valid)
+                    refs.add(raw.key)
                 llm_calls += result.calls
                 ledger.put_raw(key, result.output.model_dump_json(), True)
                 collected.append(result.output)
@@ -695,6 +880,7 @@ class WritePath:
                 window = chunks[start : start + role.batch_size]
                 texts = [self.embedding_input(titles[c.document_id], c) for c in window]
                 keys = [self.embedding_key(recipe_sha, t) for t in texts]
+                getattr(self, "_refs", set()).update(keys)
                 if imported is not None:
                     # Imported rows are matched by (document, field, exact text digest), never by position.
                     rows = [imported.lookup(c.document_id, c.field, c.text) for c in window]
@@ -777,7 +963,31 @@ class WritePath:
         policy.stage_complete("community_reports", len(communities))
         return done
 
-    def _validate_projections(self, gen: GenerationId, corpus: list[Document], chunks: list[Chunk], embedded: "Embedded | None") -> dict[str, Any]:
+    def _validate_typed_projection(self, gen: GenerationId, expected: dict[str, Any]) -> dict[str, Any]:
+        """Every target holds the sealed manifest and every file with the recorded sha256."""
+        from ..projection.builder import MANIFEST
+
+        for holder in self.generations.targets("projection"):
+            facet = holder.backend.relational
+            raw = facet.read_file(gen, MANIFEST)
+            if raw is None or json.loads(raw) != expected:
+                raise ProjectionError("projection", None, f"{holder.name}: sealed manifest missing or different")
+            for name, digest in expected["files"].items():
+                data = facet.read_file(gen, name)
+                if data is None or hashlib.sha256(data).hexdigest() != digest:
+                    raise ProjectionError("projection", name, f"{holder.name}: projection file missing or different")
+        return {"backend": self.slots["projection"], "files": len(expected["files"]), "fingerprint": expected["fingerprint"], "verified": True}
+
+    def _validate_projections(
+        self,
+        gen: GenerationId,
+        corpus: list[Document],
+        chunks: list[Chunk],
+        embedded: "Embedded | None",
+        lexical_chunks: list[Chunk] | None = None,
+        vector_chunks: list[Chunk] | None = None,
+        total_chunks: int | None = None,
+    ) -> dict[str, Any]:
         """Counts against the catalog and a sample of ids round-tripping through every target: the
         same sampled chunk ids must come back from the catalog, every scope mirror, the lexical and
         vector projections (with the catalog's document id), and their documents from every records
@@ -786,23 +996,25 @@ class WritePath:
         catalog = self._facet("catalog")
         counts = extras.require(self.backends[self.slots["catalog"]], extras.CatalogCounts, "catalog", "validate")
         _expect("catalog", counts.count_documents(gen), len(corpus), "documents")
-        _expect("catalog", counts.count_chunks(gen), len(chunks), "chunks")
+        # ``chunks`` is every chunk, or (with ``total_chunks``) the first ones in corpus order
+        n_chunks = len(chunks) if total_chunks is None else total_chunks
+        _expect("catalog", counts.count_chunks(gen), n_chunks, "chunks")
         sample = chunks[:SAMPLE]
         fetched = {c.id: c for c in catalog.get_chunks(gen, [c.id for c in sample])}
         for chunk in sample:
             if fetched.get(chunk.id) != chunk:
                 raise ProjectionError("catalog", chunk.id, "sampled chunk did not round-trip")
-        results["catalog"] = {"backend": self.slots["catalog"], "documents": len(corpus), "chunks": len(chunks), "verified": True}
+        results["catalog"] = {"backend": self.slots["catalog"], "documents": len(corpus), "chunks": n_chunks, "verified": True}
         for holder in self.generations.mirrors():
             projection = f"scope_mirror:{holder.name}"
             mirror = extras.require(holder.backend, extras.CatalogCounts, "catalog", "validate")
             _expect(projection, mirror.count_documents(gen), len(corpus), "documents")
-            _expect(projection, mirror.count_chunks(gen), len(chunks), "chunks")
+            _expect(projection, mirror.count_chunks(gen), n_chunks, "chunks")
             mirrored = {c.id: c for c in holder.backend.catalog.get_chunks(gen, [c.id for c in sample])}
             for chunk in sample:
                 if mirrored.get(chunk.id) != chunk:
                     raise ProjectionError(projection, chunk.id, "sampled chunk did not round-trip through the scope mirror")
-            results[projection] = {"backend": holder.name, "documents": len(corpus), "chunks": len(chunks), "verified": True}
+            results[projection] = {"backend": holder.name, "documents": len(corpus), "chunks": n_chunks, "verified": True}
         sampled_documents = list(dict.fromkeys([*(d.id for d in corpus[:SAMPLE]), *(c.document_id for c in sample)]))
         for holder in self.generations.targets("records"):
             projection = _projection_key("records", holder.name, self.generations.placement)
@@ -812,11 +1024,13 @@ class WritePath:
                 if not records.exists(gen, "id", document_id, []):
                     raise ProjectionError(projection, document_id, "sampled record is not queryable")
             results[projection] = {"backend": holder.name, "rows": len(corpus), "verified": True}
+        lexical_chunks = chunks if lexical_chunks is None else lexical_chunks
+        vector_chunks = chunks if vector_chunks is None else vector_chunks
         if "lexical" in self.slots:
             holder = self.generations.targets("lexical")[0]
             lexical = extras.require(holder.backend, extras.Countable, "lexical", "validate")
-            _expect("lexical", lexical.count(gen), len(chunks), "indexed chunks")
-            for chunk in sample:
+            _expect("lexical", lexical.count(gen), len(lexical_chunks), "indexed chunks")
+            for chunk in lexical_chunks[:SAMPLE]:
                 # Words the lexical analyzer keeps (an ASCII-only tokenizer drops non-ASCII words).
                 analyze = getattr(lexical, "analyze", None)
                 words = [w for w in chunk.text.split() if w.isalnum() and (analyze is None or analyze(w))][:3]
@@ -828,13 +1042,13 @@ class WritePath:
                     raise ProjectionError("lexical", chunk.id, "sampled chunk is not visible after refresh")
                 if found[chunk.id] != chunk.document_id:
                     raise ProjectionError("lexical", chunk.id, "sampled chunk carries another document id than the catalog")
-            results["lexical"] = {"backend": holder.name, "rows": len(chunks), "verified": True, "analyzer_id": self.generations.analyzer_id(holder, gen)}
+            results["lexical"] = {"backend": holder.name, "rows": len(lexical_chunks), "verified": True, "analyzer_id": self.generations.analyzer_id(holder, gen)}
         if "vector" in self.slots:
             vector = self._facet("vector")
             expected = len(embedded.ids) if embedded is not None else 0
             _expect("vector", vector.count(gen), expected, "vectors")
-            complete = expected == len(chunks)
-            for chunk in sample:
+            complete = expected == len(vector_chunks)
+            for chunk in vector_chunks[:SAMPLE]:
                 if embedded is None or chunk.id not in embedded.sample:
                     continue
                 hits = vector.search(gen, np.asarray(embedded.sample[chunk.id]), Scope(document_ids=[chunk.document_id]), 1)
@@ -911,6 +1125,23 @@ class ActivationError(RuntimeError):
         super().__init__(f"activation failed on {backend!r}: {type(cause).__name__}: {cause}{suffix}; CURRENT unchanged")
 
 
+def chunking_recipe(cfg: Any) -> dict[str, Any]:
+    """Chunking part of the index recipe; ``ingestion.line_recipe`` and ``ingestion.projections``
+    (addendum A1 L3a) enter only when set, so existing fingerprints are unchanged."""
+    ingestion = cfg.ingestion
+    recipe = ingestion.chunking.model_dump(mode="json")
+    if getattr(ingestion, "line_recipe", None) is not None:
+        recipe["line_recipe"] = ingestion.line_recipe.model_dump(mode="json")
+    if getattr(ingestion, "projections", None) is not None:
+        recipe["projections"] = ingestion.projections.model_dump(mode="json")
+    return recipe
+
+
+def recipe_fingerprint_of(recipe: dict[str, Any]) -> str:
+    """The index fingerprint of an index recipe (``WritePath.index_recipe``)."""
+    return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
+
+
 def _backend_recipe(spec: Any) -> dict[str, Any]:
     """A backend's part of the index recipe; a backend config may narrow its dump (``recipe()``)."""
     recipe = getattr(spec, "recipe", None)
@@ -933,6 +1164,28 @@ def _conflict(exc: BaseException) -> WriteConflict | None:
     if isinstance(exc, ActivationError) and isinstance(exc.cause, WriteConflict):
         return exc.cause
     return None
+
+
+BUILD_BATCH = 5000  # documents per catalog/records write batch
+
+
+class _ChunkShape:
+    """The field of a dropped chunk of a catalog-only document (status reporting needs no more)."""
+
+    __slots__ = ("field",)
+
+    def __init__(self, field: str):
+        self.field = field
+
+
+_SHAPES: dict[str, _ChunkShape] = {}
+
+
+def _shape(field: str) -> _ChunkShape:
+    shape = _SHAPES.get(field)
+    if shape is None:
+        shape = _SHAPES[field] = _ChunkShape(field)
+    return shape
 
 
 def _expect(projection: str, actual: int, expected: int, what: str) -> None:

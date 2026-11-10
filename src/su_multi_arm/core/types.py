@@ -18,7 +18,9 @@ from ..models import StrictModel, UnsupportedConstraint, UnsupportedReason  # no
 
 JsonScalar = str | int | float | bool | None
 MatchLevel = Literal["exact", "normalised", "relocated"]
-EdgeKind = Literal["fact", "co_occurrence", "mention", "native_link", "derived"]
+# ``co_firing`` (addendum A2 §4.1.3): statistical co-occurrence of two signatures in hourly cells,
+# anchored in an ``incident`` header; never traversed unless a template or request admits it.
+EdgeKind = Literal["fact", "co_occurrence", "mention", "native_link", "derived", "co_firing"]
 Support = Literal["trigger_in_span", "entailment_checked", "unchecked"]
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
 HEX32 = re.compile(r"[0-9a-f]{32}")
@@ -287,9 +289,28 @@ class FieldSpec(StrictModel):
     # values). Declared by the operator, never inferred; ``negate`` sets match records whose value
     # is unknown (null) too, and every result reports how many of those it counted.
     states: list[NamedState] = Field(default_factory=list)
+    # ``false`` for a value that does not add up across records (a per-row percentile such as a
+    # p95 latency): the structured arm refuses ``sum``/``avg`` over it (``measure_unsupported``);
+    # per-row values, ``min`` and ``max`` stay exact (addendum A2 §4.1.2).
+    additive: bool = True
+    # Count semantics (addendum A1 §3.9.1, B2): ``exactness`` (values ``exact``/``approximate``):
+    # a record store reports the worst value over the matched rows as the result's exactness;
+    # ``basis`` / ``extraction``: the distinct values over the matched rows are returned in
+    # ``ScopeResult.applied_basis`` / ``applied_extraction``. ``None``: an ordinary field.
+    role: Literal["exactness", "basis", "extraction"] | None = None
+    # Reviewed meaning of the field for a planner (typed-query plan §5.8): role, unit, timezone/time
+    # role and what it does not mean. Untrusted planner data; required for every column of an
+    # enabled ``projection`` (unless the projection table overrides it).
+    description: str | None = Field(default=None, min_length=1, max_length=1000)
 
     @model_validator(mode="after")
     def coherent(self):
+        if self.role is not None and self.type not in {"string", "enum"}:
+            raise ValueError(f"field {self.name}: role {self.role} needs a string or enum field")
+        if self.role == "exactness" and self.type == "enum" and not set(self.enum_values or []) <= {"exact", "approximate"}:
+            raise ValueError(f"field {self.name}: an exactness field takes the values exact and approximate")
+        if not self.additive and self.type not in {"integer", "number"}:
+            raise ValueError(f"field {self.name}: additive: false is only meaningful for integer/number fields")
         if self.states:
             if self.type not in {"string", "enum", "id"}:
                 raise ValueError(f"field {self.name}: states are only valid for string/enum/id fields")
@@ -475,10 +496,18 @@ class Measure(StrictModel):
     kind: MeasureKind = "count"
     field: str | None = None
     unit: str | None = None  # count_distinct(unit)
-    granularity: Literal["day", "month", "year"] | None = None  # bucket
+    granularity: Literal["hour", "day", "month", "year"] | None = None  # bucket
+    # bucket only (B3): the measure computed per bucket (``sum``/``avg``/``min``/``max`` of a
+    # numeric field, or ``count``); without it a bucket counts records.
+    of: Measure | None = None
 
     @model_validator(mode="after")
     def coherent(self):
+        if self.of is not None:
+            if self.kind != "bucket":
+                raise ValueError("of is only valid for a bucket measure")
+            if self.of.kind not in {"count", "sum", "avg", "min", "max"} or self.of.of is not None:
+                raise ValueError("a bucket's inner measure is count, sum, avg, min or max")
         if self.kind in {"min", "max", "avg", "sum", "first_seen", "last_seen", "bucket"} and not self.field:
             raise ValueError(f"measure {self.kind} requires a field")
         if self.kind == "bucket" and not self.granularity:
@@ -513,7 +542,8 @@ class TextMatch(StrictModel):
     role: Literal["scope", "numerator"] = "scope"
 
 
-Granularity = Literal["day", "month", "year"]
+Granularity = Literal["hour", "day", "month", "year"]
+MEASURE_SORT = "$measure"  # ``Sort(field="$measure")``: rank groups by their measure value (B3)
 
 
 class ScopeSpec(StrictModel):
@@ -535,11 +565,24 @@ class ScopeSpec(StrictModel):
     numerator: list[Predicate] = Field(default_factory=list)  # share: the numerator condition
     text: TextMatch | None = None  # literal topic via the lexical index (resolved by the structured arm)
     limit: int | None = Field(default=None, ge=1, le=10000)  # list: records shown (``total`` is reported)
+    # 2026-11-09 (corpus-B B5 q043): keep only groups with at least this many matched records
+    # (SQL ``HAVING COUNT(*) >= N``), applied before any ranking; needs ``group_by``
+    min_count: int | None = Field(default=None, ge=1, le=1_000_000)
 
     @model_validator(mode="after")
     def coherent(self):
-        if len(self.group_by) > 2:
-            raise ValueError("group_by takes at most two fields (a cross-tab)")
+        if self.min_count is not None and not self.group_by:
+            raise ValueError("min_count keeps groups with at least N records: it needs group_by")
+        if self.sort is not None and self.sort.field == MEASURE_SORT:
+            # ``$measure`` is the measure ranking: the same operation as ``order`` (kept as one).
+            if not self.group_by:
+                raise ValueError("sort $measure ranks groups: it needs group_by")
+            wanted = "desc" if self.sort.descending else "asc"
+            if self.order is not None and self.order != wanted:
+                raise ValueError("sort $measure and order disagree")
+            self.order, self.sort = wanted, None
+        if len(self.group_by) > 4:
+            raise ValueError("group_by takes at most four fields")
         if len(set(self.group_by)) != len(self.group_by):
             raise ValueError("group_by fields must differ")
         if self.nth is not None and not self.group_by:
@@ -564,6 +607,9 @@ class GroupRow(StrictModel):
     count: int = Field(ge=0)
     rank: int | None = Field(default=None, ge=1)  # dense rank when the scope ranks groups
     share: float | None = Field(default=None, ge=0, le=1)  # count / matched total (``with_share``)
+    # a ``share`` measure with a numerator, per group (B5 q043): the group's records matching the
+    # numerator; ``value`` is ``numerator / count``
+    numerator: int | None = Field(default=None, ge=0)
 
 
 class ListedRecord(StrictModel):
@@ -588,6 +634,14 @@ class ScopeResult(StrictModel):
     unknown: dict[str, int] = Field(default_factory=dict)  # field -> matched records with a null value under a negated predicate
     numerator: int | None = Field(default=None, ge=0)  # share: records matching the numerator
     basis: list[str] = Field(default_factory=list)  # human-readable labels: time basis, windows, text match, count unit
+    # Native aggregation (Lucene ``records.aggregation: native``): ``matched_ids`` holds the first
+    # ``matched_ids_cap`` matched ids in id order and this flag says more records matched (``total``
+    # is always the full count). The client path never truncates (it refuses above ``max_matched``).
+    matched_ids_truncated: bool = False
+    # Count semantics (B2): distinct values of the schema's ``role: basis`` / ``role: extraction``
+    # fields over the matched records (empty when the schema declares none).
+    applied_basis: list[str] = Field(default_factory=list)
+    applied_extraction: list[str] = Field(default_factory=list)
 
 
 class Page(StrictModel):

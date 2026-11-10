@@ -85,6 +85,11 @@ def runtime_ddl(rt: str) -> list[str]:
         f"CREATE TABLE IF NOT EXISTS {rt}.jobs(job_id text PRIMARY KEY, status text NOT NULL)",
         f"CREATE TABLE IF NOT EXISTS {rt}.raw_replies(key text PRIMARY KEY, raw_reply text NOT NULL, valid boolean NOT NULL)",
         f"CREATE TABLE IF NOT EXISTS {rt}.sessions(id text PRIMARY KEY, data text NOT NULL, last_seen_at double precision NOT NULL)",
+        # ledger retention side tables (addendum A1 §3.8.3)
+        f"CREATE TABLE IF NOT EXISTS {rt}.raw_tags(key text NOT NULL, tag text NOT NULL, PRIMARY KEY(key, tag))",
+        f"CREATE INDEX IF NOT EXISTS raw_tags_tag ON {rt}.raw_tags(tag)",
+        f"CREATE TABLE IF NOT EXISTS {rt}.ledger_refs(generation text NOT NULL, key text NOT NULL, PRIMARY KEY(generation, key))",
+        f"CREATE INDEX IF NOT EXISTS ledger_refs_key ON {rt}.ledger_refs(key)",
     ]
 
 

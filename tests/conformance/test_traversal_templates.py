@@ -57,3 +57,26 @@ def test_identical_semantics_on_neo4j(tmp_path):
     finally:
         backend.drop_namespace()
         backend.close()
+
+
+def test_an_attached_graph_layer_traverses_like_its_store(tmp_path):
+    """Unified merge M1b (§6.4): a graph served as an attached layer (``LayerBackend``/``MappedGraph``)
+    answers a unified generation with its store generation's traversals, unchanged; writes refused."""
+    from su_multi_arm.arms.traversal import run_template
+    from su_multi_arm.core.config_graph import GraphIntent
+    from su_multi_arm.core.errors import BackendError
+    from su_multi_arm.core.types import GenerationId
+    from su_multi_arm.ingestion.layers import MappedGraph
+
+    store = SqliteBackend(tmp_path / "s")
+    expected = _signatures(store)  # loads the fixture into the store generation (kit.GEN3)
+    unified = GenerationId(dataset=kit.GEN3.dataset, generation="c" * 32, index_format=kit.GEN3.index_format, fingerprint="d" * 64)
+    graph = MappedGraph(store.graph, lambda gen: kit.GEN3 if gen == unified else gen, "support_graph")
+    templates = kit.traversal_templates()
+    got = [
+        kit.traversal_signature(run_template(graph, unified, name, templates[name], GraphIntent(template=name, seeds=list(seeds)), scope))
+        for name, seeds, scope in kit.TRAVERSAL_CASES
+    ]
+    assert got == expected
+    with pytest.raises(BackendError, match="attached read-only"):
+        graph.upsert(unified, [], [], [])

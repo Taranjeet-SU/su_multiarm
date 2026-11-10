@@ -55,6 +55,15 @@ class ModelCapabilities:
     # The model thinks by default; thinking tokens count against ``max_tokens``.
     thinks_by_default: bool = False
     min_max_tokens: int | None = None  # a smaller role ``max_tokens`` is rejected
+    # Thinking control (2026-11-09; Anthropic ``thinking`` / ``output_config.effort``). ``thinking_types``
+    # are the wire types the model accepts (``enabled`` needs a token budget); ``thinking_off`` is how
+    # a role's ``thinking: off`` is realised (``disabled``, ``between_tools`` where the model cannot
+    # disable thinking, or ``omit`` where it does not think unless asked); ``effort_levels`` are the
+    # accepted ``effort`` values; ``off_max_effort``: ``off`` is accepted only up to this effort.
+    thinking_types: frozenset[str] = frozenset()
+    thinking_off: str | None = None
+    effort_levels: tuple[str, ...] = ()
+    off_max_effort: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +79,10 @@ class ModelCapabilities:
             "streaming": self.streaming,
             "thinks_by_default": self.thinks_by_default,
             "min_max_tokens": self.min_max_tokens,
+            "thinking_types": sorted(self.thinking_types),
+            "thinking_off": self.thinking_off,
+            "effort_levels": list(self.effort_levels),
+            "off_max_effort": self.off_max_effort,
         }
 
 
@@ -81,7 +94,19 @@ _OPENAI_MODES = frozenset({"none", "json_mode", "json_schema"})
 THINKING_MIN_MAX_TOKENS = 1024
 
 
-def _anthropic(pattern: str, native: bool, kind: NativeKind = "tool_use", thinks: bool = False) -> ModelCapabilities:
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
+def _anthropic(
+    pattern: str,
+    native: bool,
+    kind: NativeKind = "tool_use",
+    thinks: bool = False,
+    thinking: frozenset[str] = frozenset(),
+    off: str | None = None,
+    effort: tuple[str, ...] = (),
+    off_max_effort: str | None = None,
+) -> ModelCapabilities:
     return ModelCapabilities(
         provider="anthropic",
         pattern=pattern,
@@ -92,6 +117,10 @@ def _anthropic(pattern: str, native: bool, kind: NativeKind = "tool_use", thinks
         max_output_tokens_param="max_tokens",
         thinks_by_default=thinks,
         min_max_tokens=THINKING_MIN_MAX_TOKENS if thinks else None,
+        thinking_types=thinking,
+        thinking_off=off,
+        effort_levels=effort,
+        off_max_effort=off_max_effort,
     )
 
 
@@ -117,10 +146,15 @@ REGISTRY: tuple[ModelCapabilities, ...] = (
     _anthropic("claude-3*", True),
     _anthropic("claude-sonnet-4*", True),
     _anthropic("claude-opus-4*", True),
-    _anthropic("claude-haiku-4*", True),
-    _anthropic("claude-sonnet-5*", True, "output_format"),
+    # Thinking types and effort levels (2026-11-09) are the ones the provider's model-capabilities
+    # endpoint reports for claude-haiku-4-5, claude-haiku-5-5 and claude-sonnet-5-5 (read 2026-11-09,
+    # no tokens spent); other ids declare none, so a thinking/effort key is rejected for them.
+    _anthropic("claude-haiku-4*", True, thinking=frozenset({"enabled", "disabled"}), off="omit"),
+    _anthropic("claude-sonnet-5*", True, "output_format", thinking=frozenset({"adaptive", "between_tools"}), off="between_tools", effort=EFFORT_LEVELS),
     _anthropic("claude-opus-5*", True),
-    _anthropic("claude-haiku-5*", True, "output_format", thinks=True),
+    _anthropic(
+        "claude-haiku-5*", True, "output_format", thinks=True, thinking=frozenset({"adaptive", "disabled"}), off="disabled", effort=EFFORT_LEVELS, off_max_effort="high"
+    ),
     _anthropic("*", False),
     # OpenAI: native = ``response_format: json_schema`` with ``strict: true``. Snapshots that
     # predate structured outputs are carved out before their family.
@@ -169,6 +203,9 @@ def check_role(
     reasoning_effort: str | None = None,
     max_tokens_parameter: str | None = None,
     max_tokens: int | None = None,
+    thinking: str | None = None,
+    thinking_budget_tokens: int | None = None,
+    effort: str | None = None,
 ) -> list[tuple[str, str]]:
     """Static checks of a chat role against the registry: ``[(key, message), ...]``, empty when valid."""
     try:
@@ -210,6 +247,7 @@ def check_role(
         problems.append(
             ("max_tokens_parameter", f"({provider}, {model}) takes {caps.max_output_tokens_param}, not {max_tokens_parameter}")
         )
+    problems.extend(thinking_problems(caps, provider, model, structured_output, max_tokens, thinking, thinking_budget_tokens, effort))
     if max_tokens is not None and caps.min_max_tokens is not None and max_tokens < caps.min_max_tokens:
         problems.append(
             (
@@ -218,6 +256,77 @@ def check_role(
                 f"max_tokens {max_tokens} is below the minimum {caps.min_max_tokens}",
             )
         )
+    return problems
+
+
+def thinking_mode(thinking: str | None, thinking_budget_tokens: int | None) -> str | None:
+    """The role's requested thinking: ``thinking``, or ``enabled`` when only a budget is given."""
+    if thinking is None and thinking_budget_tokens is not None:
+        return "enabled"
+    return thinking
+
+
+def thinking_wire(caps: ModelCapabilities, thinking: str | None, thinking_budget_tokens: int | None) -> dict[str, Any] | None:
+    """The Anthropic ``thinking`` request field for a validated role, ``None`` when none is sent.
+    ``off`` follows the model (``thinking_off``): ``disabled``, ``between_tools`` (a model that cannot
+    disable thinking) or nothing (a model that does not think unless asked)."""
+    mode = thinking_mode(thinking, thinking_budget_tokens)
+    if mode is None:
+        return None
+    if mode == "off":
+        mode = caps.thinking_off or "omit"
+        if mode == "omit":
+            return None
+    if mode == "enabled":
+        return {"type": "enabled", "budget_tokens": thinking_budget_tokens}
+    return {"type": mode}
+
+
+def thinking_problems(
+    caps: ModelCapabilities,
+    provider: str,
+    model: str,
+    structured_output: str,
+    max_tokens: int | None,
+    thinking: str | None,
+    thinking_budget_tokens: int | None,
+    effort: str | None,
+) -> list[tuple[str, str]]:
+    """Per-model thinking/effort rules (2026-11-09): only declared thinking types and effort levels;
+    ``off`` only where the registry says how to realise it (and, on Haiku 5.x, only at effort up to
+    ``high``); ``enabled`` needs ``thinking_budget_tokens`` below ``max_tokens``; a thinking model
+    cannot be forced to call a tool (native ``tool_use``)."""
+    mode = thinking_mode(thinking, thinking_budget_tokens)
+    problems: list[tuple[str, str]] = []
+    if mode is None and effort is None:
+        return problems
+    if provider != "anthropic":
+        key = "thinking" if mode is not None else "effort"
+        return [(key, f"{key} is an Anthropic role key; ({provider}, {model}) takes reasoning_effort")]
+    if effort is not None and effort not in caps.effort_levels:
+        declared = ", ".join(caps.effort_levels) or "none"
+        problems.append(("effort", f"effort: {effort} is not declared for ({provider}, {model}) (declared: {declared})"))
+    if mode is None:
+        return problems
+    declared_types = ", ".join(sorted(caps.thinking_types)) or "none"
+    if mode == "off":
+        if caps.thinking_off is None:
+            problems.append(("thinking", f"thinking: off is not declared for ({provider}, {model}) (thinking types: {declared_types})"))
+        elif caps.off_max_effort is not None and effort is not None and EFFORT_LEVELS.index(effort) > EFFORT_LEVELS.index(caps.off_max_effort):
+            problems.append(("thinking", f"({provider}, {model}) accepts thinking: off only at effort {caps.off_max_effort} or lower, not {effort}"))
+        return problems
+    if mode not in caps.thinking_types:
+        problems.append(("thinking", f"thinking: {mode} is not declared for ({provider}, {model}) (thinking types: {declared_types})"))
+        return problems
+    if mode == "enabled":
+        if thinking_budget_tokens is None:
+            problems.append(("thinking_budget_tokens", "thinking: enabled needs thinking_budget_tokens (at least 1024)"))
+        elif max_tokens is not None and thinking_budget_tokens >= max_tokens:
+            problems.append(("thinking_budget_tokens", f"thinking_budget_tokens {thinking_budget_tokens} must be below max_tokens {max_tokens}"))
+    elif thinking_budget_tokens is not None:
+        problems.append(("thinking_budget_tokens", f"thinking_budget_tokens applies to thinking: enabled only, not {mode}"))
+    if structured_output == "native" and caps.native_kind == "tool_use" and mode in {"enabled", "adaptive"}:
+        problems.append(("thinking", f"({provider}, {model}) realises native structured output as a forced tool call, which cannot think; use structured_output: none or thinking: off"))
     return problems
 
 

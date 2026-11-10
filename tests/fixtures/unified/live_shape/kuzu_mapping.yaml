@@ -1,0 +1,24 @@
+# Synthetic live-shape fixture (unified merge plan F0): invented values; materialize() fills the sha256 placeholders.
+dataset: support_fixture
+any_generation: true
+nodes:
+- table: Ticket
+  type: issue
+  name: title
+  document:
+    column: id
+    pattern: ^(ticket:[0-9]+)$
+  mention_text: body
+- table: Symptom
+  type: symptom
+- table: Fix
+  type: fix
+edges:
+- table: HAS_SYMPTOM
+  predicate: has_symptom
+  document_pattern: ^(ticket:[0-9]+)
+  verified: verified
+- table: RESOLVED_BY
+  predicate: resolved_by
+  document_pattern: ^(ticket:[0-9]+)
+  verified: verified

@@ -39,10 +39,24 @@ Precision exclusions (2.0.0a2 release review N1; negative fixtures in
   quantifier such as "Only"/"About") is a version ("Windows 10 users", "Python 3 files");
 * a unit directly followed by a head noun it modifies is not the counted population ("there is no
   error message", "no error codes");
+* (QA-20261109-07) a singular unit in the possessive owns the following noun and is not a count
+  ("this is one ticket's resolution", "a record's owner"); a plural possessive ("12 tickets'
+  owners") still states 12 records;
 * ``the only <unit>`` is an exhaustive list only with a plural unit ("the only file you need" is
   not; "the only pending tickets are ..." is);
 * "complete/full list of <noun>" is an exhaustive list only when ``<noun>`` is a unit ("the complete
   list of supported currencies" is not); a bare "that is the complete list" still is.
+
+Disclaimers (2026-11-08 parity fix; ``tests/unit/test_parity_fixes_contract.py``): a completeness
+phrase that the sentence **denies** or only **advises** is not an exhaustive-list statement: a
+negation within six words before it in the same sentence ("this is not a complete list", "no
+complete list of the 35 records is available", "does not claim they are the full set") or an
+advice sentence (one that starts with an imperative such as "Re-run", "Filter", "Export", "Check",
+or "To get/confirm/see ...", or a phrase "to get/obtain/confirm/see/export the full list"). Neither
+claims that the answer's list is complete. A completeness phrase without such a denial is still an
+exhaustive-list statement. Also not statements: a unit used as a field label ("Zero match: false"),
+a double negative ("no zero match") and a property of counted records ("6 tickets have no priority
+recorded": the records have no value, which is a count, not an absence of records).
 """
 
 from __future__ import annotations
@@ -57,7 +71,7 @@ from ..models import StrictModel
 
 LANGUAGE = "en"
 StatementKind = Literal["count", "exhaustive_list", "absence"]
-__all__ = ["COUNT_NOUNS", "LANGUAGE", "Statement", "StatementKind", "detect_statements", "population_frame", "stated_number", "units_for"]
+__all__ = ["COUNT_NOUNS", "LANGUAGE", "Statement", "StatementKind", "completeness_disclaimed", "detect_statements", "population_frame", "stated_number", "units_for"]
 _NUMBER_WORDS = (
     "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
     "sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|a dozen|dozens of|hundreds of"
@@ -81,6 +95,14 @@ _TOTAL_STATEMENT = re.compile(
     re.I,
 )
 _QUESTION_UNIT = re.compile(r"\b(?:how many|number of|count of|list (?:all|every)|show (?:me )?(?:all|every)|are there any)\s+((?:[\w'-]+\s*){1,3})", re.I)
+
+
+# Function words and auxiliaries after "how many" that are not the counted noun ("How many are
+# classified as X?": "are" is no unit; 2026-11-08 parity fix).
+_QUESTION_FILLER = frozenset(
+    "are were was is have has had did does there the with from for and been being they them these those that which who "
+    "currently still also already ever exactly".split()
+)
 
 
 class Statement(StrictModel):
@@ -110,7 +132,7 @@ def units_for(targets: Sequence[str], question: str | None) -> list[str]:
     if question:
         for match in _QUESTION_UNIT.finditer(question):
             for word in re.findall(r"[^\W\d_][\w'-]*", match.group(1)):
-                if len(word) > 2:
+                if len(word) > 2 and word.casefold() not in _QUESTION_FILLER:
                     words.update({word.casefold(), _plural(word)})
     return sorted(words, key=len, reverse=True)
 
@@ -120,7 +142,14 @@ def _unit_re(units: Sequence[str]) -> str:
 
 
 # Words that modify a following head noun ("error message"): the unit is then not the population.
-_HEAD_NOUNS = r"\s+(?:message|messages|code|codes|handling|text|dialog|dialogs|page|pages|log|logs|banner|popup|screen|prompt|box|type|types|rate|rates)\b"
+# ``passage``/``excerpt``/``snippet``: the supplied evidence, not the corpus ("none of the ticket
+# passages mention X" is about the retrieved text, not an absence of tickets).
+_HEAD_NOUNS = (
+    r"\s+(?:message|messages|code|codes|handling|text|dialog|dialogs|page|pages|log|logs|banner|popup|screen|prompt|box|type|types|rate|rates|"
+    r"passage|passages|excerpt|excerpts|snippet|snippets)\b"
+)
+# A singular possessive ("ticket's", "record’s"; QA-20261109-07): the unit owns the following noun.
+_POSSESSIVE = re.compile(r"['’]s\b", re.I)
 # Capitalised sentence words that may precede a count ("Only 12 tickets"); any other capitalised
 # word right before a number reads as a product name with a version ("Windows 10 users").
 _QUANTIFIERS = frozenset(
@@ -154,7 +183,7 @@ def stated_number(text: str) -> int | None:
 # "40% of 2048 records", "2,048 records as the denominator". The contract does not compare such a
 # number with the cited aggregate's count; the count in the same sentence is still compared.
 _POPULATION_BEFORE = re.compile(
-    r"(?:\bout\s+of|\bdenominator(?:\s+(?:is|was|of|reported\s+is))?\s*[:=]?|\b(?:ratio|share|proportion|fraction|percentage)\s+of|"
+    r"(?:\bout\s+of|\bdenominator(?:\s+(?:is|was|of|reported\s+is))?\s*[:=]?|\bdenominator(?:\s+[\w'-]+){1,4}?\s*(?:[:=]|\bis\b|\bwas\b)|\b(?:ratio|share|proportion|fraction|percentage)\s+of|"
     r"(?:%|\bpercent|\bper\s*cent)\s+of|\b(?:\d{1,3}(?:,\d{3})+|\d+)\s+(?:out\s+)?of|\bper|/)"
     r"\s*(?:(?:a|an|the|all|its|their)\s+)?(?:(?:total|reported|stated)\s+)?(?:denominator\s+of\s+)?(?:(?:about|roughly|approximately|nearly)\s+)?$",
     re.I,
@@ -174,6 +203,8 @@ def _number_is_label(answer: str, match: re.Match[str], kind: StatementKind, fie
     unit = match.groupdict().get("unit")
     if unit is not None and re.match(_HEAD_NOUNS, answer[match.end("unit") :], re.I):
         return True
+    if unit is not None and not _plural_unit(unit) and _POSSESSIVE.match(answer[match.end("unit") :]):
+        return True  # QA-07: "one ticket's resolution" names a property of one record, not a count
     if kind != "count" or unit is None:
         return False
     value = stated_number(match.group(0))
@@ -186,6 +217,75 @@ def _number_is_label(answer: str, match: re.Match[str], kind: StatementKind, fie
         if any(ch.isupper() for ch in word) and word.strip(",;:").casefold() not in _QUANTIFIERS and word[-1] not in ",;:":
             return True  # "Windows 10 users": a version after a product-like name
     return False
+
+
+# A completeness phrase that the sentence denies (2026-11-08 parity fix): a negation within six
+# words before the phrase, in the same sentence.
+_DENIAL = re.compile(
+    r"\b(?:not(?!\s+only)|no|never|nor|cannot|can't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|won't|without)\b"
+    r"(?:[\s,]+[\w'*-]+){0,6}?[\s,*]*$",
+    re.I,
+)
+# ... or right after it: "the full list is not available", "the complete set cannot be shown".
+_DENIAL_AFTER = re.compile(
+    r"^(?:\s+[\w'-]+){0,4}?\s+(?:(?:is|are|was|were)\s+(?:not|unavailable\b)\s*(?:available|provided|included|shown|given|listed|supplied|known|possible|part|in)?\b"
+    r"|(?:isn't|aren't|wasn't|weren't)\b|cannot\s+be\s+(?:given|shown|listed|provided|stated|confirmed)\b)",
+    re.I,
+)
+_ADVISORY = re.compile(r"\b(?:advice|advisory|suggest(?:s|ed|ion)?|recommend(?:s|ed|ation)?)\b", re.I)
+# Advice: an imperative sentence start ("Re-run ...", "To get the full list, ...") or an advisory
+# "to <verb> the full list/set" right before the phrase.
+_ADVICE_START = re.compile(
+    r"^[\s*_#>\-]*(?:\(?\s*advice[^)]*\)?\s*[:.-]?\s*)?(?:re-?run|run|filter|export|query|check|verify|confirm|request|pull|use|"
+    r"to\s+(?:get|obtain|confirm|see|view|export|produce|retrieve|build|list|count))\b",
+    re.I,
+)
+_ADVICE_BEFORE = re.compile(r"\b(?:to|and)\s+(?:get|obtain|confirm|see|view|export|produce|retrieve|build|list|request)\s+(?:the\s+|a\s+)?$|\bagainst\s+(?:the\s+)?$", re.I)
+_SENTENCE_START = re.compile(r"(?:[.!?](?=\s)|\n)[^.!?\n]*$")
+# Hypothetical or advisory completeness (2026-11-09 corpus-B fix F2): "getting the full list would
+# require a records export", "the complete list could be pulled with ...": a modal of possibility
+# right after the phrase; and an advisory gerund start ("Getting/Obtaining the full list requires
+# ...") together with a requirement verb after it. A parenthetical advice label after the phrase
+# ("the full list (advice: export ...)") is advice too. A plain "this is the full list" stays a claim.
+_HYPOTHETICAL_AFTER = re.compile(
+    r"^(?:\s+[\w'-]+){0,4}?\s+(?:would|could|might)\s+(?:only\s+)?(?:require|need|mean|take|involve|be\s+(?:available|possible|obtained|produced|pulled|exported))\b",
+    re.I,
+)
+_GERUND_START = re.compile(r"^[\s*_#>\-]*(?:getting|obtaining|seeing|viewing|producing|retrieving|exporting|pulling|building|confirming|listing)\b", re.I)
+_REQUIREMENT_AFTER = re.compile(r"^[^.!?\n]{0,60}?\b(?:requires?|needs?|would|will|calls\s+for|means)\b", re.I)
+_ADVICE_LABEL_AFTER = re.compile(r"^[^.!?\n]{0,80}?\(\s*(?:advice|advisory|suggestion|recommendation)\b", re.I)
+
+
+def completeness_disclaimed(answer: str, start: int, end: int | None = None) -> bool:
+    """The exhaustive-list phrase ``answer[start:end]`` is denied or only advised by its sentence
+    (see the module docstring): it does not claim that a list in the answer is complete."""
+    head = answer[:start]
+    boundary = _SENTENCE_START.search(head)
+    sentence = head[boundary.start() + 1 :] if boundary else head
+    if _DENIAL.search(sentence[-120:]) or _ADVICE_START.match(sentence) or _ADVICE_BEFORE.search(sentence[-60:]) or _ADVISORY.search(sentence):
+        return True
+    if end is not None:
+        tail = re.match(r"[^.!?\n]*", answer[end:])
+        rest = tail.group(0) if tail else ""
+        if _HYPOTHETICAL_AFTER.match(rest) or _ADVICE_LABEL_AFTER.match(rest):
+            return True
+        if _GERUND_START.match(sentence) and _REQUIREMENT_AFTER.match(rest):
+            return True
+        return bool(_DENIAL_AFTER.match(rest))
+    return False
+
+
+def _label_or_property(answer: str, match: re.Match[str], kind: StatementKind, units: str) -> bool:
+    """An absence/count fragment that is a field label ("Zero match: false"), a double negative
+    ("no zero match") or a property of counted records ("tickets have no priority recorded")."""
+    if kind != "absence":
+        return False
+    if re.match(r"\s*[:=]\s*(?:true|false|yes|no)\b", answer[match.end() :], re.I):
+        return True
+    before = answer[max(0, match.start() - 80) : match.start()]
+    if re.search(r"\bno\s+$", before, re.I) and match.group(0).casefold().startswith("zero"):
+        return True
+    return bool(match.group(0).casefold().startswith("no") and re.search(units + r"\s+(?:that\s+|which\s+)?(?:have|has|had|with|without)\s+$", before, re.I))
 
 
 def _normalise(text: str) -> str:
@@ -249,6 +349,10 @@ def detect_statements(
                 match, fragment = longer, longer.group(0)
             if kind == "exhaustive_list" and re.match(r"the\s+only\b", fragment, re.I) and not _plural_unit(match.group("unit")):
                 continue  # "the only file you need": uniqueness of one thing, not a list
+            if kind == "exhaustive_list" and completeness_disclaimed(answer, match.start(), match.end()):
+                continue  # "this is not a complete list": a disclaimer, not a completeness claim
+            if kind == "absence" and _label_or_property(answer, match, kind, unit):
+                continue
             found.append(Statement(kind=kind, text=fragment, start=match.start(), end=match.end()))
     for match in _TOTAL_STATEMENT.finditer(answer):  # QQ-03
         fragment = match.group(0)

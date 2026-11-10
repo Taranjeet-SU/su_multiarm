@@ -1,0 +1,18 @@
+{"field": "description", "id": "ticket:1001:d", "kind": "description", "parent_id": "ticket:1001", "seq": 0, "text": "Crawls of large sitemaps stop with timeouts after about forty minutes."}
+{"field": "resolution", "id": "ticket:1001:r", "kind": "resolution", "parent_id": "ticket:1001", "seq": 1, "text": "Raised the fetch timeout as described in https://docs.example.org/kb/crawler-timeouts and split the sitemap."}
+{"field": "description", "id": "ticket:1002:d", "kind": "description", "parent_id": "ticket:1002", "seq": 0, "text": "The staging crawl failed repeatedly today; the log alert named crawler.timeout."}
+{"field": "resolution", "id": "ticket:1002:r", "kind": "resolution", "parent_id": "ticket:1002", "seq": 1, "text": "The staging proxy dropped idle connections; the proxy idle limit was raised."}
+{"field": "description", "id": "ticket:1003:d", "kind": "description", "parent_id": "ticket:1003", "seq": 0, "text": "Users see server errors on every search since this morning (search.5xx in the alerts)."}
+{"field": "description", "id": "ticket:1004:d", "kind": "description", "parent_id": "ticket:1004", "seq": 0, "text": "Writes to the index failed around midnight; the operations alert links logs:incident:252611907407520b065c5a06cf50cda7."}
+{"field": "description", "id": "ticket:1005:d", "kind": "description", "parent_id": "ticket:1005", "seq": 0, "text": "The nightly staging crawl stopped with crawler.fetch_timeout shortly before midnight."}
+{"field": "resolution", "id": "ticket:1005:r", "kind": "resolution", "parent_id": "ticket:1005", "seq": 1, "text": "The crawl was restarted after the upstream host recovered."}
+{"field": "description", "id": "ticket:1006:d", "kind": "description", "parent_id": "ticket:1006", "seq": 0, "text": "A few search requests returned search.5xx errors."}
+{"field": "resolution", "id": "ticket:1006:r", "kind": "resolution", "parent_id": "ticket:1006", "seq": 1, "text": "A cache node was replaced."}
+{"field": "description", "id": "ticket:1007:d", "kind": "description", "parent_id": "ticket:1007", "seq": 0, "text": "Page rendering hits crawler.render_timeout for script-heavy pages."}
+{"field": "description", "id": "ticket:1008:d", "kind": "description", "parent_id": "ticket:1008", "seq": 0, "text": "Some updated documents did not appear; we suspect the index write failed."}
+{"field": "description", "id": "ticket:1009:d", "kind": "description", "parent_id": "ticket:1009", "seq": 0, "text": "The scheduled export stopped; scheduler.job_halted appeared in the job history."}
+{"field": "description", "id": "ticket:1010:d", "kind": "description", "parent_id": "ticket:1010", "seq": 0, "text": "We are new and need an introduction to search setup."}
+{"field": "resolution", "id": "ticket:1010:r", "kind": "resolution", "parent_id": "ticket:1010", "seq": 1, "text": "Shared https://docs.example.org/kb/getting-started."}
+{"field": "description", "id": "ticket:1011:d", "kind": "description", "parent_id": "ticket:1011", "seq": 0, "text": "How long does a full reindex take?"}
+{"field": "resolution", "id": "ticket:1011:r", "kind": "resolution", "parent_id": "ticket:1011", "seq": 1, "text": "About one hour per million documents."}
+{"field": "description", "id": "ticket:1012:d", "kind": "description", "parent_id": "ticket:1012", "seq": 0, "text": "We see crawler.fetch_timeout errors on the nightly crawl."}

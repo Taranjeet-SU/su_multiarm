@@ -5,3 +5,10 @@ This distribution is licensed under the Apache License, Version 2.0.
 Research links do not imply endorsement or affiliation with the referenced projects.
 Optional databases, provider libraries and model weights retain their own licenses.
 No customer corpus, production index, private model or API key is included.
+
+This distribution includes source code adapted from NVIDIA Auto-Ontology
+(https://github.com/NVIDIA/auto-ontology, revision c447003f72a822301e927196a4ecb5b597c308d5),
+Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES, licensed under the Apache License,
+Version 2.0. The adapted files are in src/su_multi_arm/sql_surface/ (catalog.py, prompts.py,
+values.py, planner.py); each keeps the upstream copyright and SPDX header and states its
+modifications. See docs/THIRD_PARTY_NOTICES.md.

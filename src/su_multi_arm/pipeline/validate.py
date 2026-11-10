@@ -73,6 +73,9 @@ def _llm_calls(decision: DecisionConfig, generator: bool) -> int:
     return (1 if decision.uses_llm() else 0) + (1 if generator else 0)
 
 
+SQL_WRITER_MIN_TOKENS = 2048  # F11: the SQL writer's output ceiling below which validate warns (the ChatRole default)
+
+
 def _pipeline_diagnostics(config: Config, name: str, pipeline: PipelineConfig) -> list[Diagnostic]:
     from ..core.config import BUILTIN_GUARDS, DEFAULT_PIPELINE
 
@@ -116,6 +119,8 @@ def _pipeline_diagnostics(config: Config, name: str, pipeline: PipelineConfig) -
         out.append(_error(f"{prefix}.review", "role_missing", f"{prefix}.review.enabled requires models.roles.reviewer"))
     if pipeline.selection.rerank and roles.reranker is None:
         out.append(_error(f"{prefix}.selection.rerank", "role_missing", f"{prefix}.selection.rerank requires models.roles.reranker"))
+    if not pipeline.selection.rerank and pipeline.selection.reranking != type(pipeline.selection.reranking)():
+        out.append(_error(f"{prefix}.selection.reranking", "unused_key", f"{prefix}.selection.reranking is read only with {prefix}.selection.rerank: true"))
     for guard in pipeline.guards:
         if guard not in BUILTIN_GUARDS and guard not in config.plugins:
             out.append(_error(f"{prefix}.guards", "unknown_component", f"{guard!r} is neither a built-in guard nor a listed plugin"))
@@ -164,6 +169,28 @@ def _pipeline_diagnostics(config: Config, name: str, pipeline: PipelineConfig) -
                     )
                 )
     calls = _llm_calls(pipeline.decision, roles.generator is not None)
+    typed_arm = pipeline.arms.typed_query
+    typed = pipeline.decision.typed_query
+    if pipeline.decision.uses_llm() and typed.enabled and typed_arm is not None and typed.routing == "router":
+        # the router call, then the typed route's writer (one IR plan, or the SQL writer with its repair round)
+        calls += 2 + (typed_arm.sql_surface.repair_attempts if typed_arm.mode == "sql_surface" else 0)
+    elif pipeline.decision.uses_llm() and typed.enabled and typed_arm is not None and typed_arm.mode == "sql_surface":
+        calls += 1  # a routed answer: the SQL-writing call of the typed_query SQL route (repairs not counted, as for the planner)
+    if typed.enabled and typed_arm is not None and typed_arm.mode == "sql_surface":
+        # 2026-11-09 corpus-B fix F11: a SQL writer configured at 1500 ran out of output tokens on a
+        # combined query (sql_error) in a parity run; under the default ceiling is a warning
+        writers = {f"{prefix}.arms.typed_query.sql_surface.role": typed_arm.sql_surface.role}
+        for path, role_name in writers.items():
+            role = getattr(roles, role_name, None)
+            if role is not None and role.max_tokens < SQL_WRITER_MIN_TOKENS:
+                out.append(
+                    _warning(
+                        f"models.roles.{role_name}.max_tokens",
+                        "sql_writer_max_tokens_low",
+                        f"{path} uses models.roles.{role_name} with max_tokens {role.max_tokens}; the SQL writer's thought plus a combined "
+                        f"query can exceed it (a stop at max_tokens is an sql_error). Use at least {SQL_WRITER_MIN_TOKENS} (3000 recommended).",
+                    )
+                )
     budgets = config.budgets
     if calls > budgets.max_llm_calls:
         out.append(_error("budgets.max_llm_calls", "budget_incoherent", f"{prefix} needs {calls} model calls per answer, more than max_llm_calls {budgets.max_llm_calls}"))
@@ -188,10 +215,23 @@ def role_schemas() -> dict[str, list[type]]:
     """The reply schemas the package sends per chat role (QA-13). The generator's per-request
     variant (evidence-id and claim-kind enums) has the same shape as ``Answer``."""
     from ..decision.llm import LlmPlan
+    from ..decision.typed_router import TypedRoute
+    from ..learning.extraction.replies import ClusterExtractionReply, LineBatchReply
+    from ..learning.patterns.propose import PatternProposalReply
     from ..models import Answer, CommunityReport, Extraction
+    from ..sql_surface.planner import SqlDraft
     from .review import Review
 
-    return {"planner": [LlmPlan], "generator": [Answer], "reviewer": [Review], "extractor": [Extraction], "community": [CommunityReport]}
+    return {
+        "planner": [LlmPlan],
+        "generator": [Answer],
+        "reviewer": [Review],
+        "extractor": [Extraction],
+        "community": [CommunityReport],
+        "pattern_learner": [PatternProposalReply, ClusterExtractionReply],
+        "log_extractor": [LineBatchReply],
+        "query_writer": [TypedRoute, SqlDraft],
+    }
 
 
 def strict_schema_problems(provider: str, model: str, structured_output: str, role: str) -> list[str]:
@@ -258,7 +298,7 @@ def _strict_schema_diagnostics(config: Config) -> list[Diagnostic]:
 
 def config_diagnostics(config: Config) -> list[Diagnostic]:
     """Every static problem of a parsed v2 config (profile overlay already applied)."""
-    from ..core.config import AVAILABLE_PROFILES, BUILTIN_ACTIONS, BUILTIN_TOOLS, DEFAULT_PIPELINE
+    from ..core.config import AVAILABLE_PROFILES, BUILTIN_ACTIONS, BUILTIN_TOOLS, DEFAULT_PIPELINE, LOG_TOOLS
 
     out: list[Diagnostic] = []
     if config.profile not in AVAILABLE_PROFILES:
@@ -281,10 +321,20 @@ def config_diagnostics(config: Config) -> list[Diagnostic]:
         spec = config.metadata_schema.field(stats.time_basis)
         if spec is None or spec.type not in {"datetime", "date"}:
             out.append(_error("communities.stats.time_basis", "field_not_temporal", f"{stats.time_basis!r} must name a datetime or date field of metadata_schema"))
+    for index, source in enumerate(config.ingestion.attach):
+        undeclared = sorted(f for f in source.columns.values() if config.metadata_schema.field(f) is None)
+        if undeclared:
+            out.append(_error(f"ingestion.attach.{index}.columns", "field_undeclared", f"attached fields must be declared in metadata_schema: {undeclared}"))
     roles = config.models.roles
     out.extend(_strict_schema_diagnostics(config))
     if "llm" in config.extraction.extractors and roles.extractor is None:
         out.append(_error("extraction.extractors", "role_missing", "extraction.extractors includes llm: models.roles.extractor is required"))
+    from ..core.config_learning import learning_problems
+
+    out.extend(_error(path, "learning_incoherent", message) for path, message in learning_problems(config))
+    from ..core.config_projection import projection_problems
+
+    out.extend(_error(path, "projection_incoherent", message) for path, message in projection_problems(config))
     pipelines = config.all_pipelines()
     for name, pipeline in pipelines.items():
         out.extend(_pipeline_diagnostics(config, name, pipeline))
@@ -304,8 +354,11 @@ def config_diagnostics(config: Config) -> list[Diagnostic]:
             if decision.uses_llm() and roles.planner is None:
                 out.append(_error("request.modes", "role_missing", f"{mode!r} on pipeline {name!r} needs models.roles.planner"))
     for tool in config.tools.enabled:
-        if tool not in BUILTIN_TOOLS:
-            out.append(_error("tools.enabled", "unknown_component", f"{tool!r} is not a built-in tool ({', '.join(BUILTIN_TOOLS)})"))
+        if tool in LOG_TOOLS:
+            if config.logs is None or not config.logs.intents.enabled:
+                out.append(_error("tools.enabled", "requires_logs_intents", f"{tool!r} is a log tool: it needs logs.intents.enabled"))
+        elif tool not in BUILTIN_TOOLS:
+            out.append(_error("tools.enabled", "unknown_component", f"{tool!r} is not a built-in tool ({', '.join((*BUILTIN_TOOLS, *LOG_TOOLS))})"))
     for action in config.actions.allow:
         if action not in BUILTIN_ACTIONS:
             out.append(_error("actions.allow", "unknown_component", f"{action!r} is not a built-in action ({', '.join(BUILTIN_ACTIONS)})"))

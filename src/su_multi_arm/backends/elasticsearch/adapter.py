@@ -20,7 +20,7 @@ from typing import Any, Callable
 from ...core.errors import BackendError
 from ...core.types import GenerationId
 from .._lucene_common import MAX_MATCHED_DEFAULT, Transport
-from ..opensearch.adapter import OpenSearchBackend
+from ..opensearch.adapter import OpenSearchBackend, records_options
 from ..opensearch.catalog import OpenSearchCatalog, OpenSearchRecords
 from .search import MAX_DIMENSIONS, ElasticsearchLexical, ElasticsearchVector
 
@@ -44,8 +44,9 @@ class ElasticsearchBackend(OpenSearchBackend):
         transport: Transport | None = None,
         clock: Callable[[], float] = time.time,
         dataset: str | None = None,
+        **records: Any,
     ):
-        super().__init__(hosts, index_prefix, knn_method, exact_rescore, timeout_seconds, max_matched, transport, clock)
+        super().__init__(hosts, index_prefix, knn_method, exact_rescore, timeout_seconds, max_matched, transport, clock, **records)
         self.dataset = dataset
         self._registry: Any = None
         self.catalog = OpenSearchCatalog(self)
@@ -59,7 +60,7 @@ class ElasticsearchBackend(OpenSearchBackend):
         if not raw:
             raise BackendError(KIND, "init", f"environment variable {config.hosts_env} (hosts) is not set")
         hosts = [h.strip() for h in raw.split(",") if h.strip()]
-        return cls(hosts, config.index_prefix, config.knn.method, config.knn.exact_rescore, config.timeout_seconds, clock=clock, dataset=dataset)
+        return cls(hosts, config.index_prefix, config.knn.method, config.knn.exact_rescore, config.timeout_seconds, clock=clock, dataset=dataset, **records_options(config))
 
     def _default_transport(self, hosts: list[str], timeout_seconds: float) -> Transport:
         from .transport import ElasticsearchTransport

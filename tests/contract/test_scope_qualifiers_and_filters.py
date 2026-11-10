@@ -106,8 +106,9 @@ CLOUDTAX = {"field": "product", "op": "eq", "value": "CloudTax"}
         ("How many open tickets were created in 2025?", [count_step(STATUS_OPEN)], "2025"),
         # a dropped quoted term
         ('How many open tickets mention "nexus threshold"?', [count_step(STATUS_OPEN)], "nexus threshold"),
-        # a structured step on a question without any aggregate operator (QA-01 second example)
-        ("What is the CloudTax rounding policy?", [count_step(CLOUDTAX)], "structured scope without an aggregate operator in the question"),
+        # V3.2: the QA-01 second example ("What is the CloudTax rounding policy?" + a count step) is no
+        # longer bounded here: the llm agent drops the unsolicited step (next test). The rules agent
+        # keeps the NO_OPERATOR flag (decision/qualifiers.py).
     ],
 )
 def test_unapplied_qualifier_bounds_the_aggregate_and_the_count_is_refused(tmp_path, monkeypatch, question, steps, flagged):
@@ -120,6 +121,26 @@ def test_unapplied_qualifier_bounds_the_aggregate_and_the_count_is_refused(tmp_p
     assert result.contract == "abstained" and result.answer.insufficient_evidence
     search = engine.search(question)
     assert any(u.reason == "qualifier_not_applied" for u in search.unsupported_constraints)
+
+
+def test_an_unsolicited_structured_step_on_a_lookup_question_is_dropped_and_recorded(tmp_path, monkeypatch):
+    """V3.2: a planner count on a question that asks no aggregate is not executed; the original
+    query runs on the enabled lexical/dense arms under the immutable request filters, and the drop
+    is visible on the decision trace (never silent)."""
+    monkeypatch.setattr(JsonModel, "call", scripted([count_step(CLOUDTAX)], "Rounding follows the documented policy.", kind="narrative"))
+    engine = engine_for(tmp_path)
+    question = "What is the CloudTax rounding policy?"
+    search = engine.search(SearchRequest(query=question, filters={"status": "open"}))
+    decision = search.trace["decision"]
+    assert search.aggregates == [] and decision["outcome"] == "decided" and decision["decision_fallback"] is False
+    assert decision["planner_fallback"] == "retrieval_after_dropped_steps"
+    assert [d["reason"] for d in decision["dropped_steps"]] == ["unsolicited_structured"]
+    assert {s["arm"] for s in search.trace["steps"]} == {"lexical"}
+    open_ids = {d.id for d in corpus() if d.metadata["status"] == "open"}
+    assert search.hits and {h.document_id for h in search.hits} <= open_ids
+    assert not any(u.reason == "qualifier_not_applied" for u in search.unsupported_constraints)
+    result = engine.answer(question)
+    assert result.contract != "abstained" and not result.answer.insufficient_evidence
 
 
 @pytest.mark.parametrize(

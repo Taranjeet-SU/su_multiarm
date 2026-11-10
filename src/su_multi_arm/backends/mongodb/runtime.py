@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from ...core.errors import BackendError
 from ...core.types import CacheEntry, LedgerEntry, RawReply, SessionRecord
@@ -115,16 +115,81 @@ class MongoLedger:
             row = self._b.collection("jobs").find_one({"_id": job_id})
         return None if row is None else row["status"]
 
-    def put_raw(self, key: str, raw_reply: str, valid: bool) -> None:
+    def put_raw(self, key: str, raw_reply: str, valid: bool, tags: Sequence[str] = ()) -> None:
         with mapped("put_raw"):
-            self._b.collection("raw_replies").replace_one(
-                {"_id": key}, {"_id": key, "raw_reply": raw_reply, "valid": bool(valid)}, upsert=True
+            self._b.collection("raw_replies").update_one(
+                {"_id": key}, {"$set": {"raw_reply": raw_reply, "valid": bool(valid)}}, upsert=True
             )
+        if tags:
+            self.tag_raw(key, tags)
 
     def get_raw(self, key: str) -> RawReply | None:
         with mapped("get_raw"):
             row = self._b.collection("raw_replies").find_one({"_id": key})
         return None if row is None else RawReply(key=key, raw_reply=row["raw_reply"], valid=bool(row["valid"]))
+
+
+    # retention (``extras.LedgerRetention``): tags live on the raw entry (``tags`` array);
+    # references in ``<prefix>_ledger_refs`` documents ``{_id: "<generation>|<key>", generation, key}``.
+    def tag_raw(self, key: str, tags: Sequence[str]) -> None:
+        with mapped("tag_raw"):
+            result = self._b.collection("raw_replies").update_one({"_id": key}, {"$addToSet": {"tags": {"$each": sorted(set(tags))}}})
+        if result.matched_count == 0:
+            raise BackendError(KIND, "tag_raw", f"unknown raw entry {key}")
+
+    def raw_tags(self, key: str) -> list[str]:
+        with mapped("raw_tags"):
+            row = self._b.collection("raw_replies").find_one({"_id": key}, {"tags": 1})
+        return sorted((row or {}).get("tags") or [])
+
+    def tagged(self, tag: str) -> list[str]:
+        with mapped("tagged"):
+            return sorted(r["_id"] for r in self._b.collection("raw_replies").find({"tags": tag}, {"_id": 1}))
+
+    def add_refs(self, generation: str, keys: Sequence[str]) -> None:
+        refs = self._b.collection("ledger_refs")
+        with mapped("add_refs"):
+            for key in sorted(set(keys)):
+                refs.update_one({"_id": f"{generation}|{key}"}, {"$setOnInsert": {"generation": generation, "key": key}}, upsert=True)
+
+    def refs(self, generation: str) -> list[str]:
+        with mapped("refs"):
+            return sorted(r["key"] for r in self._b.collection("ledger_refs").find({"generation": generation}, {"key": 1}))
+
+    def referencing_generations(self) -> list[str]:
+        with mapped("referencing_generations"):
+            return sorted(self._b.collection("ledger_refs").distinct("generation"))
+
+    def purge(self, spec: Any) -> dict[str, int]:
+        raw, refs = self._b.collection("raw_replies"), self._b.collection("ledger_refs")
+        with mapped("purge"):
+            dropped = sum(int(refs.delete_many({"generation": g}).deleted_count) for g in spec.drop_refs_of)
+            tagged = int(raw.delete_many({"tags": {"$in": list(spec.tags)}}).deleted_count) if spec.tags else 0
+            referenced = set(refs.distinct("key"))
+            unreferenced = 0
+            for prefix in spec.unreferenced_prefixes:
+                doomed = [r["_id"] for r in raw.find({"_id": {"$regex": "^" + re.escape(prefix)}}, {"_id": 1, "tags": 1}) if r["_id"] not in referenced and not r.get("tags")]
+                for start in range(0, len(doomed), 1000):
+                    unreferenced += int(raw.delete_many({"_id": {"$in": doomed[start : start + 1000]}}).deleted_count)
+        return {"refs_dropped": dropped, "tagged": tagged, "unreferenced": unreferenced}
+
+    def drop_job(self, job_id: str) -> int:
+        with mapped("drop_job"):
+            removed = int(self._b.collection("ledger").delete_many({"job_id": job_id}).deleted_count)
+            self._b.collection("jobs").delete_one({"_id": job_id})
+        return removed
+
+    def jobs(self) -> list[str]:
+        with mapped("jobs"):
+            return sorted(self._b.collection("ledger").distinct("job_id"))
+
+    def raw_entries(self, prefix: str, after: str | None, limit: int) -> list[RawReply]:
+        query: dict[str, Any] = {"_id": {"$regex": "^" + re.escape(prefix)}}
+        if after is not None:
+            query["_id"]["$gt"] = after
+        with mapped("raw_entries"):
+            rows = list(self._b.collection("raw_replies").find(query).sort("_id", 1).limit(limit))
+        return [RawReply(key=r["_id"], raw_reply=r["raw_reply"], valid=bool(r["valid"])) for r in rows]
 
 
 class MongoSessions:

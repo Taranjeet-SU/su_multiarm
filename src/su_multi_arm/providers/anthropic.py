@@ -43,6 +43,7 @@ from typing import Any, Callable, ClassVar
 from pydantic import BaseModel
 
 from ._chat import HttpChatProvider
+from .capabilities import thinking_wire
 from .base import (
     CallContext,
     MeteredCall,
@@ -110,6 +111,12 @@ class AnthropicProvider(HttpChatProvider):
             # StrictSchemaError (a CapabilityMismatch) for a free-form mapping, before any call.
             wire = output_format_schema(schema.model_json_schema(), schema.__name__)  # type: ignore[union-attr]
             body["output_config"] = {"format": {"type": "json_schema", "schema": wire}}
+        # Thinking/effort control (2026-11-09): validated per model at construction (``check_role``)
+        thinking = thinking_wire(self.caps, self.role.thinking, self.role.thinking_budget_tokens)
+        if thinking is not None:
+            body["thinking"] = thinking
+        if self.role.effort is not None:
+            body.setdefault("output_config", {})["effort"] = self.role.effort
         return "/messages", {"anthropic-version": API_VERSION}, body
 
     def _stream_body(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -119,6 +126,8 @@ class AnthropicProvider(HttpChatProvider):
         return AnthropicStream(on_delta, stage)
 
     def _parse(self, data: dict[str, Any], mode: str, ctx: CallContext, call: MeteredCall, body: dict[str, Any]) -> str:
+        if self.role.thinking is not None or self.role.thinking_budget_tokens is not None:
+            call.extra["thinking"] = (body.get("thinking") or {}).get("type", "not_sent")  # what was sent (``off`` follows the model)
         call.usage = parse_usage(data.get("usage"))
         call.returned_model = data.get("model") if isinstance(data.get("model"), str) else None
         stop = data.get("stop_reason")
@@ -131,7 +140,7 @@ class AnthropicProvider(HttpChatProvider):
         if stop == "max_tokens":
             thinking = call.usage.reasoning_tokens
             detail = f" ({thinking} of {call.usage.output_tokens} output tokens were thinking)" if thinking else ""
-            raise ProviderIncomplete(f"incomplete reply: truncated at max_tokens {self.role.max_tokens}{detail}", stage=ctx.stage)
+            raise ProviderIncomplete(f"incomplete reply: truncated at max_tokens {body.get(self.caps.max_output_tokens_param, self.role.max_tokens)}{detail}", stage=ctx.stage)
         if stop == "refusal":
             raise ProviderRefusal("model refused", stage=ctx.stage)
         if mode == "native:tool_use":

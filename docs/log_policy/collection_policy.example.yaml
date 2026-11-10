@@ -1,0 +1,36 @@
+# Synthetic example of the declared log collection policy (the `logs:` block of a v2 config).
+# Source, index and tenant names are illustrative; paths are relative to the config file.
+logs:
+  source: example_source            # a sources.<name> entry (read-only)
+  timezone: UTC
+  partitions:
+    path: state/partitions
+  history:
+    tier: false                     # the archive below serves the summary mode's history
+  retention:                        # retention per data class
+    raw_days: 3                     # raw copies (when partitions.raw is enabled)
+    keep_days: 10                   # masked partitions and the live serving window
+    keep_generations: 2             # serving generations kept for rollback (active included)
+    derived: forever                # keyword/episode aggregates: kept forever (the archive)
+  collection:
+    schedule:
+      summary_refresh_minutes: 15   # continuous refresh of today's per-index summaries
+      heavy_window_utc: {start: "01:00", end: "07:00"}   # heavy pulls and day close only here
+      day_close_delay_minutes: 60   # a UTC day is complete one hour after midnight UTC
+    keywords:
+      files:
+        - path: keywords.example.yaml
+          sha256: 393bc1126f9451c25e681a905cb3d69ca3e02505a456afdca89cd95548be7b96
+      effective_from: null          # set to the first day of a new recipe after re-pinning
+      gap_seconds: 300
+    archive:
+      enabled: true
+      path: state/archive/example_source.episodes.sqlite
+      max_text_chars: 2000          # archived exemplar/summary text cut; aggregates and citations kept
+    staging:
+      path: state/staging           # collector handoff: <path>/<YYYY-MM-DD>/*.json snapshots
+      delete_after_import: true
+    serving:
+      max_window_days: 400          # longest range one episode query may span
+# The per-source request-rate cap stays where the transport enforces it:
+#   sources.example_source.limits.requests_per_second

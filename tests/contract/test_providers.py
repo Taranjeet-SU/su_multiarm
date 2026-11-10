@@ -468,3 +468,17 @@ def test_openai_compatible_embeddings_and_typed_errors():
     assert len(limited.requests) == 1
     with pytest.raises(ValueError, match="shape"):
         Embedder(cfg.model_copy(update={"dimensions": 32}), transport=Recorder(embedding_reply(1, 16)).transport).encode(["a"])
+
+
+def test_incomplete_reply_logs_stage_and_limit_without_prompt_or_partial_text(caplog):
+    from su_multi_arm.providers import ProviderIncomplete
+
+    ctx = new_context(GEN, limits=BudgetLimits(max_llm_calls=3))
+    rec = Recorder(anthropic_tool({"answer": "PRIVATE-PARTIAL-REPLY"}, stop="max_tokens", usage={"input_tokens": 11, "output_tokens": 2048}))
+    model = JsonModel(anthropic_role(structured_output="native"), transport=rec.transport)
+    with pytest.raises(ProviderIncomplete):
+        model.call("PRIVATE-SYSTEM", {"question": "PRIVATE-QUESTION"}, Reply, RunBudgetMeter(ctx, "generator", None), "generator")
+    assert "stage=generator" in caplog.text and "stop_reason=max_tokens" in caplog.text
+    assert "output_tokens=2048" in caplog.text and "max_tokens=" in caplog.text
+    assert all(secret not in caplog.text for secret in ("PRIVATE-PARTIAL-REPLY", "PRIVATE-SYSTEM", "PRIVATE-QUESTION", SECRET))
+    assert ctx.budget.snapshot()["used"]["calls"] == 1

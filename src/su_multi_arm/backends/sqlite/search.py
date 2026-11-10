@@ -149,6 +149,7 @@ class SqliteLexical:
         with self._lock:
             if gen.prefix() not in self._dirty and (folder / "meta.json").exists():
                 return
+            self._b.refuse_write("lexical refresh")  # an adopted store is served as built, never rebuilt
             builder = Bm25Builder(self.settings)
             analyze, with_title = self._analyze, self.settings.include_title
             with self._b.catalog_db(gen) as db:
@@ -181,6 +182,11 @@ class SqliteLexical:
             if prefix not in self._segments:
                 self._segments[prefix] = Bm25Segment(self._b.snapshot_dir(gen) / SEGMENT, self.settings)
             return self._segments[prefix]
+
+    def warm(self, gen: GenerationId) -> None:
+        """Startup warm-up: memory-map the ``bm25`` segment of ``gen`` (fts5 has nothing to load)."""
+        if self.engine == "bm25":
+            self.segment(gen).doc_index()
 
     def count(self, gen: GenerationId) -> int:
         if self.engine == "bm25":
@@ -295,19 +301,130 @@ class SqliteLexical:
 
     def _bm25_search(self, gen: GenerationId, query: LexicalQuery, scope: Scope | None, k: int, page: Page | None) -> PageResult[ScoredChunk]:
         offset, size = page_window(page, k)
+        found = self._bm25_candidates(gen, query, scope)
+        if found is None:
+            return PageResult(items=[], next_cursor=None)
+        segment, scores, matched, eligible = found
+        limit = min(size, max(0, k - offset))
+        best = top_rows(scores, matched, eligible, offset + limit + 1)
+        window, cursor = _page(best, offset, limit, k)
+        items = [
+            ScoredChunk(chunk_id=segment.chunk_ids[int(r)], document_id=segment.doc_ids[int(segment.row_doc[int(r)])], score=float(scores[r]))
+            for r in window
+        ]
+        return PageResult(items=items, next_cursor=cursor)
+
+    # --- stratum statistics (unified merge §6.5; partitioned collections) ---------------------------
+
+    def _excluded_rows(self, segment: Bm25Segment, excluded_docs: frozenset[str]) -> np.ndarray | None:
+        """Row mask of the chunks of ``excluded_docs`` (superseded/tombstoned in the pinned view)."""
+        if not excluded_docs:
+            return None
+        index = segment.doc_index()
+        ordinals = [index[d] for d in excluded_docs if d in index]
+        if not ordinals:
+            return None
+        return np.isin(np.asarray(segment.row_doc), np.asarray(ordinals, dtype=np.int32))
+
+    def stratum_part(self, gen: GenerationId, words: Sequence[str], excluded_docs: frozenset[str] = frozenset()) -> dict[str, Any]:
+        """This generation's contribution to a query-time stratum: rows ``n``, analyzed ``tokens`` and
+        the chunk frequency ``df`` of each distinct query token, all without the rows of
+        ``excluded_docs`` (B10: superseded and tombstoned rows never count)."""
+        segment = self.segment(gen)
+        excluded = self._excluded_rows(segment, excluded_docs)
+        lengths = np.asarray(segment.doc_len, dtype=np.int64)
+        n, tokens = segment.corpus_size, int(lengths.sum())
+        if excluded is not None:
+            n -= int(excluded.sum())
+            tokens -= int(lengths[excluded].sum())
+        found = self.term_ids(gen, words)
+        df: dict[str, int] = {}
+        for word in dict.fromkeys(words):
+            if word not in found:
+                df[word] = 0
+                continue
+            tid, freq = found[word]
+            if excluded is not None:
+                rows, _ = segment.postings(tid)
+                freq -= int(excluded[np.asarray(rows)].sum())
+            df[word] = freq
+        return {"n": n, "tokens": tokens, "df": df}
+
+    def vocabulary(self, gen: GenerationId, excluded_docs: frozenset[str] = frozenset()) -> dict[str, int]:
+        """``term -> chunk frequency`` of the whole vocabulary without ``excluded_docs`` (the base of
+        a stratum's ``average_idf``; read once per pinned unit set and cached by the caller)."""
+        self.segment(gen)
+        with self._b.catalog_db(gen) as db:
+            cursor = db.cursor()
+            cursor.row_factory = None
+            vocab = {term: int(df) for term, df in cursor.execute("SELECT term, df FROM bm25_terms")}
+        if excluded_docs:
+            segment = self.segment(gen)
+            excluded = self._excluded_rows(segment, excluded_docs)
+            if excluded is not None:
+                ids = [segment.chunk_ids[int(r)] for r in np.flatnonzero(excluded)]
+                for parts in self._analyzed_texts(gen, ids).values():
+                    for term in {t for part in parts for t in part}:
+                        vocab[term] -= 1
+                vocab = {t: d for t, d in vocab.items() if d > 0}
+        return vocab
+
+    def rank_rows(
+        self,
+        gen: GenerationId,
+        query: LexicalQuery,
+        scope: Scope | None,
+        k: int,
+        *,
+        idf: dict[str, float] | None = None,
+        avgdl: float | None = None,
+        excluded_docs: frozenset[str] = frozenset(),
+    ) -> list[ScoredChunk]:
+        """The best ``k`` chunks (best first, ties by chunk id) scored with stratum statistics
+        (``idf`` per analyzed query token and ``avgdl``) instead of this segment's own, excluding
+        ``excluded_docs``. Without overrides and exclusions: ``search(...)``'s first page."""
+        override = None if idf is None else (idf, float(avgdl))
+        found = self._bm25_candidates(gen, query, scope, override=override, excluded_docs=excluded_docs)
+        if found is None:
+            return []
+        segment, scores, matched, eligible = found
+        best = top_rows(scores, matched, eligible, k)
+        return [
+            ScoredChunk(chunk_id=segment.chunk_ids[int(r)], document_id=segment.doc_ids[int(segment.row_doc[int(r)])], score=float(scores[r]))
+            for r in best
+        ]
+
+    def _bm25_candidates(
+        self,
+        gen: GenerationId,
+        query: LexicalQuery,
+        scope: Scope | None,
+        *,
+        override: tuple[dict[str, float], float] | None = None,
+        excluded_docs: frozenset[str] = frozenset(),
+    ) -> tuple[Bm25Segment, np.ndarray, np.ndarray, np.ndarray | None] | None:
+        """``(segment, scores, matched, eligible)`` of a bm25 query, or ``None`` when nothing can
+        match. ``override``: stratum ``(idf per token, avgdl)``; ``excluded_docs``: never eligible."""
         segment = self.segment(gen)
         words = self._query_tokens(query.text)
         if not words:
-            return PageResult(items=[], next_cursor=None)
+            return None
         found = self.term_ids(gen, words)
-        scores, matched = segment.scores(found[w][0] if w in found else None for w in words)
+        if override is None:
+            scores, matched = segment.scores(found[w][0] if w in found else None for w in words)
+        else:
+            idf, avgdl = override
+            scores, matched = segment.scores_with(((found[w][0] if w in found else None, idf.get(w, 0.0)) for w in words), avgdl)
         eligible = self._eligible_rows(gen, segment, scope, query.fields)
+        excluded = self._excluded_rows(segment, excluded_docs)
+        if excluded is not None:
+            eligible = ~excluded if eligible is None else eligible & ~excluded
         restrict: np.ndarray | None = None
         if query.kind == "phrase":
             # A phrase word that analyzes to nothing cannot be verified: match nothing, never a
             # shorter phrase.
             if self.unindexable(re.findall(r"\w+", query.text)):
-                return PageResult(items=[], next_cursor=None)
+                return None
             restrict = self._verified(gen, segment, words, self._containing(gen, segment, words))
         elif query.kind == "boolean":
             candidates = np.flatnonzero(matched)
@@ -330,14 +447,7 @@ class SqliteLexical:
             allowed = np.zeros(segment.corpus_size, dtype=bool)
             allowed[restrict] = True
             eligible = allowed if eligible is None else eligible & allowed
-        limit = min(size, max(0, k - offset))
-        best = top_rows(scores, matched, eligible, offset + limit + 1)
-        window, cursor = _page(best, offset, limit, k)
-        items = [
-            ScoredChunk(chunk_id=segment.chunk_ids[int(r)], document_id=segment.doc_ids[int(segment.row_doc[int(r)])], score=float(scores[r]))
-            for r in window
-        ]
-        return PageResult(items=items, next_cursor=cursor)
+        return segment, scores, matched, eligible
 
 
 def top_k(scores: np.ndarray, eligible: np.ndarray | None, k: int) -> np.ndarray:
@@ -392,6 +502,15 @@ class SqliteVector:
         self._loaded[key] = (chunk_ids, matrix)
         return self._loaded[key]
 
+    def rows(self, gen: GenerationId, chunk_ids: Sequence[str], namespace: str = "default") -> dict[str, np.ndarray]:
+        """The stored vectors of ``chunk_ids`` (those that have one), read-only: the embedding-space
+        equivalence check of an adopted member compares them with online re-embeddings."""
+        ids, matrix = self._load(gen, namespace)
+        if matrix is None:
+            return {}
+        position = {cid: i for i, cid in enumerate(ids)}
+        return {cid: np.asarray(matrix[position[cid]], dtype=np.float32) for cid in chunk_ids if cid in position}
+
     def _rowmap(self, gen: GenerationId, namespace: str, chunk_ids: list[str]) -> tuple[np.ndarray, list[str], dict[str, int]]:
         """Vector row -> document ordinal, built once per generation from the catalog (and rebuilt if the
         catalog file changed). Every vector id must be a catalogued chunk."""
@@ -424,6 +543,20 @@ class SqliteVector:
         with self._lock:
             self._rowmaps[key] = (stamp, row_doc, doc_ids, doc_index)
         return row_doc, doc_ids, doc_index
+
+    def warm(self, gen: GenerationId, namespace: str = "default") -> int:
+        """Startup warm-up of ``gen``'s vectors: the id manifest, the row -> document map and the
+        index the search reads (``faiss``: the index file; exact: the memory-mapped matrix, its pages
+        read once). Returns the rows."""
+        chunk_ids, matrix = self._load(gen, namespace)
+        if matrix is None or not chunk_ids:
+            return 0
+        self._rowmap(gen, namespace, chunk_ids)
+        if self._b.vector_engine == "faiss" and namespace == "default":
+            self._faiss_index(gen)
+        else:
+            np.asarray(matrix) @ np.zeros(matrix.shape[1], dtype=matrix.dtype)  # page the exact matrix in
+        return len(chunk_ids)
 
     def forget(self, gen: GenerationId) -> None:
         for key in [k for k in self._loaded if k[0] == gen.prefix()]:

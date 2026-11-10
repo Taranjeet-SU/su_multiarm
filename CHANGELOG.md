@@ -5,7 +5,514 @@ All notable changes to this project are documented here. The format follows
 [PEP 440](https://peps.python.org/pep-0440/) version numbers. Evidence for each release (synthetic,
 mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
+
 ## [Unreleased]
+
+### Added (retrieval parity, all opt-in)
+
+- Cross-encoder rerank stage with device/dtype/batch/length, `top_k_in`/`top_k_out`, a latency
+  budget and an explicit fail-open-to-fusion-order policy recorded in the selection trace.
+- `segment` arm over a sealed child-record index (`segments build`): parent records with their best
+  anchored segments as evidence, scope evaluated on the parent.
+- `communities.strategy: imported` (only grounded claims; summaries refused; optional extractive
+  claims) and community `claim_hits`.
+- `ingestion.attach`: one-to-one columns of a pinned read-only SQLite table joined onto declared
+  metadata; attached Kuzu stores are no longer write targets and `graph.path_evidence` returns their
+  anchored documents.
+
+### Fixed
+
+- The local sentence-transformers embedder serialises tokenizer and encode calls (concurrent arms
+  could fail with "Already borrowed").
+
+### Added (log ingestion)
+
+- Reuse exact repeated log-head and approved-format body matches while preserving every occurrence, current timestamp, typed field and evidence offset; bound caches and report parse work separately.
+- Import exact grouped observations with separate occurrence and downloaded-example counts,
+  weighted hourly/latency aggregates, preserved evidence provenance and explicit unsupported-overlay
+  failures. The injected snapshot-based capture harness supports grouped messages and raw fallback;
+  source compatibility must be verified before production activation.
+- Add adaptive capture for sources without PIT support: accept groups only when one search response
+  completely reconciles the population, otherwise discard the candidate response and start a fresh
+  raw scroll. Retain explicit fallback diagnostics and reuse verified completed full exports without
+  downloading them again. Raw pages are configured separately from aggregation pages.
+- Add bounded hybrid grouping with global candidate counts and an exact complement scroll from the
+  same initial search snapshot. Require complete buckets, all-document guards and unique raw-count
+  reconciliation; stage masked output until validated, and permit only one fresh candidate-pruning
+  retry before full raw fallback. Retain completed raw exports only under an explicitly approved
+  prior recipe with unchanged privacy/projection and revalidated counts/checksum. Apply the actual
+  masked canonical standalone-head classifier before candidate selection and require positive request
+  savings after selection/retry overhead. Traceback markers or meaningful continuation payloads
+  discard the staged attempt and require full raw capture; only structural closing delimiters may
+  remain isolated fragments.
+
+### Fixed (answer presentation)
+
+- "Which services failed ... and what was the issue" now groups by service and observed error
+  type, returning Service / Error type / Error count rather than service-volume or parsing metrics.
+  Stored templates back the rows; generic error patterns remain explicitly unclassified. The UI
+  presents one primary table with collapsed supporting detail, while scope limitations stay visible.
+
+- The Answer card now renders Markdown tables, headings, lists, emphasis and code, with working
+  evidence chips. Raw HTML remains inert and external image loading is disabled. Tables scroll
+  inside the card on narrow screens. Cited structured rows appear as tables even when the answer
+  is plain prose; multiple deterministic findings have separate paragraphs. The generator prompt
+  requests a compact evidence-and-next-check table for multi-issue attention questions.
+- Ask defaults to today's date; explicit date links are preserved. Main navigation is Overview,
+  Ask and Graph. Graph automatically loads bounded stored service neighbourhoods.
+- Deterministic log answers include a Markdown table of actual returned rows for API/MCP clients,
+  with explicit preview bounds and the original counting-basis/coverage text retained.
+- Log planning preserves known client/service filters, explicit severities and same-month day
+  ranges, and refuses unsupported scopes/latest-event rollups. An opt-in single schema repair
+  uses the existing request budget and all normal plan validation; the logs example enables it.
+
+### Fixed (live deployment follow-ups; synthetic reproductions)
+
+- **Rankings ignored unparsed lines.** "Which service is failing the most" (`log_top` by service at
+  ERROR+FATAL) ranked by parsed lines, so a service whose errors were almost all unparsed dropped
+  out of the top N while the answer listed its source counts. A ranking by service, tenant or
+  deployment at asked levels now ranks by the source counts when the parse is incomplete
+  (`ranked_by: source_counts`; rows carry `lines` = source lines, `lines_parsed`,
+  `lines_unparsed`, `unparsed_share`; rendering "ranked by source counts (the parse is
+  incomplete)"). Without count queries over exactly the asked levels, with an `owner: reviewed`
+  filter or with units missing count fields the parsed ranking stands with a note. Signature
+  rankings keep the parsed rows and now state the unparsed share and the services with the most
+  unparsed lines. Gold plan: `GoldSpec.error_flood` plants such a service (off by default). A
+  `log_top` call without `by` (it defaults to service) now gets the source cross-check too; it used
+  to be skipped.
+- **Pure ranking answers read "No matching evidence was retrieved."** When a log aggregate did not
+  fit the generator's evidence budget the generator saw no evidence. An answer whose evidence is
+  aggregates only (typed log intents, no generator, or nothing packed) is now the aggregates'
+  deterministic rendering with its exactness label, citing them; a configured generator may add one
+  sentence, kept only when every number in it appears in the rendering (`answer_number_mismatch`,
+  action `strip`, otherwise). Trace: `rendered_answer`. Generic structured aggregates that fit the
+  budget still go to the generator as before.
+- **Usable approximate/bounded rankings abstained.** A count stated in the answer text and backed
+  by an approximate or bounded aggregate now passes when its own sentence labels it
+  ("approximately 304", "at least 304", "304 in the parsed rows", "bounded") and its number
+  matches that aggregate; unlabelled counts, mismatching numbers, complete lists and absences
+  still need an exact scope. The generator prompt asks for the label.
+- **Garbled stripped answers.** The contract split sentences at every dot, so stripping a sentence
+  that named `gen.error_word` left "… signatures were gen." or a fragment starting mid-sentence. A
+  sentence now ends only at `.`/`!`/`?` before whitespace or the end (or at a line break).
+- **Customers ranked by signature; tenant filters dropped; inverted change.** The rules grammar
+  maps customers, clients, accounts and tenants to `by: tenant`; `log_trend` and `log_compare` take
+  `tenant` and the rules carry a named tenant into them; "increase", "drop", "change", "worse" and
+  similar words with two dates are a comparison ("worse" means ERROR+FATAL). `log_compare` compares
+  its periods in date order and renders "(change from <earlier> to <later>: ±N)" (the change was
+  computed in the question's order, so "Nov 3 compared to Nov 2" had the sign inverted). The
+  planner context pack's rules and the profile's few-shot examples say the same.
+
+### Fixed (second real-deployment smoke test; synthetic reproductions)
+
+- **Wrong day on the Ask path.** `/v2/answer`, the stream and the llm planner filled the log
+  intent's `as_of` from the clock, which switched off the latest-served-day anchor, so undated
+  questions were answered for today with no data. The decision request now records
+  `as_of_source` (`request` or `clock`); only a caller-named `as_of` is pinned into a log intent
+  (a planner copying the clock `time_anchor` has it dropped). Undated questions anchor on the latest
+  served day and say so; "today"/"yesterday" read the clock, and a day that is not served is
+  `source_unavailable` with "latest available day: …" (rendered "No composed data for index date …").
+- **FATAL-only questions answered "none … exact".** Source counts were read only from a
+  single-level count query, so a source whose failure query counts ERROR and FATAL together never
+  cross-checked FATAL. Every level and mix is now cross-checked: single-level query, a query over
+  exactly the asked levels, or the smallest query that includes the level (`coverage: superset`).
+  A level no query covers is `bounded` when lines of the same units have no parsed level
+  (`unknown_level`, with their share of the source total). A WARN question on a unit whose raw lines
+  have no parsed level is therefore `bounded` now (was exact).
+- **`error_rate` divided by the pulled lines** (only the pulled E/F/W strata, capped: 94.5% for a
+  33% service, some 100%). It is now the source's level counts over the source's total lines
+  (`unit_day` `lines_total`) per unit, with the counting basis per row (`token_match` →
+  approximate); units without a source total are excluded and named, and a level set no count
+  query counts exactly refuses the rate.
+- **`deployment_id` on the served rows.** The numeric index-name suffix is now carried on
+  `unit_day`, `signature_day`, `log_day`, `log_hour`, `endpoint_day`, `exception_day` and
+  `coverage_day` (declared groupable/listable in the logs profile); `log_top` and `log_tenants` take
+  `deployment_id` and `by: deployment`, `log_trend` takes `deployment_id`. The attribute is read from
+  the partition's unit attributes at compose time, so partitions pulled with the suffix rule need a
+  recompose, not a reparse; the compose format is now 2, so the next compose rebuilds the day
+  documents once instead of reusing cached format-1 documents without the attribute.
+
+### Fixed (defects found on a real log deployment; synthetic reproductions)
+
+- **Level questions read the source's counts.** A FATAL (or ERROR/WARN) question was answered
+  "No FATAL-level lines … exact" when the FATAL lines existed but were unparsed (their level was
+  unknown to the parse). Level questions (`log_top`, `log_trend`, `log_compare`, `log_tenants`) now
+  return `source_counts` per service/tenant (source-counted lines, `level_field` or `token_match`
+  basis, the latter labelled approximate, and how many are unparsed); when the source counts more
+  lines than the rows, the answer is `bounded` with the reason. The gold set plants unparsed FATAL
+  lines in its token-only service.
+- **`patterns mine` no longer aborts on a regex over 4,096 characters** (P19): the cluster is
+  rejected as `regex_too_long` and the run continues (also in the fallback's labelled entries).
+- **Stored gate examples are pseudonymised.** `examples.positive` of learned and proposed entries
+  (and the decision's copy) kept tenant and host values; they are now pseudonymised like the prompt
+  text (case-insensitive, token-bounded) before `learned.yaml`/`proposed.yaml`/decisions are
+  written, in the learning loop and in the fallback's template tier.
+- **Undated log questions read the latest served day.** With no date in the question and no composed
+  data for today, the default window is anchored on the latest served day and the rendering states
+  "latest available day: …" (it answered "No lines for index date <today> … exact"). Days of a named
+  window that are not composed yet are `source_unavailable`; a window with none composed is `bounded`.
+- **Failure vocabulary and error rate.** "failing", "failures", "errors", "issues", "problems" and
+  "broken" mean ERROR and FATAL in the rules grammar ("which service is failing the most" →
+  `log_top` by service, level ERROR and FATAL); a named level stays itself. `log_top` gains
+  `metric: error_rate` (failing lines / all lines, by service or tenant) with source counts.
+- **`serving.ui.theme` is relative to the config file** like every other path (it was relative to
+  the working directory, so `serve` refused to start), and `config validate` and `doctor` now check
+  that the theme exists and is valid.
+
+- **Index names with numeric service suffixes.** `index_name.service_suffix: numeric` reads
+  `ml-service-1658254295` as service `ml-service` plus the `deployment_id` attribute (off by
+  default; `service_suffix_min_digits`, default 6).
+
+- **Generator `schema_violation` is logged and answered.** A generator reply that violates the
+  answer schema used to end the answer stream with a bare `error: schema_violation` and nothing in
+  the server log. It is now logged (field paths and error types, the provider stop reason; no reply
+  text) and the run returns the evidence with an abstaining answer. `SchemaViolation` carries
+  `paths` and `stop_reason`.
+
+### Added (logs planner)
+
+- **Logs planner context pack** (`logs.intents.planner_context`, on by default under the logs
+  profile): the llm planner sees what each arm stores, a capped pattern-library summary, the served
+  dates, value vocabularies, the ten intents as typed tools with input schemas and few-shot examples
+  (a synthetic default set in the profile; `logs.intents.few_shot_file` replaces it), bounded by
+  `planner_context_max_chars`. In a cascade, when the rules find no log intent the llm stage plans
+  (`logs.intents.cascade_to_planner`). Plans still go through `StructuredStep.intent` and the scope
+  guard.
+
+### Changed (web UI)
+
+- **Enter submits** in the Ask question field and in the Logs and Patterns view fields, the same as
+  the button; Shift+Enter inserts a newline in the multi-line question; nothing is submitted during
+  an IME composition. The static bundle is rebuilt.
+
+### Added (safe redaction, B11)
+
+- Five named redactors, off until listed in `privacy.redactors` like every built-in: `phone`
+  (international formats, `(415) 555-0100`, phone keys), `long_numeric_id` (13–19 digits, hashed),
+  `person_name` (JSON and `key=value` person-name fields; `privacy.person_name_fields`),
+  `record_list` (JSON arrays of business-entity records; `privacy.record_list_fields`) and
+  `product_prose` (free text after configured product or technology names, `privacy.prose_products`,
+  which stay visible and do not stop the masking). Existing fingerprints are unchanged while the new
+  keys hold their defaults.
+
+### Accounted coverage and LLM fallback extraction (preview, addendum A2 §4.2, slices C1–C4)
+
+- **Accounting** (`ingestion/accounting.py`): every head gets one final status (`parsed`,
+  `parsed_filled`, `provisional`, `model_line`, `noise`, or `unresolved` with a reason from a closed
+  list). Identities Q, D and H are checked before the seal, and an imbalance refuses it
+  (`AccountingImbalance`, version stays open). Match rows carry `final_status`, `reason`,
+  `pattern_owner`, `extraction_source` and `gaps`; the partition manifest carries per-unit
+  accounting. New keys `logs.accounting.{required_fields, validators, targets}`.
+- **Fallback overlays** (`ingestion/overlay.py`, `learning/extraction/`): after the seal, residue
+  clusters get one `pattern_learner` call each (labels on the synthesised `vN`/`maskN` groups, or a
+  regex) through the full gate. Field gaps get a gated `fix`, then capped line quotes, and singletons
+  get a capped per-line tail. Values are always spans of the line. Replies are cached; overlays are
+  keyed by a fallback identity and rebuilt from the cache when stale. New keys
+  `learning.extraction.*`, `models.roles.log_extractor`, `models.routes.*` and
+  `budgets.providers.<provider>.max_usd_total`.
+- **Provider routes**: ordered local → local → paid routes per role, with health and capacity
+  probes. No route available gives `capacity_deferred` (retried next run). A paid route after a local
+  one runs only with `models.routes.allow_paid_fallback: true`. A paid route is refused at config
+  load without a price table, a finite provider total and finite daily and run USD caps. Local routes
+  record calls and tokens at USD 0. A total-period spend ledger projects days until exhaustion.
+- **`run-daily`** gains the `fallback` and `apply_decisions` steps. `su-multi-arm logs coverage`
+  prints regex-only and with-model numbers with fragment accounting.
+- **Route tiers** `local`/`lan`/`paid` (`lan` needs `egress.allow_lan`), UTC time windows and an
+  invalid-reply limit per route. **`learning.bootstrap`** (off by default) runs on self-hosted routes
+  only, refuses an unmeasured start, and is capped by measured throughput. **`patterns
+  measure-throughput --tier --clusters 50 --date`** records calls/hour and tokens/s.
+  **`serving.answers`** is a persistent answer-time spend scope. The cluster cap now counts only
+  clusters that need a model call. E1b adds the synthetic fallback gold set
+  (`testing/fixtures/logs/fallback_gold.py`).
+- **`patterns learn|propose`**: a stop file or SIGTERM gives a clean stop (`paused`), `--output` is
+  persisted per cluster, and a template with a pending proposal gets no new call.
+- **Changed (egress):** a line with a residual PII, cookie, session or tracking shape is refused on
+  its own (`egress_refused`), and the run is refused only above `max_refused_share`. The B11
+  built-in redactors are part of the egress shape check. Pseudonymisation is case-insensitive and
+  token-bounded. A model-labelled noise pattern becomes a `noise` proposal for a human, never an
+  auto-promoted message.
+
+### Logs analytics profile (addendum A2 L5a–L5d, M1, B2+B3; synthetic/contract evidence)
+
+- **`profile: logs_example`**: the pattern extractor's output feeds every arm. Dense: `signature`
+  (masked human template; the regex moved to metadata `regex`) and `incident` documents only.
+  Lexical: signatures, per-tenant redacted `signature_examples`, incidents. Structured: typed
+  rollups `log_day`, `log_hour`, `endpoint_day`, `endpoint_window`, `exception_day`, `coverage_day`,
+  `signature_catalog` (first/last seen over all served history) next to the A1 kinds. Graph:
+  span-anchored header links `emits`/`runs`/`serves`/`raises` (`native_link`) with per-day weights,
+  line-scoped facts of reviewed entries, `co_fires_with` (`co_firing`, new edge kind, not traversed
+  by default). Communities: co-firing incidents per tenant (`communities.strategy: declared`).
+- **Partition format 2:** typed values with spans and gaps, `pattern_owner`, `deployment` and
+  exactness in hourly cells, analytics aggregates and a library digest (`patterns.json`); an older
+  partition is reparsed before compose.
+- **Delta reparse** (`ingestion/reparse.py`): change classes A–H, an engine-`Set` steal scan over the
+  stored lines, rows outside the delta copied; delta == full (seeded property test); content-addressed
+  day documents are reused.
+- **Ten typed log intents** (`decision/log_intents.py`) and tools (`runtime/log_tools.py`):
+  `log_top`, `log_new`, `log_affected`, `log_trend`, `log_compare`, `log_tenants`, `log_around`,
+  `log_endpoints`, `log_signature`, `log_coverage`, plus `incidents` and `graph_neighbourhood`.
+  Every decision agent (rules, llm, cascade) goes through one typed `StructuredStep.intent`; the
+  engine compiles the scopes; aggregates carry `intent`, `args`, `rows` and a deterministic
+  `rendering` (basis, exactness with method, time basis, `source_unavailable` days).
+- **Scope guard** (`decision/log_guard.py`): under the profile a kind-less, negated or multi-kind
+  scope is refused with `intent_required` (decision steps, the request aggregate, the HTTP and MCP
+  `aggregate` tool); `logs.serving.allow_adhoc_scopes` opts out.
+- **Count semantics (B2+B3):** `FieldSpec.role` (`exactness`, `basis`, `extraction`) gives worst-row
+  exactness and `ScopeResult.applied_basis`/`applied_extraction`; `FieldSpec.additive: false` refuses
+  sum/avg (`measure_unsupported`); `Sort(field="$measure")`; `Measure(kind="bucket", of=...)`; the
+  `hour` granularity.
+- **MCP:** the log tools are MCP tools with `readOnlyHint: true`; `serving.mcp.mount_on_http` mounts
+  streamable HTTP at `/mcp` on the HTTP app (SDK DNS-rebinding protection, optional
+  `serving.mcp.token_env`); the existing tools are unchanged.
+- **Single tenant:** a tenant-scoped access policy is refused under the profile (`Engine`,
+  `create_app`, `create_mcp`); new `access.policy: none | tenant` for other profiles.
+
+### History tier and lineage (addendum A2 H1/H2)
+
+- `logs.history.tier: true` (on in `logs_example`): day documents become content-addressed,
+  append-only day shards (sqlite, or `logs.history.backend` such as OpenSearch); a generation is the
+  window shard plus shard refs; every read of a day kind filters by the pinned generation's shard
+  set; gc by reference; imports the per-day derived snapshots (formats 1 and 2). Appending a day
+  writes that day's rows only.
+- `signature_lineage` (supersede decisions) and `signature_history` (per library identity); log
+  tools fold superseded signatures into their successor. New kinds `graph_link` (one per header link
+  of the served history, per-day weights from the shards).
+- `graph_neighbourhood.days` (default 30) bounds the per-day weights.
+
+### Fallback overlay into the arms (addendum A2 L5/B7)
+
+- Model-assisted heads of the fallback overlay become rollup rows (`log_day`, `log_hour`,
+  `endpoint_day`, `exception_day`) with `extraction_source: model_assisted`; heads without a
+  signature go to `signature_id: unknown`; they never produce graph edges. `coverage_day` adds
+  `extracted_coverage` and the model-assisted counts next to the unchanged deterministic coverage.
+  Answers that include model-assisted rows state their share; `extraction: deterministic` excludes
+  them. Snapshots and history shards carry them.
+- **Fixed:** a newly sealed overlay did not change the compose identity.
+
+### Fixed (logs analytics)
+
+- Generated answers to grouped-sum questions no longer abstain when they state the group values,
+  their total, the number of groups shown or the grouped population; every aggregate record carries a
+  deterministic `rendering`, and an answer stating a number the cited exact aggregate does not back has
+  its text replaced by the rendering (recorded as `answer_number_mismatch`, action `strip`) instead
+  of abstaining; without a rendering it still abstains.
+- sqlite typed scope: the correlated field lookup now always uses the `(owner, field)` index; the
+  planner chose the `(field, value)` index and scanned every row of that value per record (1.8 s →
+  0.02 s for 4.6×10³ records).
+
+### Web UI (preview, addendum A2 §4.4)
+
+- **Design and theming.** `serving.ui.theme` names a JSON theme (brand colours, product name,
+  tagline, fonts, chart series, SVG logo), served as `/ui/theme.css` (custom properties only) and
+  `/ui/theme-logo.svg`; unsafe values refuse the start. A neutral default ships; branding stays in
+  the deployment. New visual system, live run timeline (plan, arms with counts and server time,
+  evidence, drafting, contract, answer; from the stream events only), answer card with inline
+  citation chips, exactness badges and rendering sentences, graph mini-map and a typed legend.
+- **Charts and overview.** Ranked bars (approximate bars hatched and marked ≈), gap-aware trend
+  lines, tenant × service heatmap, coverage gauges (regex-only and with-model apart) and an
+  incident timeline; an Overview dashboard over the log tools, shown only when they exist.
+
+- **Read-only web UI** in the separate wheel `su-multi-arm-ui` (`ui/`, Vite + React + TypeScript; the
+  built bundle is committed under `ui/python/su_multi_arm_ui/static`). `serving.ui.enabled: true`
+  mounts it at `/ui` on the HTTP app (same origin, same `PrincipalResolver`); the wheel missing is a
+  `ConfigError`. Views: Ask (SSE stream, citations, contract status and violations), evidence per arm
+  (structured aggregates with exactness, basis, denominator, truncated-ids flag), graph explorer
+  (graph-arm evidence; no fabricated edges), grouped-aggregate charts and a trace panel (decision,
+  arms, timings, model calls and spend).
+- **Browser guards (B10, N12).** With the UI enabled: Host allow-list (421) and cross-origin `Origin`
+  refusal on writes and the answer stream (403); strict CSP and security headers on `/ui/*`;
+  `X-Content-Type-Options: nosniff` on every `/v2/*` response. `ui.enabled` requires bearer auth or an
+  injected resolver unless `serving.ui.allow_unauthenticated_loopback: true`.
+- New config keys `serving.ui.*` and `serving.allowed_hosts`; `docs/config.schema.json` regenerated.
+- The built-in principals gain the read-only `inspect` scope (for the A2 inspect routes).
+- **Fixed:** `serve` ignored `serving.http.bind`; it now takes host and port from it unless
+  `--host`/`--port` are given, and its non-loopback guard accepts `serving.http.auth: bearer_env`.
+- New extra `su-multi-arm[ui]` (not in `all`); the core sdist excludes `ui/`.
+
+### Log features
+
+- **LLM pattern learning** (addendum A1, slice L4b). `su-multi-arm patterns learn` runs one loop:
+  mine the unparsed lines, ask `models.roles.pattern_learner` (Anthropic, OpenAI or
+  `openai_compatible`, structured output) for one proposal per cluster, gate it deterministically,
+  write it under `extraction.pattern_library.promotion`, and report coverage before and after.
+  `patterns propose` writes proposals to `proposed.yaml` only. `--dry-run` sends, spends and writes
+  nothing; `--max-usd` lowers the run cap.
+  - Egress policy (`learning.patterns.egress`): only lines processed by the configured `privacy`
+    redaction leave the process, a residual e-mail/IP/token shape refuses the run before any call,
+    `pseudonymise` attributes become per-run aliases, and a hosted role needs `allow_hosted: true`.
+  - Spend caps per run and per calendar day (`max_calls_*`, `max_usd_*`), reserved before every call;
+    the day caps are kept in a SQLite spend ledger. No retries.
+  - The gate gains `cluster_coverage`, `out_of_cluster` (absolute over-breadth bound, default 0)
+    and `fix_target`. A passing fix of a learned pattern is written as `supersede`.
+  - Human decisions `patterns promote|deprecate|disable <id>` (CLI only, recorded in
+    `decisions.yaml`). A human disable or edit always wins; the system never writes `library.yaml`.
+  - Optional git commit of the system files (`learning.patterns.git_commit`), refused while a system
+    file has uncommitted hand edits.
+  - Evidence: synthetic lines with a scripted fake provider only (docs/VALIDATION.md).
+- **Index-name grammar** (`sources.<name>.index_name`). Optional `prefix`, optional
+  `deployment_prefixes` (`{n}` = digits; recorded as the `deployment` attribute) and vocabularies for
+  any segment. A name that does not fit exactly once is `unparsed` with a typed `reason`.
+- **Safe redaction** (B11, `privacy.engine: safe`). Named redactors (`email`, `ipv4`, `ipv6`,
+  `bearer_token`, `jwt`, `api_key`, `aws_key`, `url_credentials`, `query_values`, `uuid` and
+  `request_id` hashed, `hex_secret`, and the payload classes `llm_text`, `content`, `query`,
+  `tracking_id` hashed, `record_payload` with configurable field lists, `pg_row`), user redactors
+  (`privacy.custom`) validated by the pattern engine's RE2-subset and ReDoS lint and run on the
+  configured engine (fail closed on a timeout). Runs before any partition write, on ingested
+  documents and on every prompt line; stamped (`safe:<sha16>`), counts per redactor in the partition
+  manifest. `logs run-daily|backfill|settle` run from the CLI with a safe redactor and still refuse
+  without one. `su-multi-arm privacy scan` is a content-free leak scan (text, `.gz`, SQLite).
+- **Retention scopes** (`logs.retention.raw_days`, `partition_days`/`keep_days`, `derived:
+  window|forever|<days>`) and the optional **raw-copy tier** (`logs.partitions.raw`, off by default,
+  0700/0600, `logs reparse --from-raw`, `privacy scan --raw`). With `derived: forever` composed days
+  stay served after their partitions expired (masked exemplars kept indefinitely).
+- **Interim derived archive** (A2 §4.8.6): per-day snapshots with `derived_format: 2`, an identity
+  over partition format, fallback identity and compose format, typed-value aggregates, overlay rows
+  and accounting; format-1 snapshots read and marked. `logs.history.serve_days` (default
+  `keep_days`) and `max_serve_rows` bound what compose serves; window rollups cover the masked
+  window; a manifest flag when served days span several library identities; day documents cached by
+  snapshot identity.
+- **Raw tier hardening**: parent-directory check, served-directory check, exact 0700/0600 verify,
+  every access through `ingestion/raw_reparse.py`, and a redaction change re-derives only days the
+  raw tier still holds (`rederive` step).
+- **Host guard** also when `serving.allowed_hosts` is non-empty (API-only behind a LAN forwarder)
+  and on the standalone MCP HTTP app.
+- **A2 rev 3/4 amendment of A1 §3.8.3**: rule (a) and the content-based verify are scoped to the
+  masked tier; derived and raw tiers have their own clocks and checks.
+- **Index-name grammar**: `deployment_position: before_service | after_env` (env-anchored), and
+  `unparsed: exclude` (counted as `excluded_scope.unparsed_name`).
+- **Multiline**: `closing_bracket` and contextual `python_traceback` rules (column-0 tracebacks), and
+  approved library `continuation` entries are applied when joining lines.
+- **Pattern library**: `noise` entries take `precedence: before_message` to win over a message.
+- **Sources**: the probe's PIT check is opt-in (`--probe-pit`) and skipped when unsupported or
+  `sources.<n>.disallow: [pit]`; `--request-log` writes a content-free request log; the privilege
+  endpoint is asked once.
+- **Configuration.** New keys `learning.patterns`, `models.roles.pattern_learner`,
+  `extraction.pattern_library.gate.min_cluster_coverage` / `max_out_of_cluster`, and the
+  `index_name` grammar keys; the config schema is regenerated.
+
+### Changed
+
+- **Index-name parsing no longer guesses.** A segment without a vocabulary is exactly one token, so a
+  multi-token tenant (previously "the first prefix field keeps extra separators") now needs a tenant
+  vocabulary, and a name with an undeclared left-side prefix is `unparsed` instead of being read
+  into the tenant.
+- **`keep_days` is the N most recent complete days** before today (`today - N` .. `today - 1`).
+  `run-daily` composes that window and runs retention as of today; `retention --date D` takes D as
+  today. Previously `run-daily` and the CLI used different reference days.
+- **`patterns lint`** prints every issue (also structured) and exits 1 on errors instead of failing
+  at load with a truncated message. **`patterns coverage|mine`** apply multiline joining and count
+  fragments like ingest (`--no-multiline` for the old per-line behaviour).
+- **`serve`** binds to `serving.http.bind` (and its token variable) unless overridden.
+- **Request filters** on `id`, `source`, `dataset`, `kind` are accepted without a schema entry.
+- **Aggregates** carry `measure` (the measure kind, e.g. `sum` of a field).
+- **Manifest**: `native_link_relations` counted; a local embedder's unused `base_url` is omitted.
+
+### Fixed
+
+- Grammar false positives that made complete aggregates `bounded`: "by <field> yesterday" and an
+  enum value inside a numeric field's name (real dropped qualifiers still bound the result).
+- OpenSearch/Elasticsearch: a dataset or index prefix containing `_` no longer makes the adapter
+  read its own index as foreign (every request 503); activation reads each pointer back before
+  `CURRENT` moves.
+- HTTP 503s log their cause (class, adapter, operation; no request content); `/ready` reports
+  `not_ready` when the active generation cannot be served.
+- Louvain communities are identical across processes for the same input and seed.
+- The serving path pins the generation of every request (cross-process pins), so retention cannot
+  delete it mid-request or mid-stream.
+- The PostgreSQL native-types conformance test read records after another check overwrote them.
+- Compose of 10^6 aggregate rows fits the memory budget (catalog/records written in batches,
+  catalog-only chunks dropped after their batch; 3.94 GiB peak, was 10.28 GiB).
+
+### Added
+
+- **Read-only log sources (`sources:`; addendum A1 slices L0 and L1).**
+  - Component kind `source` and the `elasticsearch_rest` adapter (Elasticsearch ≥ 7.9, OpenSearch
+    ≥ 1.0) behind an exact allow-list transport, which refuses every non-listed request before any
+    I/O.
+  - A `_has_privileges` read-only self-check (`require_read_only_role`).
+  - Discovery with the `_alias` fallback, and per-index count queries built from the mapping
+    (basis `level_field` or `token_match`).
+  - Scroll and `search_after` pulls with close hygiene and stratified caps (`hourly_quota`,
+    `random_score`).
+  - Index-name parsing by service vocabulary, longest suffix first.
+  - `LogRecord` mapping and multiline assembly.
+  - `su-multi-arm sources check|discover|count|probe`.
+  - Synthetic fixtures: a deterministic log generator, a fake cluster and a ReDoS corpus.
+  - Evidence: synthetic and contract-mocked only (docs/VALIDATION.md).
+
+- **`pattern` extractor** (addendum A1, slice L2). Set `extraction.extractors: [pattern, …]` with
+  `extraction.pattern_library`. It has:
+  - an explicit `re2` engine (extra `patterns`) or the `regex` development engine (extra
+    `patterns-lite`), with no fallback between them;
+  - an RE2-subset validator and ReDoS lint;
+  - a four-file library: human `library.yaml`, plus system-owned and append-only `learned.yaml`,
+    `proposed.yaml` and `decisions.yaml`;
+  - a loader with owner precedence and decisions replay (a human `disable` is final);
+  - an RE2 `Set` prefilter;
+  - line-scoped facts, header-scoped `native_link` attribute links, and residue composition when listed
+    first;
+  - a CAS-safe writer for the system files;
+  - the read-only CLI `patterns lint|coverage|mine`.
+- **Pattern provenance.** Generation manifests record `pattern_provenance` and a content-addressed
+  library snapshot. Extraction reuse keys of the `pattern` extractor carry a salt derived from the
+  library, so library changes re-extract while index fingerprints stay unchanged. Other extractors keep
+  their keys.
+- **Pattern learning, deterministic part** (slice L4a). It adds:
+  - a Drain-style template miner with bounded memory;
+  - a regex synthesiser;
+  - bootstrap coverage without an LLM;
+  - the validation gate;
+  - `pattern_library.promotion: auto | manual` (default `auto`).
+- **Configuration.** New keys `extraction.pattern_library` and `extraction.extractors: pattern`; the
+  config schema is regenerated. Configs that do not select `pattern` keep their index fingerprint.
+- **Daily log partitions and compose (`logs:`; addendum A1 slice L3a).**
+  - A partition store per source and day (`ingestion/partitions.py`): resumable atomic units, sealed
+    immutable versions, `reparse`/`repull` as `v+1`, tombstones.
+  - Partition-stage parsing with an optional spawn process pool, signature and unit aggregates with
+    row exactness, hourly co-firing cells, exemplars and the unparsed queue.
+  - Compose of the window into a generation with a library identity check (stale partitions are
+    reparsed first) and a compose identity (unchanged windows are not rebuilt); per-day and window
+    documents with a rendered `header` field.
+  - `logs run-daily|backfill|settle|compose` under a schedule lock separate from the write lease.
+    Pulling refuses a mapping without a redactor; the CLI has none until slice B11, so the three
+    pulling commands refuse today.
+  - Partition clocks `index_date` and `event_time` (a reporting day in `logs.timezone`, DST-aware,
+    read from every UTC index day it overlaps).
+  - Write path: the `line` chunk recipe (`ingestion.line_recipe`), projection exclusions
+    (`ingestion.projections`), `manifest_extra`. Both keys enter the index recipe only when set.
+- **Retention (`logs.retention`, `logs.pins`; slice L3b).** Rule (a) `gc` of every generation that
+  lists an expired day, cross-process pins with TTL on the file (sqlite sidecar), memory, SQL and
+  PostgreSQL registries, per-process heartbeat pins, ledger tags / `ledger_refs` / `purge` on the
+  memory, sqlite, sqlalchemy, postgres and mongodb ledgers, cache invalidation, session expiry,
+  audit records, `retention report|verify|run` with a content-based verifier. `logs` is refused on
+  MongoDB and Elasticsearch catalogs (no pins).
+- `scripts/compose_scale.py`: the compose scale benchmark (synthetic aggregate rows on SQLite).
+
+- **Native aggregation pushdown for the `opensearch` and `elasticsearch` records facets.**
+  - New `backends.<name>.records` block: `aggregation: client | native` (default `client`, unchanged
+    behaviour and fingerprints), `matched_ids_cap`, `max_groups`, `distinct_exact_cap`. It is a
+    query-time setting and is excluded from the index recipe.
+  - Under `native`, scope operations compile to server-side aggregations (`backends/_lucene_aggs.py`):
+    - `track_total_hits` for counts;
+    - `composite` paging for groups and cross-tabs (nulls via `missing_bucket`);
+    - `date_histogram` with the schema `time_zone` for calendar groups and buckets;
+    - a count-ordered `terms` request for `top_n`/`nth`, trusted only when the engine reports
+      `doc_count_error_upper_bound: 0` (OpenSearch 3.x concurrent segment slices report an error);
+    - `filters` for periods;
+    - `filter` sub-aggregations for share numerators and null counts;
+    - `stats` for sum/avg/min/max and `top_hits` for first/last seen;
+    - exact `count_distinct` by pair paging, with `cardinality` above the cap labelled `approximate`.
+    The ACL is the query of every aggregation request, and nothing is scanned or `max_matched`-bound.
+  - `ScopeResult.matched_ids_truncated` (additive, default `false`): under `native`, `matched_ids` is
+    the first `matched_ids_cap` ids and the flag says more matched. The structured arm passes it on
+    as `document_ids_truncated` (kept out of the prompt). `AggregateEvidence.empty()` also requires
+    `total == 0`.
+  - More than `max_groups` groups is a `bounded` result. A group key that the index keeps apart but
+    Python equates is a typed `BackendError`.
+  - Conformance: new kit `testing/aggregation_parity.py` (client/native parity, ACL isolation,
+    native caps). The records kit also runs natively (`opensearch_native`, `elasticsearch_native`).
+    Results are identical on OpenSearch 2.19.1, 3.9.0 and Elasticsearch 8.17.4.
+  - `scripts/bench_native_aggregation.py` measures client and native latency (docs/VALIDATION.md).
 
 ## [2.0.0a3] - 2026-11-04
 
@@ -269,3 +776,14 @@ First alpha of the v2 rewrite: Phase 0 and Phase 1 of `docs/plans/v2_implementat
 [2.0.0a3]: https://github.com/Taranjeet-SU/su_multiarm/compare/v2.0.0a2...v2.0.0a3
 [2.0.0a2]: https://github.com/Taranjeet-SU/su_multiarm/compare/v2.0.0a1...v2.0.0a2
 [2.0.0a1]: https://github.com/Taranjeet-SU/su_multiarm/releases/tag/v2.0.0a1
+
+
+### Portable log integration follow-up
+
+- Preserve full operational navigation by default; `serving.ui.navigation_profile:
+  focused` opts into the reduced Overview/Ask/Graph navigation.
+- Compile source-side incident summaries and evidence queries through configurable
+  validated source message/timestamp fields.
+- Keep private deployment-helper tests outside the distribution. The large-context batch
+  audit experiment is excluded pending quality validation; complete JSON does not
+  prove extraction quality.

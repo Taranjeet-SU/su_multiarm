@@ -22,8 +22,16 @@ Resolution table (one row per predicate/field-type combination):
   ``date_interval`` in ``MetadataSchema.timezone``; a relative expression needs the request
   ``anchor``. Failure: ``unparseable_bound``.
 
+* an agent-written ``eq``/``in`` text value on a field with an enumerable universe (2026-11-09, B5):
+  grounded by the rule table of ``decision/value_match.py`` (exact, casefold, normalized, plural,
+  distinctive token); a rule-2..5 match executes the stored value and is recorded on the
+  ``Resolution`` (``canonical``) and ``ValueResolver.canonicalized``; a rule that finds several
+  stored values is ``value_not_observed`` ("ambiguous"). An ``eq`` value no rule grounds on its
+  field moves to the one other field that grounds it only when ``ValueResolver.question`` (the
+  user's question) contains it and does not name the original field (``other_field``).
+
 Fields with ``max_catalog_cardinality: 0`` (IDs, free text) are never enumerated to a model. No
-value is ever guessed, corrected or dropped silently.
+value is ever guessed or dropped silently; every replacement is a documented rule and is recorded.
 """
 
 from __future__ import annotations
@@ -44,7 +52,9 @@ from ..core.types import (
     UnsupportedConstraint,
     UnsupportedReason,
 )
+from ..backends._scope import RECORD_KEYS
 from ..models import StrictModel
+from .value_match import MatchRule, ValueMatch, field_named, match_value, question_mentions
 
 Granularity = Literal["day", "month", "year"]
 _INT = re.compile(r"^[+-]?\d+$")
@@ -59,6 +69,10 @@ class Resolution(StrictModel):
     unsupported: UnsupportedConstraint | None = None
     zero_match: bool = False  # caller-supplied value with no observed record (applied as given)
     origin: Literal["request", "agent"] = "agent"
+    # 2026-11-09 (B5): agent values grounded by a normalization rule (``decision/value_match.py``):
+    # one ``{"field", "as_written", "value", "rule"}`` per replaced value (plus ``"from_field"`` when
+    # the question moved it to another field). Exact matches are not listed.
+    canonical: list[dict[str, Any]] = Field(default_factory=list)
 
     def ok(self) -> bool:
         return self.predicate is not None and self.unsupported is None
@@ -191,8 +205,13 @@ class ValueResolver:
         gen: GenerationId | None = None,
         acl: ScopePredicates | Sequence[Predicate] = (),
         anchor: date | None = None,
+        *,
+        value_scoped: bool = False,
     ):
         self.schema = schema
+        # staging round 4 (N10): the ACL carries a value scope (the two-halves knowledge half's
+        # sources): declared enum values count as question qualifiers only when present in scope
+        self.value_scoped = value_scoped
         self.records = records
         self.gen = gen
         self.acl = list(acl)
@@ -200,6 +219,12 @@ class ValueResolver:
         # ("this month", "last 7 days"); ``None`` refuses them (never guessed).
         self.anchor = anchor
         self._observed: dict[str, list[str] | None] = {}
+        # The user's own question (never model text) for the cross-field rule of agent values
+        # (``value_match`` module docstring); ``None`` disables it.
+        self.question: str | None = None
+        # every canonical replacement this resolver made (for the trace; values are masked there)
+        self.canonicalized: list[dict[str, Any]] = []
+        self._last_rule: MatchRule | None = None
 
     # --- observed values -------------------------------------------------------------------------
 
@@ -226,6 +251,15 @@ class ValueResolver:
                     catalog[spec.name] = values
         return catalog
 
+    def known_value(self, field: str, value: str) -> bool:
+        """``value`` is an observed value of ``field`` (case-insensitive, listable fields under their
+        cap) or, without a listable universe, ``RecordStore.exists`` confirms it. No store: False."""
+        observed = self.observed(field)
+        if observed is not None:
+            folded = value.casefold()
+            return any(isinstance(v, str) and v.casefold() == folded for v in observed)
+        return bool(self._exists(field, value))
+
     def _store_ready(self) -> bool:
         return self.records is not None and self.gen is not None
 
@@ -239,6 +273,15 @@ class ValueResolver:
     def resolve(self, predicate: Predicate, *, from_request: bool = False) -> Resolution:
         origin: Literal["request", "agent"] = "request" if from_request else "agent"
         spec = self.schema.field(predicate.field)
+        if spec is None and predicate.field in RECORD_KEYS and predicate.op in {"eq", "in"}:
+            values = predicate.value if predicate.op == "in" and isinstance(predicate.value, list) else [predicate.value]
+            if all(isinstance(v, str) for v in values):
+                # record identity, always filterable without a schema entry (string equality)
+                return Resolution(predicate=predicate, origin=origin)
+            return Resolution(
+                unsupported=UnsupportedConstraint(constraint_text=_constraint(predicate), reason="type_mismatch", suggestion=f"{predicate.field!r} is a record key; compare it with strings"),
+                origin=origin,
+            )
         if spec is None or not spec.filterable:
             return Resolution(
                 unsupported=UnsupportedConstraint(
@@ -262,10 +305,66 @@ class ValueResolver:
                 return self._resolve_range(spec, predicate, origin)
             return self._resolve_interval(spec, predicate, origin)
         except BoundError as error:
+            moved = self._retarget(spec, predicate, origin, error)
+            if moved is not None:
+                return moved
             return Resolution(
                 unsupported=UnsupportedConstraint(constraint_text=_constraint(predicate), reason=error.reason, suggestion=str(error)),
                 origin=origin,
             )
+
+    def ground_text(self, spec: FieldSpec, value: str) -> ValueMatch | None:
+        """``value_match.match_value`` over the field's enumerable universe (declared enum values, or
+        observed values of a listable field under its cap); ``None`` when it has none."""
+        universe = list(spec.enum_values or []) if spec.type == "enum" else self.observed(spec.name)
+        if universe is None:
+            return None
+        return match_value(value, universe, casefold=spec.casefold_match)
+
+    def other_field(self, field: str, value: str) -> tuple[FieldSpec, ValueMatch] | BoundError | None:
+        """The cross-field rule (``value_match`` module docstring): the one other filterable string/
+        enum field with an enumerable universe that grounds ``value``, when ``value`` is a word
+        sequence of ``self.question`` and the question does not name ``field``. ``None``: the rule
+        does not apply or nothing grounds it; ``BoundError``: several fields (or values) ground it."""
+        question = self.question
+        if not question or not question_mentions(question, value) or field_named(question, field):
+            return None
+        found: list[tuple[FieldSpec, ValueMatch]] = []
+        ambiguous: list[str] = []
+        for other in self.schema.fields:
+            if other.name == field or not other.filterable or other.type not in {"string", "enum"}:
+                continue
+            match = self.ground_text(other, value)
+            if match is None:
+                continue
+            if match.found:
+                found.append((other, match))
+            elif match.ambiguous:
+                ambiguous.extend(f"{other.name}={v!r}" for v in match.ambiguous)
+        if len(found) == 1 and not ambiguous:
+            return found[0]
+        if found or ambiguous:
+            names = [f"{s.name}={m.value!r}" for s, m in found] + ambiguous
+            return BoundError("value_not_observed", f"{field}: {value!r} is not an observed value; it matches several values of other fields ({', '.join(names[:6])}); name the field")
+        return None
+
+    def _retarget(self, spec: FieldSpec, predicate: Predicate, origin: str, error: BoundError) -> Resolution | None:
+        """An agent ``eq`` text value that no rule grounds on its field, moved to the one other field
+        that grounds it (``other_field``); ambiguity stays an explicit unsupported constraint."""
+        if origin != "agent" or error.reason != "value_not_observed" or predicate.op != "eq" or not isinstance(predicate.value, str):
+            return None
+        if spec.type not in {"string", "enum", "id"} or "ambiguous" in str(error):
+            return None
+        moved = self.other_field(spec.name, predicate.value)
+        if moved is None:
+            return None
+        if isinstance(moved, BoundError):
+            return Resolution(unsupported=UnsupportedConstraint(constraint_text=_constraint(predicate), reason=moved.reason, suggestion=str(moved)), origin=origin)  # type: ignore[arg-type]
+        other, match = moved
+        record = {"field": other.name, "from_field": spec.name, "as_written": predicate.value, "value": match.value, "rule": f"question_field:{match.rule}"}
+        self.canonicalized.append(record)
+        typed = Predicate(field=other.name, op="eq", value=match.value, negate=predicate.negate)
+        return Resolution(predicate=typed, origin=origin, canonical=[record])  # type: ignore[arg-type]
 
     @staticmethod
     def state(spec: FieldSpec, predicate: Predicate) -> Predicate | None:
@@ -321,6 +420,7 @@ class ValueResolver:
         raw = predicate.value if predicate.op == "in" else [predicate.value]
         resolved: list[JsonScalar] = []
         zero_match = False
+        canonical: list[dict[str, Any]] = []
         for value in raw:
             if spec.type in {"integer", "number"}:
                 resolved.append(_parse_number(spec, value))
@@ -331,30 +431,48 @@ class ValueResolver:
             elif spec.type == "date":
                 resolved.append(_parse_date_bound(spec, value).isoformat())
             else:
-                canonical, missing = self._resolve_text(spec, value, origin == "request")
-                resolved.append(canonical)
+                stored, missing = self._resolve_text(spec, value, origin == "request")
+                resolved.append(stored)
                 zero_match = zero_match or missing
+                if stored != value and isinstance(value, str) and origin == "agent" and self._last_rule not in {None, "exact", "casefold"}:
+                    record = {"field": spec.name, "as_written": value, "value": stored, "rule": self._last_rule}
+                    canonical.append(record)
+                    self.canonicalized.append(record)
+        if predicate.op == "in" and len(set(map(str, resolved))) != len(resolved):
+            resolved = list(dict.fromkeys(resolved))  # two spellings of one stored value
         typed = predicate.model_copy(update={"value": resolved if predicate.op == "in" else resolved[0]})
-        return Resolution(predicate=typed, zero_match=zero_match, origin=origin)
+        return Resolution(predicate=typed, zero_match=zero_match, origin=origin, canonical=canonical)
 
     def _resolve_text(self, spec: FieldSpec, value: Any, from_request: bool) -> tuple[str, bool]:
         """Returns ``(canonical value, zero_match)``; raises ``BoundError(value_not_observed)``."""
+        self._last_rule = None
         if not isinstance(value, str):
             raise BoundError("type_mismatch", f"{spec.name}: {value!r} is not text")
         if spec.type == "enum":
-            match = self._match(value, spec.enum_values or [], spec.casefold_match)
-            if match is None:
+            if from_request:
+                match = self._match(value, spec.enum_values or [], spec.casefold_match)
+                if match is None:
+                    raise BoundError("value_not_observed", f"{spec.name}: {value!r} is not one of the declared enum values")
+                return match, False
+            grounded = match_value(value, spec.enum_values or [], casefold=spec.casefold_match)
+            if grounded.ambiguous:
+                raise BoundError("value_not_observed", f"{spec.name}: {value!r} is ambiguous: it matches {grounded.ambiguous[:6]} under the documented normalization")
+            if not grounded.found:
                 raise BoundError("value_not_observed", f"{spec.name}: {value!r} is not one of the declared enum values")
-            return match, False
+            self._last_rule = grounded.rule
+            return grounded.value, False  # type: ignore[return-value]
         if from_request:
             exists = self._exists(spec.name, value)
             return value, exists is False  # applied as given; zero match reported, not rewritten
         observed = self.observed(spec.name)
         if observed is not None:
-            match = self._match(value, observed, spec.casefold_match)
-            if match is None:
+            grounded = match_value(value, observed, casefold=spec.casefold_match)
+            if grounded.ambiguous:
+                raise BoundError("value_not_observed", f"{spec.name}: {value!r} is ambiguous: it matches {grounded.ambiguous[:6]} under the documented normalization")
+            if not grounded.found:
                 raise BoundError("value_not_observed", f"{spec.name}: {value!r} is not an observed value")
-            return match, False
+            self._last_rule = grounded.rule
+            return grounded.value, False  # type: ignore[return-value]
         exists = self._exists(spec.name, value)
         if exists is None:
             raise BoundError("value_not_observed", f"{spec.name}: no record store is available to verify {value!r}")
@@ -489,6 +607,9 @@ def check_request_filters(resolver: ValueResolver, filters: dict[str, JsonScalar
       ``field_not_filterable``). Datetime/date values are parsed but pushed down as given, so the
       backend's stored-value comparison is unchanged. A string/id value on a listable field under
       its catalog cap that no record holds is applied but reported as ``value_not_observed``.
+    * the record keys ``id``, ``source``, ``dataset`` and ``kind`` (``RECORD_KEYS``), when the
+      schema does not declare them: string equality, always available (a non-string value is
+      ``type_mismatch``).
     * undeclared field under ``unknown_fields: reject``: ``field_not_filterable``.
     * undeclared field under ``unknown_fields: allow``: applied as untyped string equality,
       labelled in ``untyped`` and reported (``field_not_filterable``) because its aggregate cannot be
@@ -497,6 +618,16 @@ def check_request_filters(resolver: ValueResolver, filters: dict[str, JsonScalar
     check = FilterCheck()
     for field, value in filters.items():
         spec = schema.field(field)
+        if spec is None and field in RECORD_KEYS:
+            # Record identity (``id``/``source``/``dataset``/``kind``) is filterable on every
+            # document without a schema entry: string equality, applied as given.
+            if not isinstance(value, str):
+                check.applied[field] = value
+                check.invalid[field] = "type_mismatch"
+                check.unsupported.append(UnsupportedConstraint(constraint_text=f"{field} eq {value!r}", reason="type_mismatch", suggestion=f"{field!r} is a record key; filter it with a string"))
+                continue
+            check.applied[field] = value
+            continue
         if spec is None:
             check.applied[field] = value
             check.invalid[field] = "field_not_filterable"
@@ -525,3 +656,85 @@ def check_request_filters(resolver: ValueResolver, filters: dict[str, JsonScalar
         if type(coerced) is not type(value) or coerced != value:
             check.coercions.append({"field": field, "from": value, "to": coerced, "type": f"{type(value).__name__}->{spec.type}"})
     return check
+
+
+# --- registry-grounded customer text (unified merge M2b-2, §6.9, §6.11; lane LF) -------------------
+
+
+class CustomerMention(StrictModel):
+    """One customer named in a question: the raw alias as written in the registry, its namespace,
+    the registry customer and the log tenants (``tenant_namespace`` aliases) that join to it."""
+
+    text: str
+    namespace: str
+    customer_id: str
+    tenants: list[str] = []
+
+
+class CustomerGrounding(StrictModel):
+    """Customers named in a question, grounded through the pinned identity registry (matched aliases
+    only, ``IdentityView``). ``joins_enabled`` false: no name can be resolved (``reason``), which is
+    stated, never replaced by an unfiltered answer. ``registry_version`` pins the reading."""
+
+    joins_enabled: bool
+    reason: str | None = None
+    registry_version: str | None = None
+    customers: list[CustomerMention] = []
+
+    def tenants(self) -> list[str]:
+        return list(dict.fromkeys(t for c in self.customers for t in c.tenants))
+
+    def ungrounded(self) -> list[CustomerMention]:
+        return [c for c in self.customers if not c.tenants]
+
+    def statements(self) -> list[str]:
+        out = []
+        for c in self.customers:
+            if c.tenants:
+                out.append(f'"{c.text}" was read as customer {c.customer_id}, log tenant {", ".join(c.tenants)} (identity registry {self.registry_version}, matched aliases only).')
+            else:
+                out.append(f'"{c.text}" was read as customer {c.customer_id}, which has no matched log tenant in identity registry {self.registry_version}; operations evidence for it is not shown.')
+        return out
+
+
+def _mentions(question: str, raws: list[str]) -> list[str]:
+    """Registry raw values written in ``question`` (case-insensitive, whole words, longest first,
+    non-overlapping)."""
+    found: list[str] = []
+    taken: list[tuple[int, int]] = []
+    for raw in sorted({r for r in raws if r and len(r) >= 2}, key=lambda r: (-len(r), r)):
+        for m in re.finditer(rf"(?<![\w.\-]){re.escape(raw)}(?![\w\-]|\.\w)", question, re.I):
+            if not any(a < m.end() and m.start() < b for a, b in taken):
+                taken.append((m.start(), m.end()))
+                found.append(raw)
+                break
+    return found
+
+
+def ground_customers(question: str, identity: Any, customer_namespaces: list[str], tenant_namespace: str) -> CustomerGrounding:
+    """Customers named in ``question`` through ``identity`` (``crosssource.identity.IdentityView``):
+    a raw alias of a ``customer_namespaces`` namespace written in the question names its customer;
+    its log tenants are the ``tenant_namespace`` aliases matched to the same customer. Only matched
+    aliases join (candidate, contested, ambiguous and unmatched aliases never do); a tenant value
+    written directly in the question is the log intents' own known-value binding, not this one."""
+    if identity is None:
+        return CustomerGrounding(joins_enabled=False, reason="no identity registry configured (crosssource.identity)")
+    if not identity.joins_enabled:
+        return CustomerGrounding(joins_enabled=False, reason=identity.reason, registry_version=identity.registry_version)
+    by_namespace: dict[str, dict[str, str]] = {}
+    for (namespace, raw), customer in identity.matched.items():
+        by_namespace.setdefault(namespace, {})[raw] = customer
+    tenants_of: dict[str, list[str]] = {}
+    for raw, customer in sorted(by_namespace.get(tenant_namespace, {}).items()):
+        tenants_of.setdefault(customer, []).append(raw)
+    customers: list[CustomerMention] = []
+    seen: set[str] = set()
+    for namespace in customer_namespaces:
+        aliases = by_namespace.get(namespace, {})
+        for raw in _mentions(question, list(aliases)):
+            customer = aliases[raw]
+            if customer in seen:
+                continue
+            seen.add(customer)
+            customers.append(CustomerMention(text=raw, namespace=namespace, customer_id=customer, tenants=tenants_of.get(customer, [])))
+    return CustomerGrounding(joins_enabled=True, registry_version=identity.registry_version, customers=customers)

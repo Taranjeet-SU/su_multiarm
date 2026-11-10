@@ -59,6 +59,10 @@ _MEASURES = {
     "average": "avg", "avg": "avg", "mean": "avg", "minimum": "min", "min": "min", "maximum": "max", "max": "max",
     "highest": "max", "lowest": "min", "largest": "max", "smallest": "min", "total": "sum", "sum of": "sum", "combined": "sum", "median": "median",
 }  # fmt: skip
+# Verbs that only say a group produced records ("which customer raised/filed the most tickets";
+# 2026-11-08 parity fix): a fixed list, never a wildcard, so a state verb ("escalated") stays
+# residual and is refused rather than ignored.
+_RECORD_VERBS = r"(?:raised|filed|opened|logged|submitted|created|reported|received|generated|accumulated)"
 _GRANULARITY = {"day": "day", "days": "day", "daily": "day", "month": "month", "months": "month", "monthly": "month", "year": "year", "years": "year", "yearly": "year", "annually": "year", "annual": "year"}
 _NEGATION = re.compile(r"(?:\bnot|\bexcluding|\bexcept(?:\s+for)?|\bother\s+than|\bwithout|\bnon)[\s-]+$")
 _COMPARE = {"above": ">", "over": ">", "more than": ">", "greater than": ">", "higher than": ">", ">": ">", "at least": ">=", ">=": ">=",
@@ -437,7 +441,9 @@ class QueryGrammar:
         groups = self._alternation(self._group_forms())
         draft = result.draft
         rank_which = re.compile(
-            r"\b(?:which|what)\s+(?P<f>" + groups + r")\s+(?:has|have|had|got|gets|saw|sees|is|was|were|are|with)\s+(?:the\s+)?(?P<ord>" + _ORD + r"\s+)?(?P<dir>most|fewest|least|highest|lowest|largest|smallest|biggest|greatest)\b"
+            r"\b(?:which|what)\s+(?P<f>" + groups + r")\s+(?:(?:currently|still|now|ever|overall)\s+)?"
+            r"(?:(?:has|have|had)\s+(?:" + _RECORD_VERBS + r")\s+|(?:has|have|had|got|gets|saw|sees|is|was|were|are|with|" + _RECORD_VERBS + r")\s+)"
+            r"(?:the\s+)?(?P<ord>" + _ORD + r"\s+)?(?P<dir>most|fewest|least|highest|lowest|largest|smallest|biggest|greatest)\b"
         )
         rank_common = re.compile(
             r"\b(?:the\s+)?(?P<ord>" + _ORD + r"\s+)?(?P<dir>most|least)\s+(?:common|frequent|popular|active|used|reported)\s+(?P<f>" + groups + r")\b"

@@ -18,7 +18,8 @@ from ..backends import capabilities as caps
 from ..core.component import Dependencies, Diagnostic, Environment
 from ..core.config_graph import GraphIntent
 from ..core.errors import BackendError, ConfigError
-from ..core.types import Chunk, Document, Page, Path, Scope, ScopePredicates, ScopeSpec
+from ..core.types import Chunk, Document, EdgeKind, JsonScalar, Page, Path, Scope, ScopePredicates, ScopeSpec
+from ..core.types_typed import TypedQueryDraft
 from ..models import Hit, StrictModel
 from ..runtime.context import RunContext
 
@@ -34,7 +35,14 @@ class ArmInput(StrictModel):
     acl: ScopePredicates = Field(default_factory=list)  # ACL alone (RecordStore denominators)
     candidates: int = Field(default=200, ge=1, le=10000)
     aggregate: ScopeSpec | None = None  # structured arm only
+    typed: TypedQueryDraft | None = None  # typed_query arm only (recompiled with ``acl`` by the arm)
+    filters: dict[str, JsonScalar] = Field(default_factory=dict)  # the immutable request filters (typed_query)
+    sql: str | None = Field(default=None, min_length=1, max_length=20000)  # typed_query sql_surface mode only (re-validated with ``acl``)
+    # typed_query sql_surface: the user's own question (never model text), for the guard's
+    # cross-field value rule (``ValueResolver.other_field``); ``None`` disables that rule
+    question: str | None = Field(default=None, max_length=20000)
     graph: GraphIntent | None = None  # graph arm only: a declared traversal template and its seeds
+    edge_kinds: list[EdgeKind] | None = None  # internal incident investigation traversal policy
     incomplete_stages: list[str] = Field(default_factory=list)  # from the generation manifest
     allow_incomplete: bool = False
 

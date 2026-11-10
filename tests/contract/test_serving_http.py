@@ -255,6 +255,41 @@ def test_health_and_ready_probe_backends(fake, monkeypatch):
     assert response.status_code == 503 and response.json()["reason"] == "no active generation"
 
 
+def test_ready_waits_for_the_startup_warmup(fake, monkeypatch):
+    import threading
+    import time
+
+    from su_multi_arm.core.errors import BackendError
+
+    engine = make_engine(fake.role())
+    gate = threading.Event()
+    real = engine.warmup
+    monkeypatch.setattr(engine, "warmup", lambda: gate.wait(10) and real())
+    app = create_app(engine=engine, warmup=True)
+    client = TestClient(app)
+    running = client.get("/ready")
+    assert running.status_code == 503 and running.json()["warmup"]["status"] == "running" and running.json()["reason"] == "warm-up running"
+    gate.set()
+    deadline = time.time() + 10
+    while app.state.warmup.state()["status"] == "running" and time.time() < deadline:
+        time.sleep(0.02)
+    ready = client.get("/ready")
+    assert ready.status_code == 200 and ready.json()["warmup"]["status"] == "done" and ready.json()["warmup"]["generation"] == ready.json()["generation"]
+
+    def broken():
+        raise BackendError("sqlite", "member", "unit at /synthetic/private/path is gone")
+
+    other = make_engine(fake.role())
+    monkeypatch.setattr(other, "warmup", broken)
+    failed_app = create_app(engine=other, warmup=True)
+    while failed_app.state.warmup.state()["status"] == "running" and time.time() < deadline:
+        time.sleep(0.02)
+    failed = TestClient(failed_app).get("/ready")
+    assert failed.status_code == 503 and failed.json()["reason"] == "warm-up failed (BackendError in sqlite.member; see the server log)"
+    assert "/synthetic/private" not in failed.text
+    assert "warmup" not in TestClient(create_app(engine=make_engine(fake.role()))).get("/ready").json()  # off unless asked (serve turns it on)
+
+
 def test_dependency_failures_map_to_5xx_not_422(fake, monkeypatch):
     """Release review N4: backend, generation and provider failures are server/dependency errors
     (503/502), cancellation is 499; the detail stays generic (no backend or provider text)."""

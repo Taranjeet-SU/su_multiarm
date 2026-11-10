@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS jobs(job_id TEXT PRIMARY KEY, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS raw_replies(key TEXT PRIMARY KEY, raw_reply TEXT NOT NULL, valid INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, data TEXT NOT NULL, last_seen_at REAL NOT NULL);
 """
+# Ledger retention side tables (addendum A1 §3.8.3); also created on first use in an older runtime file.
+RETENTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS raw_tags(key TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(key, tag));
+CREATE INDEX IF NOT EXISTS raw_tags_tag ON raw_tags(tag);
+CREATE TABLE IF NOT EXISTS ledger_refs(generation TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(generation, key));
+CREATE INDEX IF NOT EXISTS ledger_refs_key ON ledger_refs(key);
+"""
 
 
 @contextmanager
@@ -77,7 +84,7 @@ def connect(path: Path, timeout: float, readonly: bool = False) -> Iterator[sqli
 def ensure_runtime(path: Path, timeout: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path, timeout) as db:
-        db.executescript(RUNTIME_SCHEMA)
+        db.executescript(RUNTIME_SCHEMA + RETENTION_SCHEMA)
 
 
 # --- typed field rows -------------------------------------------------------------------------
@@ -136,12 +143,19 @@ def _bound_condition(alias: str, bound: Any, operator: str, spec: Any = None) ->
     return f"{alias}.kind='string' AND {alias}.text_value {operator} ?", [text]
 
 
+_OWNER_INDEX = {"record_fields": "record_fields_rec", "document_fields": "document_fields_doc", "history_fields": "history_fields_rec"}
+
+
 def predicate_sql(table: str, owner_column: str, owner_expr: str, predicate: Predicate, casefold: bool, spec: Any = None) -> tuple[str, list[Any]]:
     """``EXISTS``-style SQL for one predicate against an EAV table; parameters are bound. ``spec`` is
     the field's ``FieldSpec`` when known (typed records); document scope has none."""
     alias = "f"
     params: list[Any] = [predicate.field]
-    base = f"SELECT 1 FROM {table} {alias} WHERE {alias}.{owner_column}={owner_expr} AND {alias}.field=?"
+    # A correlated lookup by owner: always the (owner, field) index. Without the hint SQLite picks the
+    # (field, value) index for an equality and scans every row of that value per outer row
+    # (quadratic; measured 1.8 s for 4.6e3 records in the A2 log-tools latency run).
+    hint = _OWNER_INDEX.get(table)
+    base = f"SELECT 1 FROM {table} {alias}{f' INDEXED BY {hint}' if hint else ''} WHERE {alias}.{owner_column}={owner_expr} AND {alias}.field=?"
     if predicate.op == "missing":
         sql = f"NOT EXISTS ({base} AND {alias}.is_null=0)"
     elif predicate.op == "eq":

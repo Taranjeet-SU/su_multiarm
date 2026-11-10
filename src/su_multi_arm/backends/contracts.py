@@ -54,6 +54,7 @@ __all__ = [
     "CacheStore",
     "LedgerStore",
     "SessionStore",
+    "RelationalProjection",
     "CONTRACT_NAMES",
 ]
 
@@ -170,6 +171,24 @@ class SessionStore(Protocol):
     def expire(self, now: float, ttl_seconds: float) -> int: ...
 
 
+@runtime_checkable
+class RelationalProjection(Protocol):
+    """Per-generation typed projection files (typed-query plan §5.2; additive after the freeze,
+    recorded in the plan changelog). Written only by the write path; read only through
+    ``connect_readonly`` (``projection/store.open_readonly`` adds the authorizer and timeout).
+    ``delete_generation`` of the adapter removes a generation's files."""
+
+    def put_file(self, gen: GenerationId, name: str, data: bytes) -> None: ...
+
+    def read_file(self, gen: GenerationId, name: str) -> bytes | None: ...
+
+    def file_names(self, gen: GenerationId) -> list[str]: ...
+
+    def connect_readonly(self, gen: GenerationId, name: str) -> Any: ...
+
+    def forget(self, gen: GenerationId) -> None: ...
+
+
 CONTRACT_NAMES: dict[str, type] = {
     "catalog": Catalog,
     "lexical": LexicalIndex,
@@ -179,4 +198,5 @@ CONTRACT_NAMES: dict[str, type] = {
     "cache": CacheStore,
     "ledger": LedgerStore,
     "session": SessionStore,
+    "relational": RelationalProjection,
 }

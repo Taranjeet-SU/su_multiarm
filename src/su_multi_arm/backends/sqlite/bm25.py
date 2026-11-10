@@ -244,6 +244,26 @@ class Bm25Segment:
             matched[rows] = True
         return score, matched
 
+    def scores_with(self, terms: Iterable[tuple[int | None, float]], avgdl: float) -> tuple[np.ndarray, np.ndarray]:
+        """``scores`` with stratum statistics (§6.5 query-time statistics): each query token's
+        ``(term id in this segment, stratum idf)`` and the stratum's ``avgdl`` replace the segment's
+        own. Same float64 expression and order as ``scores``, so a segment scored with its own idf
+        and avgdl gives identical values."""
+        score = np.zeros(self.corpus_size)
+        matched = np.zeros(self.corpus_size, dtype=bool)
+        k1, b = self.k1, self.b
+        for tid, idf in terms:
+            if tid is None:
+                continue
+            rows, freqs = self.postings(tid)
+            if not len(rows):
+                continue
+            f = freqs.astype(np.float64)
+            dl = self.doc_len[rows]
+            score[rows] += float(idf) * (f * (k1 + 1) / (f + k1 * (1 - b + b * dl / avgdl)))
+            matched[rows] = True
+        return score, matched
+
     def contains_all(self, tids: Sequence[int]) -> np.ndarray:
         """Rows containing every token (ascending), smallest posting list first."""
         ordered = sorted(set(tids), key=lambda t: int(self.offsets[t + 1] - self.offsets[t]))
@@ -255,6 +275,31 @@ class Bm25Segment:
                 break
             rows = np.intersect1d(rows, self.postings(tid)[0], assume_unique=True)
         return rows
+
+
+def okapi_idf(n: int, df: int) -> float:
+    """``BM25Okapi`` idf before the epsilon floor (the expression ``Bm25Builder.write`` uses)."""
+    return math.log(n - df + 0.5) - math.log(df + 0.5)
+
+
+def stratum_idf(n: int, dfs: Sequence[int], average_idf: float, epsilon: float) -> list[float]:
+    """Per query token idf over a stratum of ``n`` rows: ``okapi_idf``, negative values floored to
+    ``epsilon * average_idf`` exactly as ``Bm25Builder.write`` floors them."""
+    eps = epsilon * average_idf
+    out = []
+    for df in dfs:
+        value = okapi_idf(n, df)
+        out.append(eps if value < 0 else value)
+    return out
+
+
+def average_idf_of(n: int, dfs: Iterable[int]) -> float:
+    """Mean unfloored idf over a vocabulary's document frequencies (the epsilon-floor base)."""
+    total, count = 0.0, 0
+    for df in dfs:
+        total += okapi_idf(n, df)
+        count += 1
+    return total / count if count else 0.0
 
 
 def top_rows(scores: np.ndarray, matched: np.ndarray, eligible: np.ndarray | None, k: int) -> np.ndarray:

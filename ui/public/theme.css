@@ -1,0 +1,20 @@
+/* su_multi_arm UI theme: neutral (generated; custom properties only) */
+:root {
+  --brand: #0f6e66;
+  --brand-ink: #ffffff;
+  --brand-soft: #e3f0ee;
+  --brand-tint: #f2f8f7;
+  --ink: #1d2733;
+  --muted: #5b6573;
+  --surface: #f5f6f8;
+  --card: #ffffff;
+  --border: #dde2e9;
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --series-1: #1d4ed8;
+  --series-2: #b45309;
+  --series-3: #166534;
+  --series-4: #7c3aed;
+  --series-5: #0891b2;
+  --series-6: #be123c;
+}

@@ -8,8 +8,11 @@ use real-time ``_mget``. Records are written with ``refresh=true`` because ``Rec
 ``execute`` pushes the ACL and every supported predicate down as a native ``bool.filter``; the
 denominator is a ``_count``; the matched records are then scanned (``search_after`` pages, bounded by
 ``max_matched``, typed error above it) and the measure is computed by ``_scope.scope_result`` so the
-``ScopeResult`` is exact and identical to the other adapters for the same data. Native approximate
-aggregations (``cardinality``) are deliberately not used: the frozen result carries ``matched_ids``.
+``ScopeResult`` is exact and identical to the other adapters for the same data. That is the default
+``records.aggregation: client``. Under ``native`` the operations are compiled to aggregations by
+``_lucene_aggs.NativeAggregation`` (no record scan, no ``max_matched`` bound; ``matched_ids`` capped at
+``matched_ids_cap`` with ``matched_ids_truncated``; ``cardinality`` only above the exact distinct cap,
+labelled ``approximate``).
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from ...core.types import (
     StructuredRecord,
     UnsupportedConstraint,
 )
+from .._lucene_aggs import NativeAggregation
 from .._lucene_common import MAX_VALUES, SCAN_PAGE, bulk_body, check_bulk, predicates_filter, scope_filter, typed_fields
 from .._scope import document_values, record_violations, scope_result, unsupported_reason
 
@@ -254,6 +258,9 @@ class OpenSearchRecords:
                 unsupported.append(UnsupportedConstraint(constraint_text=predicate.field, reason=reason))
             else:
                 applied.append(predicate)
+        if self._b.aggregation == "native":
+            self._b.stats["records.execute.native"] += 1
+            return NativeAggregation(self._b, name, schema, lambda f: self._casefold(schema, f)).execute(scope, acl, applied, unsupported)
         population = int(self._b.call("execute", "POST", f"/{name}/_count", body={"query": self._filter(schema, acl)})["count"])
         matched = self._scan(gen, name, self._filter(schema, [*acl, *applied]), "execute")
         return scope_result(scope, matched, population, schema, applied, unsupported)

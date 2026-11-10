@@ -31,7 +31,9 @@ DOCS = [
     for rid, project, status, ext, text in ROWS
 ]
 REQUEST = {"query": "billing records", "filters": {"project": "Alpha"}, "exclude_ids": ["r2"]}
-VOLATILE = frozenset({"seconds", "trace_id", "session", "at", "elapsed_seconds"})
+# ``stream``/``first_token_seconds``/``generator_latency`` (2026-11-09): a streamed call records its
+# first-token time, a non-streamed one cannot; the answers themselves must still be equal.
+VOLATILE = frozenset({"seconds", "trace_id", "session", "at", "elapsed_seconds", "stream", "first_token_seconds", "generator_latency"})
 
 
 def config_data(backend: dict[str, Any], generator: dict[str, Any] | None, **overrides: Any) -> dict[str, Any]:

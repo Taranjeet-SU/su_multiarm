@@ -91,7 +91,9 @@ def compare(value: Any, bound: Any, spec: Any = None) -> int | None:
 
 
 def truncate(moment: datetime, granularity: str, zone: tzinfo = timezone.utc) -> datetime:
-    """Start of the calendar day/month/year containing ``moment`` in ``zone`` (UTC by default)."""
+    """Start of the calendar hour/day/month/year containing ``moment`` in ``zone`` (UTC by default)."""
+    if granularity == "hour":
+        return moment.astimezone(zone).replace(minute=0, second=0, microsecond=0)
     moment = moment.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
     if granularity == "month":
         return moment.replace(day=1)
@@ -235,6 +237,7 @@ def measure_of(scope: ScopeSpec, rows: list[StructuredRecord], population: int, 
         return {"value": chosen[0].isoformat(), "record_id": chosen[1]}, len(stamped) - len(valid)
     if measure.kind == "bucket":
         counts: Counter[str] = Counter()
+        members: dict[str, list[StructuredRecord]] = {}
         invalid = 0
         zone = zone_of(schema)
         for r in rows:
@@ -242,8 +245,18 @@ def measure_of(scope: ScopeSpec, rows: list[StructuredRecord], population: int, 
             if moment is None:
                 invalid += 1
             else:
-                counts[truncate(moment, measure.granularity or "day", zone).isoformat()] += 1
-        return dict(sorted(counts.items())), invalid
+                label = truncate(moment, measure.granularity or "day", zone).isoformat()
+                counts[label] += 1
+                members.setdefault(label, []).append(r)
+        if measure.of is None or measure.of.kind == "count":
+            return dict(sorted(counts.items())), invalid
+        # bucket of an inner measure (B3): e.g. the sum of ``lines`` per day
+        inner = scope.model_copy(update={"measure": measure.of})
+        values: dict[str, Any] = {}
+        for label in sorted(members):
+            values[label], inner_missing = measure_of(inner, members[label], population, schema)
+            invalid += inner_missing
+        return values, invalid
     numbers = [r.values.get(field) for r in rows]
     valid_numbers = [n for n in numbers if _number(n)]
     invalid = len(numbers) - len(valid_numbers)
@@ -256,6 +269,22 @@ def measure_of(scope: ScopeSpec, rows: list[StructuredRecord], population: int, 
     if measure.kind == "sum":
         return sum(valid_numbers), invalid
     return sum(valid_numbers) / len(valid_numbers), invalid
+
+
+def non_additive(scope: ScopeSpec, schema: MetadataSchema) -> UnsupportedConstraint | None:
+    """A ``sum``/``avg`` over a field declared ``additive: false`` (a per-row percentile): the value
+    would be a meaningless number, so it is refused (``measure_unsupported``), never computed."""
+    measure = scope.measure
+    if measure is None or measure.kind not in {"sum", "avg"} or not measure.field:
+        return None
+    spec = schema.field(measure.field)
+    if spec is None or spec.additive:
+        return None
+    return _flag(
+        f"{measure.kind} of {measure.field}",
+        "measure_unsupported",
+        f"{measure.field} is not additive across records (a per-row value such as a percentile); read it per row, or use min/max",
+    )
 
 
 # Upper bound on the records one typed scope may match on the request path (plan §2.1 principle 7).
@@ -288,6 +317,8 @@ def _key_repr(group: GroupRow) -> str:
 def calendar_label(moment: datetime, granularity: str, zone: tzinfo) -> str:
     """``2024``, ``2024-03`` or ``2024-03-05``: the calendar bucket of ``moment`` in ``zone``."""
     local = moment.astimezone(zone)
+    if granularity == "hour":
+        return local.replace(minute=0, second=0, microsecond=0).isoformat()
     if granularity == "year":
         return f"{local.year:04d}"
     if granularity == "month":
@@ -308,16 +339,31 @@ def _rank_value(group: GroupRow) -> float | None:
     return float(group.value) if _number(group.value) else None  # type: ignore[arg-type]
 
 
+def _asked_missing(scope: ScopeSpec) -> set[str]:
+    """Group fields whose missing value the scope asks about (a ``missing`` predicate)."""
+    return {p.field for p in scope.predicates if p.op == "missing"}
+
+
+def _null_group(group: GroupRow, asked: set[str]) -> bool:
+    """A group whose key has no value on a field the scope does not ask the missing value of
+    (2026-11-09 corpus-B fix F8): "the most common rca" ranks rca values, not the records without
+    one. Such a group is listed after the ranked ones (rank ``None``) and never kept by a top-N
+    or nth cut."""
+    return any(value is None and field not in asked for field, value in group.key.items())
+
+
 def rank_groups(scope: ScopeSpec, groups: list[GroupRow]) -> tuple[list[GroupRow], list[GroupRow]]:
     """``(kept, ties)``. Groups are ranked by their measure value (``order``, default descending;
     the group count for ``count``), ties broken by the group key ascending, with **dense** ranks
     (1, 1, 2: "second most" is the next lower value). ``nth`` keeps every group at that rank;
     ``top_n`` keeps the first N and ``ties`` lists the groups the cut excluded that share the last
     kept group's rank, so a tie at the boundary is always reported. Groups without a numeric value
-    are never ranked and come last."""
+    are never ranked and come last; nor is a NULL-key group unless the scope asks for the missing
+    value (``_null_group``)."""
     descending = (scope.order or "desc") == "desc"
-    rankable = [g for g in groups if _rank_value(g) is not None]
-    unranked = sorted((g for g in groups if _rank_value(g) is None), key=_key_repr)
+    asked = _asked_missing(scope)
+    rankable = [g for g in groups if _rank_value(g) is not None and not _null_group(g, asked)]
+    unranked = sorted((g for g in groups if _rank_value(g) is None or _null_group(g, asked)), key=_key_repr)
     rankable.sort(key=_key_repr)
     rankable.sort(key=lambda g: _rank_value(g), reverse=descending)  # type: ignore[arg-type, return-value]
     ranked: list[GroupRow] = []
@@ -332,10 +378,35 @@ def rank_groups(scope: ScopeSpec, groups: list[GroupRow]) -> tuple[list[GroupRow
     ordered = ranked + unranked
     if scope.top_n is None:
         return ordered, []
+    # a top-N cut ranks values: a group without a value (NULL key) is never one of them (F8)
+    ordered = ranked + [g for g in unranked if not _null_group(g, asked)]
     kept = ordered[: scope.top_n]
     boundary = kept[-1].rank if kept else None
     ties = [g for g in ordered[scope.top_n :] if boundary is not None and g.rank == boundary]
     return kept, ties
+
+
+def order_groups(scope: ScopeSpec, groups: list[GroupRow]) -> tuple[list[GroupRow], list[GroupRow], dict[str, Any]]:
+    """``(groups, ties, value)`` of a grouped scope: groups by count (key ascending on ties), then
+    the scope's group-field sort or measure ranking (``rank_groups``); ``value`` maps the joined key
+    to the group value. Shared by the client path and the native aggregation path."""
+    if scope.min_count is not None:
+        groups = [g for g in groups if g.count >= scope.min_count]  # HAVING COUNT(*) >= N (B5 q043)
+    groups = sorted(groups, key=lambda g: (-g.count, _key_repr(g)))
+    ties: list[GroupRow] = []
+    if scope.sort and scope.sort.field in scope.group_by:
+        # by the group key's value, the NULL group last in either direction (F8: it used to sort by
+        # ``repr``, so a descending sort put "None" first and a top-N reported it as a value)
+        field = scope.sort.field
+        asked = _asked_missing(scope)
+        valued = sorted((g for g in groups if g.key.get(field) is not None), key=lambda g: (type(g.key.get(field)).__name__, g.key.get(field)), reverse=scope.sort.descending)
+        nulls = [g for g in groups if g.key.get(field) is None]
+        groups = valued + nulls
+        if scope.top_n:
+            groups = (valued + (nulls if field in asked else []))[: scope.top_n]
+    elif scope.order is not None or scope.top_n is not None or scope.nth is not None:
+        groups, ties = rank_groups(scope, groups)
+    return groups, ties, {"|".join(str(k) for k in g.key.values()): g.value for g in groups}
 
 
 def _numerator_rows(scope: ScopeSpec, matched: list[StructuredRecord], schema: MetadataSchema, unsupported: list) -> list[StructuredRecord] | None:
@@ -419,7 +490,8 @@ def scope_result(
     semantics are identical on every records backend: group ranking (``order``/``top_n``/``nth``,
     boundary ties reported), calendar buckets of temporal group keys (``granularity``, in
     ``MetadataSchema.timezone``), period comparison (``periods``), group shares (``with_share``),
-    share numerators (``numerator``), the record list (``limit``; ``total`` always), and the count
+    share numerators (``numerator``; per group with ``group_by``: numerator / group records, B5),
+    the group threshold (``min_count``), the record list (``limit``; ``total`` always), and the count
     of null values a negated predicate included (``unknown``). A ``text`` condition that reaches a
     record store unresolved is reported as unsupported (the result is ``bounded``), never ignored."""
     unsupported = list(unsupported)
@@ -456,19 +528,25 @@ def scope_result(
         buckets: dict[tuple, list[StructuredRecord]] = {}
         for row in matched:
             buckets.setdefault(tuple(_group_value(row, f, scope, schema, zone) for f in scope.group_by), []).append(row)
+        # a share measure with a numerator, per group (2026-11-09, corpus-B B5 q043): each group's
+        # value is its numerator records over its own records ("the urgent ratio per organization");
+        # before, the numerator was ignored and the value was the group's share of the population
+        in_numerator: set[str] | None = None
+        grouped_share = _numerator_share(scope) and bool(scope.numerator)
+        if grouped_share:
+            rows_in = _numerator_rows(scope, matched, schema, unsupported)
+            in_numerator = None if rows_in is None else {r.id for r in rows_in}
         for key, rows in buckets.items():
-            group_value, group_missing = measure_of(scope, rows, population, schema)
-            missing += group_missing
+            group_numerator: int | None = None
+            if grouped_share:
+                group_numerator = None if in_numerator is None else sum(1 for r in rows if r.id in in_numerator)
+                group_value = (group_numerator / len(rows)) if group_numerator is not None and rows else None
+            else:
+                group_value, group_missing = measure_of(scope, rows, population, schema)
+                missing += group_missing
             share = (len(rows) / len(matched)) if scope.with_share and matched else None
-            groups.append(GroupRow(key=dict(zip(scope.group_by, key)), value=group_value, count=len(rows), share=share))
-        groups.sort(key=lambda g: (-g.count, _key_repr(g)))
-        if scope.sort and scope.sort.field in scope.group_by:
-            groups.sort(key=lambda g: repr(g.key.get(scope.sort.field)), reverse=scope.sort.descending)
-            if scope.top_n:
-                groups = groups[: scope.top_n]
-        elif scope.order is not None or scope.top_n is not None or scope.nth is not None:
-            groups, ties = rank_groups(scope, groups)
-        value = {"|".join(str(k) for k in g.key.values()): g.value for g in groups}
+            groups.append(GroupRow(key=dict(zip(scope.group_by, key)), value=group_value, count=len(rows), share=share, numerator=group_numerator))
+        groups, ties, value = order_groups(scope, groups)
     elif _numerator_share(scope):
         rows = _numerator_rows(scope, matched, schema, unsupported) if scope.numerator else None
         numerator = None if rows is None else len(rows)
@@ -482,8 +560,11 @@ def scope_result(
             count = sum(1 for r in matched if r.values.get(predicate.field) is None)
             if count:
                 unknown[predicate.field] = unknown.get(predicate.field, 0) + count
+    exactness, applied_basis, applied_extraction = row_semantics(schema, matched)
     return ScopeResult(
-        exactness="bounded" if unsupported else "exact",
+        exactness="bounded" if unsupported else exactness,
+        applied_basis=applied_basis,
+        applied_extraction=applied_extraction,
         denominator=population,
         value=value,
         groups=groups,
@@ -499,6 +580,31 @@ def scope_result(
         numerator=numerator,
         basis=_basis(scope, schema, applied, unknown),
     )
+
+
+def role_fields(schema: MetadataSchema, role: str) -> list[str]:
+    return [f.name for f in schema.fields if getattr(f, "role", None) == role]
+
+
+def row_semantics(schema: MetadataSchema, matched: list[StructuredRecord]) -> tuple[str, list[str], list[str]]:
+    """Count semantics over the matched rows (A1 §3.9.1, B2): ``exact`` unless a ``role:
+    exactness`` field of some matched row says ``approximate`` (worst row wins); the distinct
+    values of the ``role: basis`` and ``role: extraction`` fields."""
+    exactness = "exact"
+    for name in role_fields(schema, "exactness"):
+        if any(r.values.get(name) == "approximate" for r in matched):
+            exactness = "approximate"
+
+    def distinct(role: str) -> list[str]:
+        out: set[str] = set()
+        for name in role_fields(schema, role):
+            for r in matched:
+                value = r.values.get(name)
+                if isinstance(value, str) and value:
+                    out.update(v for v in value.split(",") if v)
+        return sorted(out)
+
+    return exactness, distinct("basis"), distinct("extraction")
 
 
 MAX_HOPS = 3

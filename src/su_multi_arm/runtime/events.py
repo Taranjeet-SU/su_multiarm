@@ -20,6 +20,7 @@ token, and an in-flight provider stream is closed. Usage already spent is commit
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from typing import Annotated, Any, Callable, Literal, Union
@@ -63,6 +64,9 @@ class ReviewRoundEvent(_Event):
 class EvidenceEvent(_Event):
     event: Literal["evidence"] = "evidence"
     ids: list[str]
+    # additive: ``{id, title, source, url}`` of each packed evidence row, in ``ids`` order, so a client
+    # can list (and number) the sources before generation starts
+    items: list[dict[str, Any]] = Field(default_factory=list)
     omitted_ids: list[str] = Field(default_factory=list)
     truncated_ids: list[str] = Field(default_factory=list)
 
@@ -76,7 +80,7 @@ class TokenEvent(_Event):
 
 class ContractEvent(_Event):
     event: Literal["contract"] = "contract"
-    status: Literal["passed", "stripped", "abstained"]
+    status: Literal["passed", "stripped", "abstained", "annotated"]
     violations: list[Violation] = Field(default_factory=list)
     unsupported_constraints: list[UnsupportedConstraint] = Field(default_factory=list)
     tokens_streamed: int = 0
@@ -90,10 +94,15 @@ class DoneEvent(_Event):
     result: AnswerResult
 
 
+ERROR_STAGES = frozenset({"planner", "generator", "reviewer", "community"})
+LOGGER = logging.getLogger(__name__)
+
+
 class ErrorEvent(_Event):
     event: Literal["error"] = "error"
     category: str
     message: str
+    stage: Literal["planner", "generator", "reviewer", "community"] | None = None
 
 
 AnswerEvent = Annotated[
@@ -131,6 +140,24 @@ def error_category(exc: BaseException) -> str:
     return "internal"
 
 
+def failure_reason(exc: BaseException, category: str) -> str:
+    """A loggable reason for a failed run. Provider, schema and request failures may carry model or
+    caller text, so only content-free attributes are logged for them (HTTP status, stop reason, the
+    violated field paths); an unclassified (``internal``) failure is a code fault and its message is
+    logged (one line, at most 300 characters)."""
+    if category == "internal":
+        return " ".join(str(exc).split())[:300]
+    parts = []
+    for name in ("status_code", "status", "stop_reason", "operation", "kind"):
+        value = getattr(exc, name, None)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            parts.append(f"{name}={value}")
+    paths = getattr(exc, "paths", None)
+    if paths:
+        parts.append(f"paths={','.join(str(p) for p in paths[:5])}")
+    return " ".join(parts) or "-"
+
+
 Emit = Callable[[Any], None]
 
 
@@ -141,9 +168,15 @@ class AnswerStream:
     ``RunCancelled`` after cancellation. ``next_event(timeout)`` returns ``None`` when no event
     arrived within ``timeout`` (serving layers send a heartbeat then)."""
 
-    def __init__(self, run: Callable[[Emit, Callable[[str], None]], AnswerResult], cancel_budget: Callable[[str], None] | None = None):
+    def __init__(
+        self,
+        run: Callable[[Emit, Callable[[str], None]], AnswerResult],
+        cancel_budget: Callable[[str], None] | None = None,
+        usage: Callable[[], dict[str, Any]] | None = None,
+    ):
         self._run = run
         self._cancel_budget = cancel_budget
+        self._usage = usage
         self._queue: queue.Queue = queue.Queue()
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
@@ -181,7 +214,12 @@ class AnswerStream:
             result = self._run(self._emit, self._delta)
             self._put(DoneEvent(result=result))
         except BaseException as exc:  # every failure becomes the terminal ``error`` event
-            self._put(ErrorEvent(category=error_category(exc), message=str(exc)))
+            stage = getattr(exc, "stage", None)
+            stage = stage if stage in ERROR_STAGES else None
+            category = error_category(exc)
+            reason = failure_reason(exc, category)
+            LOGGER.warning("answer stream failed: category=%s stage=%s error=%s reason=%s", category, stage, type(exc).__name__, reason)
+            self._put(ErrorEvent(category=category, message=str(exc), stage=stage))
         finally:
             self.worker_done.set()
 
@@ -226,6 +264,11 @@ class AnswerStream:
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
+
+    def usage(self) -> dict[str, Any] | None:
+        """The run budget's usage so far (``reserved``/``used`` per kind), when the producer exposes
+        it: what a cancelled or abandoned run already spent."""
+        return None if self._usage is None else self._usage()
 
     def close(self) -> None:
         self.cancel("closed")

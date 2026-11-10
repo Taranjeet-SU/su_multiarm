@@ -12,8 +12,10 @@ Query-compiler operations (2.0.0a3): calendar ``windows`` become half-open ``dat
 predicates on one time basis (``ValueResolver.window``, anchored); ``periods`` become
 ``ScopeSpec.periods`` plus one pushed-down span predicate; ``numerator`` predicates resolve like
 scope predicates; a temporal ``group_by`` needs a ``granularity``; ranking (``order``/``top_n``/
-``nth``), ``with_share``, ``text`` and ``limit`` pass through and are checked by ``ScopeSpec``
-(an incoherent combination is ``measure_unsupported``, never repaired).
+``nth``), ``with_share``, ``text``, ``limit`` and ``min_count`` (2026-11-09: the groups' record
+threshold) pass through and are checked by ``ScopeSpec`` (an incoherent combination is
+``measure_unsupported``, never repaired). A ``share`` measure with a ``numerator`` and ``group_by``
+is the numerator's share **within each group** (B5 q043), ranked by ``order``/``top_n``/``nth``.
 """
 
 from __future__ import annotations
@@ -64,6 +66,8 @@ class ScopeDraft(StrictModel):
     numerator: list[Predicate] = Field(default_factory=list)
     text: TextMatch | None = None
     limit: int | None = Field(default=None, ge=1, le=10000)
+    # 2026-11-09 (B5 q043): "among groups with at least N records" (HAVING COUNT(*) >= N); needs group_by
+    min_count: int | None = Field(default=None, ge=1, le=1_000_000, description="Keep only groups with at least this many matched records (HAVING COUNT(*) >= N), applied before ranking; needs group_by.")
 
 
 class CompiledScope(StrictModel):
@@ -119,9 +123,23 @@ class ScopeCompiler:
                 unsupported.append(self._flag(f"sort by {sort.field}", "measure_unsupported", f"sort direction {wanted} contradicts order {order}"))
             else:
                 sort, order = None, wanted
+        elif sort is not None and sort.field in draft.group_by and (order is not None or draft.top_n is not None or getattr(draft, "nth", None) is not None):
+            # 2026-11-09 corpus-B fix F8: a top-N / nth / ranking of groups sorted by the group key
+            # ("organization desc", "created_date desc" with top_n 1) is not the ranking it is
+            # labelled as ("which month has the most" answered with the latest month). Refused, never
+            # re-ranked by the measure on the planner's behalf.
+            unsupported.append(
+                self._flag(f"sort by {sort.field}", "measure_unsupported", "a top_n/nth/order over groups ranks them by their count or measure; sorting by the group key contradicts it (drop sort)")
+            )
         elif sort is not None and sort.field not in self.schema.sortable():
             unsupported.append(self._flag(f"sort by {sort.field}", "field_not_filterable", f"declare {sort.field!r} as sortable"))
         time_basis = draft.time_basis
+        if time_basis is not None and self.schema.field(time_basis) is None:
+            # 2026-11-09 corpus-B fix F9: the time role label ("created") names the one datetime/date
+            # field that declares it; ambiguous or unknown labels stay unsupported below
+            labelled = [f.name for f in self.schema.fields if f.time_basis == time_basis and f.type in TEMPORAL]
+            if len(labelled) == 1:
+                time_basis = labelled[0]
         if time_basis is not None:
             spec = self.schema.field(time_basis)
             if spec is None or spec.type not in TEMPORAL or spec.time_basis is None:
@@ -194,6 +212,7 @@ class ScopeCompiler:
                 numerator=numerator,
                 text=getattr(draft, "text", None),
                 limit=getattr(draft, "limit", None),
+                min_count=getattr(draft, "min_count", None),
             )
         except ValidationError as error:
             problem = "; ".join(e["msg"] for e in error.errors())
@@ -212,6 +231,8 @@ class ScopeCompiler:
             names |= {"count", "record_count", "group_count", "records"}
         if measure is not None and measure.field and kind in NUMERIC_MEASURES:
             names.add(measure.field.casefold())
+        if kind == "share":
+            names |= {"ratio", "percentage", "proportion", "fraction"}  # B5 q043: "sort by ratio"
         return name in names
 
     def _temporal(self, field: str) -> bool:

@@ -74,7 +74,7 @@ def test_minimal_v2_config_validates_with_fail_closed_defaults():
         (lambda d: d["pipeline"].__setitem__("decision", {"kind": "classifier"}), "decision", "exactly one of artifact"),
         (lambda d: d.__setitem__("pipeline", {"arms": {"cache": {"backend": "local"}}}), "arms", "at least one retrieval arm"),
         (lambda d: d.__setitem__("serving", {"http": {"bind": "0.0.0.0:8099"}}), "serving", "requires auth"),
-        (lambda d: d.__setitem__("schema_version", 3), "schema_version", ""),
+        (lambda d: d.__setitem__("schema_version", 4), "schema_version", ""),  # 3 is the unified-collection schema (S0)
     ],
 )
 def test_validation_errors_carry_a_key_path(mutate, path, match):
@@ -317,7 +317,7 @@ def test_schema_files_match_the_models():
     assert not schema.drift(ROOT / "docs/config.schema.json", Config), "run core.schema.write_all('docs')"
     assert not schema.drift(ROOT / "docs/config_v1.schema.json", ConfigV1), "run core.schema.write_all('docs')"
     generated = json.loads(schema.render(Config))
-    assert generated["properties"]["schema_version"]["const"] == 2
+    assert generated["properties"]["schema_version"]["enum"] == [2, 3]  # v3: unified collection (S0)
     assert generated["$defs"]["DecisionConfig"]["properties"]["on_failure"]["default"] == "fail_closed"
     assert generated["additionalProperties"] is False
 
@@ -362,4 +362,4 @@ def test_cli_config_subcommands(tmp_path, capsys, monkeypatch):
     assert report["schema_version"] == 2 and report["warnings"] == [] and report["decision"] == "rules"
     monkeypatch.setattr("sys.argv", ["su-multi-arm", "--config", str(output), "config", "schema"])
     main()
-    assert json.loads(capsys.readouterr().out)["properties"]["schema_version"]["const"] == 2
+    assert json.loads(capsys.readouterr().out)["properties"]["schema_version"]["enum"] == [2, 3]

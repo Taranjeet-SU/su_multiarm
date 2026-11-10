@@ -147,6 +147,12 @@ class SqliteRecords:
         row = db.execute("SELECT value FROM meta WHERE key='metadata_schema'").fetchone()
         return MetadataSchema.model_validate_json(row["value"]) if row else MetadataSchema()
 
+    def schema(self, gen: GenerationId) -> MetadataSchema:
+        """The metadata schema this store's records were sealed with (a partitioned collection asks
+        each member whether it holds a field at all: ``PartitionedRecords.values``)."""
+        with self._b.catalog_db(gen) as db:
+            return self._schema(db)
+
     def upsert(self, gen: GenerationId, records: Sequence[StructuredRecord], schema: MetadataSchema) -> None:
         with self._b.catalog_db(gen, create=True) as db:
             db.execute("INSERT OR REPLACE INTO meta VALUES ('metadata_schema', ?)", (schema.model_dump_json(),))
@@ -179,7 +185,33 @@ class SqliteRecords:
             params.extend(extra)
         return " AND ".join(clauses), params
 
+    def population(self, gen: GenerationId, acl: ScopePredicates, exclude_ids: frozenset[str] = frozenset()) -> int:
+        """The ACL population of this store (``matched``'s denominator) without matching any scope:
+        a partitioned collection counts a member that cannot hold a scope's field this way."""
+        excluded = sorted(exclude_ids)
+        with self._b.catalog_db(gen) as db:
+            schema = self._schema(db)
+            where, params = self._where(schema, acl)
+            if excluded:
+                db.execute("CREATE TEMP TABLE IF NOT EXISTS _excluded(id TEXT PRIMARY KEY)")
+                db.execute("DELETE FROM _excluded")
+                db.executemany("INSERT OR IGNORE INTO _excluded VALUES (?)", [(i,) for i in excluded])
+                where += " AND r.id NOT IN (SELECT id FROM _excluded)"
+            return int(db.execute(f"SELECT count(*) FROM records r WHERE {where}", params).fetchone()[0])
+
     def execute(self, gen: GenerationId, scope: ScopeSpec, acl: ScopePredicates) -> ScopeResult:
+        schema, matched, population, applied, unsupported = self.matched(gen, scope, acl)
+        return scope_result(scope, matched, population, schema, applied, unsupported)
+
+    def matched(
+        self, gen: GenerationId, scope: ScopeSpec, acl: ScopePredicates, exclude_ids: frozenset[str] = frozenset(), cap: int | None = None
+    ) -> tuple[MetadataSchema, list[StructuredRecord], int, list[Predicate], list[UnsupportedConstraint]]:
+        """The inputs of ``scope_result`` for this generation: ``(schema, matched rows ordered by id,
+        ACL population, applied, unsupported)``. ``exclude_ids`` (superseded/tombstoned records of a
+        partitioned view) count neither as rows nor as population; ``cap`` defaults to the
+        backend's records-scan cap. A partitioned collection concatenates the rows of its members and
+        calls ``scope_result`` once, so the semantics are those of one store."""
+        excluded = sorted(exclude_ids)
         with self._b.catalog_db(gen) as db:
             schema = self._schema(db)
             applied, unsupported = [], []
@@ -190,13 +222,20 @@ class SqliteRecords:
                 else:
                     applied.append(predicate)
             acl_where, acl_params = self._where(schema, acl)
+            if excluded:
+                db.execute("CREATE TEMP TABLE IF NOT EXISTS _excluded(id TEXT PRIMARY KEY)")
+                db.execute("DELETE FROM _excluded")
+                db.executemany("INSERT OR IGNORE INTO _excluded VALUES (?)", [(i,) for i in excluded])
+                acl_where += " AND r.id NOT IN (SELECT id FROM _excluded)"
             population = int(db.execute(f"SELECT count(*) FROM records r WHERE {acl_where}", acl_params).fetchone()[0])
             where, params = self._where(schema, [*acl, *applied])
-            cap = matched_cap(self._b)
+            if excluded:
+                where += " AND r.id NOT IN (SELECT id FROM _excluded)"
+            cap = matched_cap(self._b) if cap is None else cap
             rows = db.execute(f"SELECT r.data FROM records r WHERE {where} ORDER BY r.id LIMIT ?", [*params, cap + 1]).fetchall()
         check_matched(KIND, rows, cap)
         matched = [StructuredRecord.model_validate_json(r["data"]) for r in rows]
-        return scope_result(scope, matched, population, schema, applied, unsupported)
+        return schema, matched, population, applied, unsupported
 
     def exists(self, gen: GenerationId, field: str, value: Any, acl: ScopePredicates) -> bool:
         with self._b.catalog_db(gen) as db:

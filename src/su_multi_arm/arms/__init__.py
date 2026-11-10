@@ -7,9 +7,11 @@ from .dense import DenseArm
 from .exact_id import ExactIdArm
 from .graph import GraphArm
 from .lexical import LexicalArm
+from .segment import SegmentArm
 from .structured import StructuredArm
+from .typed_query import TypedQueryArm
 
-BUILTIN_ARMS: tuple[type, ...] = (ExactIdArm, DenseArm, LexicalArm, StructuredArm, GraphArm, CommunityArm)
+BUILTIN_ARMS: tuple[type, ...] = (ExactIdArm, DenseArm, LexicalArm, StructuredArm, GraphArm, CommunityArm, TypedQueryArm, SegmentArm)
 
 
 def builtin_registry() -> Registry:
@@ -32,4 +34,6 @@ __all__ = [
     "StructuredArm",
     "GraphArm",
     "CommunityArm",
+    "TypedQueryArm",
+    "SegmentArm",
 ]

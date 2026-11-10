@@ -8,9 +8,11 @@ from .base import (
     DecisionAgent,
     DecisionFailure,
     DecisionRequest,
+    DroppedStep,
     Plan,
     RetrievalStep,
     StructuredStep,
+    TypedStep,
 )
 from .cascade import CascadeAgent, CascadeConfig
 from .classifier import ClassifierAgent, ClassifierConfig, ClassifierModel, ClassifierOutput
@@ -36,6 +38,7 @@ __all__ = [
     "DecisionAgent",
     "DecisionFailure",
     "DecisionRequest",
+    "DroppedStep",
     "Intents",
     "LlmAgent",
     "LlmConfig",
@@ -48,6 +51,7 @@ __all__ = [
     "ScopeCompiler",
     "ScopeDraft",
     "StructuredStep",
+    "TypedStep",
     "ValueResolver",
     "detect_intents",
     "resolve_request_filters",

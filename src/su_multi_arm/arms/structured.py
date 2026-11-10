@@ -17,9 +17,12 @@ import re
 from typing import Any, ClassVar
 
 from ..backends import capabilities as caps
+from ..backends._scope import non_additive
+from ..decision.log_guard import log_scope_guard
 from ..core.component import Diagnostic, Environment
 from ..core.config import StructuredArm as StructuredArmConfig
 from ..core.errors import BackendError
+from ..generation.rendering import render_aggregate
 from ..core.types import GenerationId, LexicalQuery, Page, Predicate, Scope, ScopeResult, ScopeSpec, TextMatch, UnsupportedConstraint
 from ..runtime.context import RunContext
 from .base import ArmInput, ArmResult, BaseArm
@@ -33,7 +36,7 @@ def operation_name(spec: ScopeSpec) -> tuple[str, str | None]:
     if spec.periods:
         return "compare_periods", spec.time_basis
     if spec.group_by:
-        if len(spec.group_by) == 2:
+        if len(spec.group_by) >= 2:
             return "cross_tab", "|".join(spec.group_by)
         if spec.nth is not None or spec.top_n is not None or spec.order is not None:
             return "rank", spec.group_by[0]
@@ -45,6 +48,22 @@ def operation_name(spec: ScopeSpec) -> tuple[str, str | None]:
     if spec.measure.kind == "count_distinct":
         return "count_distinct", spec.measure.unit
     return spec.measure.kind, spec.measure.field
+
+
+def measure_of(spec: ScopeSpec) -> dict[str, Any]:
+    """The measure behind an aggregate's values: ``count`` of records unless the scope declares
+    another kind (``sum``, ``avg``, ``min``, ``max``, ``count_distinct``, …) and its field or unit."""
+    measure = spec.measure
+    if measure is None:
+        return {"kind": "count", "of": "records"}
+    out: dict[str, Any] = {"kind": measure.kind}
+    for key in ("field", "unit", "granularity"):
+        value = getattr(measure, key, None)
+        if value is not None:
+            out[key] = value
+    if measure.kind == "count" and "unit" not in out:
+        out["of"] = "records"
+    return out
 
 
 def text_query(text: TextMatch) -> LexicalQuery | None:
@@ -167,8 +186,18 @@ class StructuredArm(BaseArm):
             constraints.append(Predicate(field="id", op="in", value=list(scope.exclude_ids), negate=True))
         if scope.document_ids is not None:
             constraints.append(Predicate(field="id", op="in", value=list(scope.document_ids)))
+        refused = non_additive(spec, self.schema) if self.schema is not None else None
+        guard = self.deps.components.get("log_scope_guard")
+        if refused is None and guard:
+            # R2-B4: decision steps and the request aggregate; a scope executed under source
+            # conditions that admit no log source (the knowledge half, N1) cannot read a log rollup
+            refused = log_scope_guard(spec, context=constraints, log_sources=getattr(guard, "log_sources", None))
+        if refused is not None:
+            result = ScopeResult(exactness="bounded", denominator=0, unsupported=[refused], applied=[])
+            return ArmResult(arm=self.name, aggregates=[aggregate_record(spec, result)])
         executable, flagged, basis = self.resolve_text(ctx, spec, scope)
-        result = self._facet().execute(ctx.generation, executable, constraints)
+        store = self.deps.components.get("records_router") or self._facet()  # H1: day kinds read their shards
+        result = store.execute(ctx.generation, executable, constraints)
         if flagged:
             result = result.model_copy(update={"exactness": "bounded", "unsupported": [*result.unsupported, *flagged]})
         if basis:
@@ -193,6 +222,13 @@ def aggregate_record(spec: ScopeSpec, result: ScopeResult) -> dict[str, Any]:
         "groups": [g.model_dump(mode="json") for g in result.groups],
         "total": result.total,
         "basis": list(result.basis),
+        "applied_basis": list(result.applied_basis),
+        "applied_extraction": list(result.applied_extraction),
+        # the numbers of the answer come from here (``generation/rendering.py``)
+        "rendering": render_aggregate(spec, result),
+        # what each value measures (P12): ``operation`` names the shape (group_count, rank, …), this
+        # names the measure (a grouped sum is ``{"kind": "sum", "field": "lines"}``, not a count)
+        "measure": measure_of(spec),
     }
     if any(g.rank is not None or g.share is not None for g in result.groups) or spec.periods:
         aggregate["rows"] = [{k: v for k, v in g.model_dump(mode="json").items() if v is not None} for g in result.groups]
@@ -210,6 +246,8 @@ def aggregate_record(spec: ScopeSpec, result: ScopeResult) -> dict[str, Any]:
     if spec.limit is not None:
         aggregate["listed"] = [r.model_dump(mode="json", exclude_none=True) for r in result.listed]
         aggregate["shown"] = f"showing {len(result.listed)} of {result.total}"
+    if result.matched_ids_truncated:  # native aggregation: ``document_ids`` is the first matched_ids_cap ids of ``total``
+        aggregate["document_ids_truncated"] = True
     if result.unknown:
         aggregate["unknown"] = dict(result.unknown)
     if result.numerator is not None:

@@ -134,6 +134,24 @@ class Trace:
             span.ended = self.clock()
             stack.pop()
 
+    def current(self) -> Span:
+        """This thread's current span (the root when none is open)."""
+        return self._current()
+
+    @contextmanager
+    def attached(self, span: Span) -> Iterator[Span]:
+        """Record this thread's events and child spans under ``span``, a span opened by another
+        thread (a worker of a concurrent stage keeps its events where the sequential run put them;
+        the span is not ended here)."""
+        stack = getattr(self._stack, "items", None)
+        if stack is None:
+            stack = self._stack.items = []
+        stack.append(span)
+        try:
+            yield span
+        finally:
+            stack.pop()
+
     def set(self, **attributes: Any) -> None:
         self._current().set(**attributes)
 

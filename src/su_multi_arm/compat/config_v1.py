@@ -604,6 +604,8 @@ def downgrade(v2: "ConfigV2") -> Config:
                 raise ConfigError(f"v1 has no postgres {key}; only the default can be downgraded", f"backends.pg.{key}")
     if v2.communities.strategy not in {"entity", "louvain"} or v2.communities.hierarchy is not None or v2.communities.stats is not None:
         raise ConfigError("v1 has no hierarchical communities or community stats", "communities")
+    if v2.models.roles.query_writer is not None:
+        raise ConfigError("v1 has no query_writer role (typed router / SQL writer)", "models.roles.query_writer")
     for name, role in v2.models.roles.chat_roles().items():
         if role.provider == "openai":
             raise ConfigError("v1 has no openai chat provider (use openai_compatible)", f"models.roles.{name}.provider")
@@ -617,7 +619,13 @@ def downgrade(v2: "ConfigV2") -> Config:
     arms = v2.pipeline.arms
     if arms.exact_id is not None or arms.cache is not None:
         raise ConfigError("v1 has no exact_id or cache arm", "pipeline.arms")
+    if arms.typed_query is not None or v2.projection.enabled:
+        raise ConfigError("v1 has no typed projection or typed_query arm", "projection")
     decision = v2.pipeline.decision
+    if decision.schema_repair_attempts:
+        raise ConfigError("v1 cannot express planner schema repair", "pipeline.decision.schema_repair_attempts")
+    if decision.on_step_failure != "abstain":
+        raise ConfigError("v1 cannot express a step-level failure policy", "pipeline.decision.on_step_failure")
     if decision.kind == "rules":
         mode = "raw"
     elif decision.kind == "llm":
@@ -663,7 +671,7 @@ def downgrade(v2: "ConfigV2") -> Config:
             threshold=v2.extraction.threshold,
             model=_model(roles.extractor),
         ),
-        privacy=PrivacyConfig(**v2.privacy.model_dump(exclude={"trace_masking"})),
+        privacy=_v1_privacy(v2.privacy),
         input_mapping=None if v2.ingestion.input_mapping is None else InputMapping(**v2.ingestion.input_mapping.model_dump()),
         arms=ArmsConfig(
             enabled=enabled,
@@ -710,3 +718,10 @@ def downgrade(v2: "ConfigV2") -> Config:
         ),
         max_llm_calls=v2.budgets.max_llm_calls,
     )
+
+
+def _v1_privacy(privacy: Any) -> PrivacyConfig:
+    """The v1 privacy keys; the B11 safe engine has no v1 equivalent."""
+    if privacy.engine != "legacy":
+        raise ConfigError("privacy.engine: safe has no schema_version 1 equivalent", "privacy.engine")
+    return PrivacyConfig(redact_emails=privacy.redact_emails, patterns=dict(privacy.patterns), metadata_fields=list(privacy.metadata_fields))

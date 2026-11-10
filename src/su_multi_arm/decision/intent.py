@@ -34,7 +34,8 @@ LANGUAGE = "en"
 # Without a target the words are ordinary English ("all the steps", "the latest release notes",
 # "every time the service restarts") and the question is a retrieval question.
 _COUNT = re.compile(r"\b(how many|number of|total number of|count of|count the|a count)\b", re.I)
-_GAP = r"(?:[\w'-]+\s+){0,3}"  # up to three words between operator and target
+# up to three words between operator and target; "high+urgent", "open/pending" are one word (F5)
+_GAP = r"(?:[\w'+/&-]+\s+){0,3}"
 _OPERATORS: dict[AggregateKind, str] = {
     "total": r"(total(?!\s+number\b)|sum of|summed|altogether|add up)",
     "list": r"(list (all|every)|show (me )?(all|every)|all (of )?the|every|enumerate|exhaustive)",
@@ -42,10 +43,14 @@ _OPERATORS: dict[AggregateKind, str] = {
     "earliest": r"(earliest|first (recorded|seen|reported|known)|oldest|first time)",
     "latest": r"(latest|most recent|last (recorded|seen|reported)|newest|last time)",
     # query-compiler operators (2.0.0a3): ranking, breakdowns, numeric measures, shares, comparisons
-    "rank": r"(top \d+|top|(most|least) (common|frequent|popular|active)|(has|have|had|with) the (\w+ )?(most|fewest|least|highest|lowest)|second|third|\d+(st|nd|rd|th) most)",
+    # "(has) raised/filed/opened ... the most": record-producing verbs only (2026-11-08 parity fix)
+    # 2026-11-09 corpus-B fix F5: "appears/occurs most often", "spans/covers the most distinct",
+    # "next (two) highest", "second-most", "highest ... ratio": ranking phrasings the targeted grammar
+    # missed (the SQL result was then labelled bounded with ``NO_OPERATOR``)
+    "rank": r"(top \d+|top|(most|least) (common|frequent|popular|active)|(has|have|had|with|spans?|spanning|covers?|covering) the (\w+ )?(most|fewest|least|highest|lowest)|((has|have|had) )?(raised|filed|opened|logged|submitted|created|reported|received|generated|accumulated) the (\w+ )?(most|fewest|least|highest|lowest)|((appears?|occurs?|recurs?|shows? up) )?(the )?most (often|frequently)|next (\w+ )?(highest|lowest|most|largest|biggest|fewest)|(second|third|fourth|fifth)[ -](most|highest|lowest|largest|fewest)|second|third|\d+(st|nd|rd|th) most)",
     "breakdown": r"(by|per|for each|broken down by|break down by|breakdown by|grouped by|distribution of|monthly|yearly|daily)",
     "measure": r"(average|avg|mean|median|minimum|maximum)",
-    "share": r"(percentage|percent|share|proportion|fraction|ratio)",
+    "share": r"(percentages?|percent|share|proportions?|fractions?|ratios?)",
     "compare": r"(vs\.?|versus|compared (to|with)|compare)",
 }
 # Operators that must sit right next to their target (at most an article between): "by" and "per"
@@ -98,7 +103,18 @@ def _targeted_grammar(targets: Sequence[str]) -> tuple[tuple[AggregateKind, re.P
     grammar: list[tuple[AggregateKind, re.Pattern[str]]] = [("count", _COUNT)]
     for kind, body in _OPERATORS.items():
         if kind in _TIGHT:
-            grammar.append((kind, re.compile(r"\b" + body + r"\s+(?:the\s+|each\s+)?\b" + target + r"\b|\b(?:monthly|yearly|daily)\b(?=.*\b" + target + r"\b)", re.I)))
+            # 2026-11-09 (B4 q001): "the status breakdown", "a priority distribution": the target
+            # directly before a breakdown noun is the group-by too
+            grammar.append(
+                (
+                    kind,
+                    re.compile(
+                        r"\b" + body + r"\s+(?:the\s+|each\s+)?\b" + target + r"\b|\b(?:monthly|yearly|daily)\b(?=.*\b" + target + r"\b)"
+                        r"|\b" + target + r"\s+(?:breakdown|distribution|split)\b",
+                        re.I,
+                    ),
+                )
+            )
             continue
         after = r"\b" + body + r"\s+" + _GAP + r"\b" + target + r"\b"
         before = r"\b" + target + r"\b\s+" + _GAP + body + r"\b"
@@ -176,9 +192,45 @@ def detect_intents(query: str, id_patterns: Sequence[str] = (), targets: Sequenc
         aggregates=aggregates,
         untargeted=untargeted,
         exact_ids=list(dict.fromkeys(exact_ids)),
-        quoted_phrases=list(dict.fromkeys(q.strip() for q in quoted if q.strip())),
+        # trailing punctuation inside the quotes is the sentence's ("'intermittent,' 'failing'"; B4 q041)
+        quoted_phrases=list(dict.fromkeys(p for p in (q.strip().rstrip(",;:.!?").strip() for q in quoted) if p)),
         follow_up=bool(_FOLLOW_UP.search(query.strip())),
     )
+
+
+# Operator words the targeted grammar may not bind ("Count open items", "numbers by component",
+# "compare March and April"). Used only to decide that a planner's structured step was *not*
+# requested (V3.2, ``llm`` agent): if any of these appears, the step is kept and every existing guard
+# (qualifier coverage, the logs scope guard, the answer contract) applies to it. Deliberately broad;
+# common prose words ("all", "every", "by", "per", "first", "last", "any") are not cues on their own.
+_AGGREGATE_CUE = re.compile(
+    r"\b(?:counts?|counting|counted|how\s+many|how\s+much|number\s+of|numbers|totals?|totall?ed|sum|summed|"
+    r"list(?:\s+(?:all|every|of))?|lists|listing|enumerate|tally|average|avg|mean|median|minimum|maximum|"
+    r"top\s+\d+|(?:most|least)\s+(?:common|frequent)|percentage|percent|proportion|ratio|share\s+of|"
+    r"breakdown|break\s+down|broken\s+down|grouped\s+by|group\s+by|distribution|stats|statistics|"
+    r"earliest|latest|oldest|newest|most\s+recent|first\s+time|last\s+time|"
+    r"(?:is|are)\s+there\s+(?:any|no)|none\s+of|versus|vs\.?|compare[ds]?|comparison)\b"
+    # 2026-11-08 parity fix: ranking, superlative, ordinal, range, distinct, existence and trend
+    # phrasings that planners answer with a structured count/list step ("which X has raised the
+    # most Y", "who is second for Z", "date range of the data", "are any Y still open", "how did Z
+    # change across half-years", "how concentrated is Z").
+    r"|\b(?:which|who|what)\b[^?.!]{0,80}?\b(?:most|fewest|least|highest|lowest|largest|smallest|biggest|greatest)\b"
+    r"|\bmost\s+(?:often|frequently)\b"
+    r"|\b(?:second|third|fourth|fifth|\d+(?:st|nd|rd|th))(?:[\s-]+(?:most|highest|lowest|largest|place))?\s+(?:for|in|by|on|among|place)\b"
+    r"|\b(?:second|third|fourth|fifth)[\s-]+(?:most|highest|lowest|largest|fewest)\b"
+    r"|\bnext\s+(?:two|three|four|five|\d+)\s+(?:highest|lowest|most|largest|fewest|top)\b"
+    r"|\b(?:date|time)\s+range\b|\brange\s+of\s+(?:dates|the\s+data(?:set)?)\b|\bdistinct\b|\bunique\b"
+    r"|\b(?:are|is|was|were|does|do|did)\s+any\b"
+    r"|\bconcentrat(?:ed|ion)\b|\bover\s+time\b|\btrends?\b|\bhalf-?years?\b|\bquarters?\b"
+    r"|\b(?:increase|decrease|grow|decline|change|rise|drop)(?:s|d|ed)?\b[^?.!]{0,40}?\b(?:over|across|between|by|from)\b"
+    r"|\bhow\s+(?:reliable|complete|consistent|often|frequent(?:ly)?)\b",
+    re.I,
+)
+
+
+def mentions_aggregate_operator(query: str) -> bool:
+    """A permissive lexical check: does the question use any aggregate operator word at all? (V3.2)"""
+    return bool(_AGGREGATE_CUE.search(query))
 
 
 def untargeted_constraint(intent: AggregateIntent) -> UnsupportedConstraint:

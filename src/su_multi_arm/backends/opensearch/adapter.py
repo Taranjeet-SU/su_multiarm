@@ -34,21 +34,46 @@ from .._lucene_common import (
     Transport,
     TransportError,
     alias_name,
+    bulk_batches,
+    check_bulk,
     check_dataset,
     check_prefix,
     generation_pattern,
     index_name,
     meta,
 )
+from .._lucene_aggs import DISTINCT_EXACT_CAP_DEFAULT, MATCHED_IDS_CAP_DEFAULT, MAX_GROUPS_DEFAULT
 from .catalog import OpenSearchCatalog, OpenSearchRecords
 from .search import HNSW_ENGINE, OpenSearchLexical, OpenSearchVector
 
 KIND = "opensearch"
 ANALYZER_ID = "lucene_standard"
+MAX_BULK_BYTES = 5 * 1024 * 1024
 # Supported server majors and the k-NN engines each accepts for *new* indices (k-NN plugin release
 # notes: nmslib deprecated in 2.19, index creation with nmslib blocked from 3.0.0).
 KNN_ENGINES: dict[int, frozenset[str]] = {2: frozenset({"lucene", "faiss", "nmslib"}), 3: frozenset({"lucene", "faiss"})}
 DOCS_PATTERN = re.compile(r"^(?P<prefix>[a-z][a-z0-9_]*)_(?P<dataset>[a-z0-9][a-z0-9_-]*)_(?P<generation>[0-9a-f]{32})_docs$")
+
+
+def docs_index_parts(name: str, prefix: str) -> tuple[str, str] | None:
+    """``(dataset, generation)`` of ``<prefix>_<dataset>_<generation>_docs`` for **this** adapter's
+    prefix, else ``None``. The prefix is matched literally, so an ``_`` in the prefix or in the
+    dataset name cannot shift the split (a free prefix group would take the dataset's ``_``)."""
+    match = re.fullmatch(re.escape(prefix) + r"_(?P<dataset>[a-z0-9][a-z0-9_-]*)_(?P<generation>[0-9a-f]{32})_docs", name)
+    return None if match is None else (match.group("dataset"), match.group("generation"))
+
+
+def records_options(config: Any) -> dict[str, Any]:
+    """Constructor arguments of a ``LuceneBackend.records`` block (absent: the defaults)."""
+    records = getattr(config, "records", None)
+    if records is None:
+        return {}
+    return {
+        "aggregation": records.aggregation,
+        "matched_ids_cap": records.matched_ids_cap,
+        "max_groups": records.max_groups,
+        "distinct_exact_cap": records.distinct_exact_cap,
+    }
 
 
 def server_major(number: str) -> int | None:
@@ -97,7 +122,15 @@ class OpenSearchBackend:
         max_matched: int = MAX_MATCHED_DEFAULT,
         transport: Transport | None = None,
         clock: Callable[[], float] = time.time,
+        aggregation: str = "client",
+        matched_ids_cap: int = MATCHED_IDS_CAP_DEFAULT,
+        max_groups: int = MAX_GROUPS_DEFAULT,
+        distinct_exact_cap: int = DISTINCT_EXACT_CAP_DEFAULT,
     ):
+        if aggregation not in {"client", "native"}:
+            raise BackendError(self.kind, "init", f"unknown records aggregation {aggregation!r} (client | native)")
+        if min(matched_ids_cap, max_groups, distinct_exact_cap) < 1:
+            raise BackendError(self.kind, "init", "matched_ids_cap, max_groups and distinct_exact_cap must be positive")
         if knn_method not in {"exact", "hnsw"}:
             raise BackendError(self.kind, "init", f"unknown knn method {knn_method!r} (exact | hnsw)")
         if knn_method == "hnsw" and not exact_rescore:
@@ -113,6 +146,13 @@ class OpenSearchBackend:
         self.exact_rescore = exact_rescore
         self.timeout = timeout_seconds
         self.max_matched = max_matched
+        # Records aggregation (``records.aggregation``): ``client`` scans matched records (bounded by
+        # ``max_matched``); ``native`` pushes the operations down as aggregations (``_lucene_aggs``).
+        self.aggregation = aggregation
+        self.matched_ids_cap = matched_ids_cap
+        self.max_groups = max_groups
+        self.distinct_exact_cap = distinct_exact_cap
+        self.shard_counts: dict[str, bool] = {}  # records index -> has exactly one shard (terms ranking is exact)
         self.transport = transport
         self.clock = clock
         self.stats: Counter[str] = Counter()
@@ -139,12 +179,24 @@ class OpenSearchBackend:
         if not raw:
             raise BackendError(cls.kind, "init", f"environment variable {config.hosts_env} (hosts) is not set")
         hosts = [h.strip() for h in raw.split(",") if h.strip()]
-        return cls(hosts, config.index_prefix, config.knn.method, config.knn.exact_rescore, config.timeout_seconds, clock=clock)
+        return cls(hosts, config.index_prefix, config.knn.method, config.knn.exact_rescore, config.timeout_seconds, clock=clock, **records_options(config))
 
     # --- transport ---------------------------------------------------------------------------
 
     def call(self, operation: str, method: str, path: str, params: dict[str, Any] | None = None, body: Any = None) -> Any:
-        """One request; every failure is a ``BackendError`` naming the operation."""
+        """A logical request; bounded bulk writes preserve per-item error reporting."""
+        if method == "POST" and path.endswith("/_bulk") and isinstance(body, str) and len(body.encode("utf-8")) > MAX_BULK_BYTES:
+            try:
+                batches = list(bulk_batches(body, MAX_BULK_BYTES))
+            except ValueError as exc:
+                raise BackendError(self.kind, operation, str(exc)) from exc
+            if len(batches) > 1:
+                combined = {"errors": False, "items": []}
+                for batch in batches:
+                    reply = self.call(operation, method, path, params, batch)
+                    check_bulk(self.kind, operation, reply)
+                    combined["items"].extend(reply["items"])
+                return combined
         self.stats[f"request.{operation}"] += 1
         try:
             return self.transport.request(method, path, params, body)
@@ -252,10 +304,10 @@ class OpenSearchBackend:
         names = self.alias_indices(self.alias(dataset, "docs"), "active_generation")
         generations = set()
         for name in names:
-            match = DOCS_PATTERN.match(name)
-            if match is None or match.group("prefix") != self.prefix or match.group("dataset") != dataset:
+            parts = docs_index_parts(name, self.prefix)
+            if parts is None or parts[0] != dataset:
                 raise BackendError(self.kind, "active_generation", f"alias serves a foreign index {name}")
-            generations.add(match.group("generation"))
+            generations.add(parts[1])
         if not generations:
             return None
         if len(generations) != 1:
@@ -344,9 +396,9 @@ class OpenSearchBackend:
         reply = self.call("generations", "GET", f"/_cat/indices/{self.prefix}_*_docs", params={"format": "json", "h": "index"})
         found = set()
         for row in reply or []:
-            match = DOCS_PATTERN.match(row["index"])
-            if match is not None and match.group("prefix") == self.prefix:
-                found.add(f"{match.group('dataset')}/{match.group('generation')}/")
+            parts = docs_index_parts(row["index"], self.prefix)
+            if parts is not None:
+                found.add(f"{parts[0]}/{parts[1]}/")
         return sorted(found)
 
     def close(self) -> None:

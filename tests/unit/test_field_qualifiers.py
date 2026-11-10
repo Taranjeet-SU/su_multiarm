@@ -40,7 +40,9 @@ def flagged(question: str, predicates: list[dict] | None = None, filters: dict |
     [
         ("How many priority 3 tickets are open?", "priority 3"),
         ("How many tickets on version 2.1?", "version 2.1"),
-        ("How many severity high tickets?", "severity high"),
+        # V3.2: a word after a string field label needs an explicit operator (or a known value,
+        # tests/unit/test_v32_decision_precision.py); "severity high" alone is no longer bound
+        ("How many tickets with severity = high?", "severity = high"),
         ("How many tickets have tier gold?", "gold"),  # enum values are ``value`` candidates already
         ("How many escalated tickets are there?", "escalated"),
         ("How many tickets with escalated false?", "escalated false"),
@@ -60,7 +62,7 @@ def test_field_named_with_a_value_is_a_qualifier(question, text):
         ("How many priority 3 tickets are open?", [{"field": "priority", "op": "in", "value": [2, 3]}], None),
         ("How many priority 3 tickets are open?", [], {"priority": "3"}),
         ("How many tickets on version 2.1?", [{"field": "version", "op": "eq", "value": 2.1}], None),
-        ("How many severity high tickets?", [{"field": "severity", "op": "eq", "value": "High"}], None),
+        ("How many tickets with severity = high?", [{"field": "severity", "op": "eq", "value": "High"}], None),
         ("How many escalated tickets are there?", [{"field": "escalated", "op": "eq", "value": True}], None),
         ("How many tickets with escalated false?", [{"field": "escalated", "op": "eq", "value": False}], None),
         ("How many tickets have priority at least 2?", [{"field": "priority", "op": "range", "lower": 2}], None),
@@ -87,6 +89,7 @@ NEGATIVE = [
     "How many tickets have build number 7?",  # not filterable: never a qualifier
     "What is the severity level of this issue?",
     "How do I raise the priority of a ticket?",
+    "How many severity high tickets?",  # V3.2: unbound word after a string label, no resolver
 ]
 
 

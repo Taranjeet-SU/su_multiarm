@@ -1,7 +1,8 @@
 """Provider kernel: typed errors, usage, call metering, the ``ChatProvider`` protocol, HTTP helpers.
 
 Strict behaviour (plan §3.6): no automatic retries, no repair calls, no silent downgrade from native
-to prompt mode. Every failure is a typed ``ProviderError`` (``RuntimeError``) carrying a
+to prompt mode. The only retries are the role's explicit, metered ``on_incomplete`` /
+``retry_transient`` policies (M0, ``core/config_m0.py``; off by default; ``providers/_chat.py``). Every failure is a typed ``ProviderError`` (``RuntimeError``) carrying a
 ``category``; a reply that does not satisfy the schema is a ``SchemaViolation`` (``ValueError``)
 carrying the raw text so callers can keep it for replay. The caller's fail policy decides what
 happens next. Provider response bodies are never echoed into error messages (they can contain
@@ -37,6 +38,9 @@ class ProviderError(RuntimeError):
     """A provider call failed. ``category`` is stable and machine-readable."""
 
     category = "provider_error"
+    # ``False`` only when the request provably never reached the provider (the connection to it, or
+    # to the egress proxy, was never established): such a call is not booked on the spend ledgers.
+    sent: bool = True
 
     def __init__(self, message: str, *, stage: str | None = None, status: int | None = None):
         self.stage, self.status = stage, status
@@ -51,7 +55,7 @@ class ProviderRateLimited(ProviderError):
     category = "rate_limited"
 
     def __init__(self, message: str, *, stage: str | None = None, status: int | None = None, retry_after: str | None = None):
-        self.retry_after = retry_after  # recorded only; the package never retries
+        self.retry_after = retry_after  # recorded only; retries happen only under an explicit retry_transient
         super().__init__(message, stage=stage, status=status)
 
 
@@ -94,9 +98,15 @@ class ProviderResponseError(ProviderError):
 
 
 class ProviderIncomplete(ProviderError):
-    """Truncation (``max_tokens``/``length``) or another non-final stop: always a failure."""
+    """Truncation (``max_tokens``/``length``) or another non-final stop: always a failure.
+
+    ``cause`` (set by the chat kernel, M0): ``max_tokens`` (the reply was cut at the output
+    ceiling), ``stop`` (another non-final stop reason) or ``stream_end`` (the event stream ended
+    before its final event, without a ``max_tokens`` stop). It decides which explicit retry policy
+    applies (``on_incomplete`` vs ``retry_transient``)."""
 
     category = "incomplete"
+    cause: str | None = None
 
 
 class ProviderLimitIgnored(ProviderResponseError):
@@ -129,8 +139,12 @@ class SchemaViolation(ValueError):
 
     category = "schema_violation"
 
-    def __init__(self, message: str, *, raw: str, stage: str | None = None, error_count: int = 0):
+    def __init__(self, message: str, *, raw: str, stage: str | None = None, error_count: int = 0, paths: list[str] | None = None, stop_reason: str | None = None):
         self.raw, self.stage, self.error_count = raw, stage, error_count
+        # Loggable without content: the violated field paths with the error type (never the input
+        # values) and the provider's stop reason (``length``/``max_tokens`` explain a cut reply).
+        self.paths = list(paths or [])
+        self.stop_reason = stop_reason
         super().__init__(f"{stage}: {message}" if stage else message)
 
 
@@ -259,9 +273,18 @@ class RoleSpec:
     reasoning_effort: str | None = None
     pricing_key: str | None = None
     streaming: bool = False  # the role declares ``capabilities.streaming``
+    thinking: str | None = None  # Anthropic thinking control (``capabilities.thinking_wire``)
+    thinking_budget_tokens: int | None = None
+    effort: str | None = None  # Anthropic ``output_config.effort``
+    measure_first_token: bool = False
     # ``structured_output`` came from the registry default, not the config: only then may a native
     # call refused as ``ProviderSchemaTooComplex`` be switched once, recorded, to prompt mode.
     structured_output_defaulted: bool = False
+    # M0 resilience (``core/config_m0.RoleResilience``): explicit, bounded, metered retries only.
+    on_incomplete: str = "fail"
+    incomplete_retry_max_tokens: int | None = None
+    retry_attempts: int = 0
+    retry_backoff_seconds: float = 0.0
 
     @classmethod
     def of(cls, config: Any) -> "RoleSpec":
@@ -280,7 +303,15 @@ class RoleSpec:
             reasoning_effort=getattr(config, "reasoning_effort", None),
             pricing_key=pricing or config.model or None,
             streaming=bool(getattr(caps, "streaming", False)),
+            thinking=getattr(config, "thinking", None),
+            thinking_budget_tokens=getattr(config, "thinking_budget_tokens", None),
+            effort=getattr(config, "effort", None),
+            measure_first_token=getattr(config, "measure_first_token", False) is True,
             structured_output_defaulted=getattr(config, "structured_output_defaulted", False) is True,
+            on_incomplete=str(getattr(config, "on_incomplete", "fail") or "fail"),
+            incomplete_retry_max_tokens=getattr(config, "incomplete_retry_max_tokens", None),
+            retry_attempts=int(getattr(getattr(config, "retry_transient", None), "attempts", 0) or 0),
+            retry_backoff_seconds=float(getattr(getattr(config, "retry_transient", None), "backoff_seconds", 0.0) or 0.0),
         )
 
 
@@ -320,8 +351,9 @@ def validate_reply(schema: type[T], raw: str, stage: str) -> T:
     try:
         return schema.model_validate_json(raw)
     except ValidationError as error:
+        paths = [(".".join(str(part) for part in item.get("loc", ())) or "<root>") + f" ({item.get('type', 'invalid')})" for item in error.errors()[:10]]
         raise SchemaViolation(
-            f"reply violates the {schema.__name__} schema ({error.error_count()} errors)", raw=raw, stage=stage, error_count=error.error_count()
+            f"reply violates the {schema.__name__} schema ({error.error_count()} errors)", raw=raw, stage=stage, error_count=error.error_count(), paths=paths
         ) from error
 
 
@@ -529,6 +561,22 @@ def output_format_limit_problems(wire: dict[str, Any], name: str = "schema") -> 
     return [f"{name} is too complex for output_config.format ({', '.join(over)}); the provider refuses it with HTTP 400 (declare structured_output: none for this role)"]
 
 
+# httpx errors raised before any request byte reached the provider: no connection (or proxy tunnel)
+# was established, or the URL scheme is unusable. Read/write/protocol errors after connecting are
+# not listed: the request may have been received (and billed).
+NOT_SENT: tuple[type[Exception], ...] = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.UnsupportedProtocol)
+
+
+def not_sent(error: Exception, stage: str) -> ProviderError:
+    """The typed error of a request that never reached the provider (``sent = False``)."""
+    if isinstance(error, httpx.TimeoutException):
+        mapped: ProviderError = ProviderTimeout(f"provider connection timed out before the request was sent ({type(error).__name__})", stage=stage)
+    else:
+        mapped = ProviderConnectionError(f"provider unreachable; the request was not sent ({type(error).__name__})", stage=stage)
+    mapped.sent = False
+    return mapped
+
+
 class HttpCall:
     """One HTTP POST with typed error mapping. No retry, no redirect following."""
 
@@ -540,6 +588,8 @@ class HttpCall:
             options: dict[str, Any] = {} if self.transport is None else {"transport": self.transport}
             with httpx.Client(timeout=timeout, follow_redirects=False, **options) as client:
                 response = client.post(url, headers=headers, json=body)
+        except NOT_SENT as error:
+            raise not_sent(error, stage) from error
         except httpx.TimeoutException as error:
             raise ProviderTimeout(f"provider timed out ({type(error).__name__})", stage=stage) from error
         except httpx.TransportError as error:
@@ -570,6 +620,8 @@ class HttpCall:
                         raise ProviderResponseError("provider reply is not an event stream", stage=stage, status=response.status_code)
                     for event, data in iter_sse(response.iter_lines()):
                         consumer.feed(event, data)
+        except NOT_SENT as error:
+            raise not_sent(error, stage) from error
         except httpx.TimeoutException as error:
             raise ProviderTimeout(f"provider timed out ({type(error).__name__})", stage=stage) from error
         except httpx.TransportError as error:
@@ -607,8 +659,9 @@ def as_int(value: Any) -> int:
 class MeteredCall:
     """Wraps one provider exchange: reservation, timing, and a record in ``finally`` (also on failure)."""
 
-    def __init__(self, provider: Any, budget: CallMeter, ctx: CallContext, mode: str, estimate: CallEstimate):
+    def __init__(self, provider: Any, budget: CallMeter, ctx: CallContext, mode: str, estimate: CallEstimate, max_tokens: int | None = None):
         self.provider, self.budget, self.ctx, self.mode, self.estimate = provider, budget, ctx, mode, estimate
+        self.max_tokens = max_tokens  # the ceiling actually sent (a ``retry_larger`` attempt raises it)
         self.usage = Usage()
         self.returned_model: str | None = None
         self.extra: dict[str, Any] = {}
@@ -638,7 +691,11 @@ class MeteredCall:
                 "pricing_key": role.pricing_key,
                 "prompt_caching": role.prompt_caching,
                 "reasoning_effort": role.reasoning_effort,
-                "max_tokens": role.max_tokens,
+                "max_tokens": self.max_tokens or role.max_tokens,
+                **({"thinking_requested": role.thinking} if role.thinking else {}),
+                **({"effort": role.effort} if role.effort else {}),
+                # the request never reached the provider: nothing is booked on the spend ledgers
+                **({"sent": False} if exc is not None and getattr(exc, "sent", True) is False else {}),
                 **self.extra,
             }
         )

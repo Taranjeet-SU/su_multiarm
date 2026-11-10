@@ -32,6 +32,11 @@ def describe(engine: Any) -> dict[str, Any]:
         for f in config.metadata_schema.fields
     ]
     generator = config.models.roles.generator
+    logs = getattr(config, "logs", None)
+    extra: dict[str, Any] = {}
+    if logs is not None:
+        # the UI/API default day range of the log views (a default, not a serving limit)
+        extra["logs"] = {"default_view_days": logs.collection.serving.default_view_days, "max_window_days": logs.collection.serving.max_window_days, "provisional": logs.collection.provisional.enabled}
     return {
         "datasets": [{"name": config.dataset, "generation": engine._current_generation(), "profile": config.profile}],
         "default_pipeline": config.default_pipeline,
@@ -43,4 +48,5 @@ def describe(engine: Any) -> dict[str, Any]:
         "tools": engine.tools.names(),
         "remote_actions": sorted(set(config.serving.actions.allow) & set(engine.actions.names())),
         "answer_streaming": {"tokens": bool(generator is not None and generator.capabilities.streaming)},
+        **extra,
     }

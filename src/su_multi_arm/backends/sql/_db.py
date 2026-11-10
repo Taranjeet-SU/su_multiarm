@@ -96,6 +96,19 @@ def runtime_tables(prefix: str) -> tuple[sa.MetaData, dict[str, sa.Table]]:
             sa.Column("raw_reply", sa.Text, nullable=False),
             sa.Column("valid", sa.Boolean, nullable=False),
         ),
+        # ledger retention side tables (addendum A1 §3.8.3)
+        "raw_tags": sa.Table(
+            f"{prefix}_raw_tags",
+            md,
+            sa.Column("key", sa.String(768), primary_key=True),
+            sa.Column("tag", sa.String(255), primary_key=True, index=True),
+        ),
+        "ledger_refs": sa.Table(
+            f"{prefix}_ledger_refs",
+            md,
+            sa.Column("generation", sa.String(64), primary_key=True),
+            sa.Column("key", sa.String(768), primary_key=True, index=True),
+        ),
         "sessions": sa.Table(
             f"{prefix}_sessions",
             md,

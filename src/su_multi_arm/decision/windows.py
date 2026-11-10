@@ -44,6 +44,7 @@ _UNIT = {"day": "day", "days": "day", "week": "week", "weeks": "week", "month": 
 
 # Order matters: longer, more specific expressions first; matches never overlap.
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("month_day_range", re.compile(r"\b(?P<mon>" + _MON + r")\.?\s+(?P<d>\d{1,2})\s*(?:[-–—]|to|through)\s*(?P<last>\d{1,2})(?:,?\s+(?P<y>(?:19|20)\d{2}))?\b", re.I)),
     ("rolling_n", re.compile(r"\b(?:in\s+the\s+|over\s+the\s+|during\s+the\s+|within\s+the\s+)?(?:last|past|previous)\s+(?P<n>\d{1,3})\s+(?P<unit>days?|weeks?|months?|quarters?|years?)\b", re.I)),
     ("relative", re.compile(r"\b(?P<which>this|current|last|previous|past)\s+(?P<unit>week|month|quarter|year)\b", re.I)),
     ("ytd", re.compile(r"\b(?:year[- ]to[- ]date|ytd)\b", re.I)),
@@ -94,6 +95,17 @@ def _need(anchor: date | None, text: str) -> date:
 
 def _from_match(kind: str, m: re.Match[str], anchor: date | None) -> Window | None:
     text = m.group(0).strip()
+    if kind == "month_day_range":
+        month = _MONTH_NAMES[m.group("mon").casefold()]
+        year = int(m.group("y")) if m.group("y") else _need(anchor, text).year
+        try:
+            start = date(year, month, int(m.group("d")))
+            last = date(year, month, int(m.group("last")))
+        except ValueError as exc:
+            raise WindowError(f"invalid calendar range: {text}") from exc
+        if last < start:
+            raise WindowError(f"date range ends before it starts: {text}")
+        return Window(start=start, end=last + timedelta(days=1), label=f"{start.isoformat()} to {last.isoformat()}", text=text, relative=not bool(m.group("y")))
     if kind == "rolling_n":
         today = _need(anchor, text)
         n, unit = int(m.group("n")), _UNIT[m.group("unit").casefold()]

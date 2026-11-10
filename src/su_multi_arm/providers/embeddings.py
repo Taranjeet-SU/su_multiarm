@@ -55,15 +55,17 @@ class SentenceTransformerEmbeddings:
 
     def raw(self, texts: list[str]) -> np.ndarray:
         cfg = self.config
+        # One lock for load, tokenizer and encode: the fast tokenizer is not thread-safe ("Already
+        # borrowed") and two arms (dense, segment) may encode the same query concurrently.
         with self._lock:
             if self._model is None:
                 from sentence_transformers import SentenceTransformer
 
                 self._model = SentenceTransformer(cfg.model, revision=cfg.revision, device=cfg.device, trust_remote_code=False)
-        lengths = self._model.tokenizer(texts, truncation=False, padding=False)["input_ids"]
-        if any(len(row) > self._model.max_seq_length for row in lengths):
-            raise ValueError("embedding text exceeds model context; reduce chunk_size/title or query length")
-        return self._model.encode(texts, batch_size=cfg.batch_size, convert_to_numpy=True, show_progress_bar=False)
+            lengths = self._model.tokenizer(texts, truncation=False, padding=False)["input_ids"]
+            if any(len(row) > self._model.max_seq_length for row in lengths):
+                raise ValueError("embedding text exceeds model context; reduce chunk_size/title or query length")
+            return self._model.encode(texts, batch_size=cfg.batch_size, convert_to_numpy=True, show_progress_bar=False)
 
     def recipe(self) -> dict[str, Any]:
         return {"provider": "sentence_transformers", "model": self.config.model, "revision": self.config.revision}

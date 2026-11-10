@@ -415,8 +415,12 @@ def test_engine_counts_a_text_topic_over_the_whole_corpus_with_its_basis():
     engine = engine_with_text()
     result = engine.search(SearchRequest(query="How many records mention billing?", mode="rules", as_of="2024-04-15"))
     [aggregate] = result.aggregates
-    assert aggregate["value"] == 2 and aggregate["exactness"] == "exact" and aggregate["document_ids"] == ["r1", "r2"]
+    # 2026-11-08 parity fix: a *mention* count is a literal match, another counting basis -> bounded
+    assert aggregate["value"] == 2 and aggregate["exactness"] == "bounded" and aggregate["document_ids"] == ["r1", "r2"]
+    assert any(u["reason"] == "qualifier_not_applied" for u in aggregate["unsupported"])
     assert any(b.startswith("text scope: documents with an indexed chunk containing every one of the words 'billing'") for b in aggregate["basis"])
+    literal = engine.search(SearchRequest(query='How many records contain "billing"?', mode="rules")).aggregates[0]
+    assert literal["value"] == 2 and literal["exactness"] == "exact"  # the literal match the question defines
     share = engine.search(SearchRequest(query="What percentage of records mention billing?", mode="rules"))
     assert share.aggregates[0]["value"] == 0.5 and share.aggregates[0]["numerator"] == 2
     scoped = engine.search(SearchRequest(query="How many records mention billing?", mode="rules", filters={"status": "open"}))
@@ -484,7 +488,7 @@ def test_a_text_topic_word_the_lexical_analyzer_drops_is_bounded_not_exact(tmp_p
         values = {k: v for k, v in record.values.items() if k in {"kind", "project", "status", "amount", "created_at"}}
         docs.append(Document(id=record.id, dataset="demo", kind=str(record.values["kind"]), title=f"Record {record.id}", fields={"body": texts[record.id]}, metadata=values))
     engine.ingest(docs)
-    plain = engine.search(SearchRequest(query="How many records mention billing?", mode="rules"))
+    plain = engine.search(SearchRequest(query='How many records contain "billing"?', mode="rules"))
     assert plain.aggregates[0]["value"] == 2 and plain.aggregates[0]["exactness"] == "exact"
     assert any("bm25_okapi:ascii_alnum" in b for b in plain.aggregates[0]["basis"])  # the generation's analyzer
     dropped = engine.search(SearchRequest(query="How many records mention 東京?", mode="rules"))

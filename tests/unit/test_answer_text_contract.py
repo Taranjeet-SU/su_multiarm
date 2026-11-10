@@ -114,8 +114,11 @@ def test_absence_needs_an_exhaustive_empty_scope():
     absent = Answer(answer="There are no priority 3 records [aggregate:1].", claims=[Claim(text="none", kind="count", evidence_ids=["aggregate:1"])], citations=["aggregate:1"])
     result = AnswerContract().enforce(absent, evidence_ids=EVIDENCE, aggregates=[EXACT], intents=COUNT, targets=TARGETS)
     assert result.contract == "abstained"  # a count of 12 never backs "there are no ..."
-    zero = absent.model_copy(update={"claims": [Claim(text="none", kind="absence", evidence_ids=["aggregate:2"])], "citations": ["aggregate:2"]})
+    # 2026-11-09: the inline marker must name supplied evidence too (an unsupplied "[aggregate:1]" is unknown_evidence)
+    zero = absent.model_copy(update={"answer": "There are no priority 3 records [aggregate:2].", "claims": [Claim(text="none", kind="absence", evidence_ids=["aggregate:2"])], "citations": ["aggregate:2"]})
     assert AnswerContract().enforce(zero, evidence_ids=EVIDENCE, aggregates=[ZERO], intents=COUNT, targets=TARGETS).contract == "passed"
+    stale = absent.model_copy(update={"claims": zero.claims, "citations": ["aggregate:2"]})
+    assert [v.rule for v in AnswerContract().enforce(stale, evidence_ids=EVIDENCE, aggregates=[ZERO], intents=COUNT, targets=TARGETS).violations] == ["unknown_evidence"]
     claim_only = zero.model_copy(update={"answer": "See the aggregate [aggregate:1].", "claims": [Claim(text="none", kind="absence", evidence_ids=["aggregate:1"])], "citations": ["aggregate:1"]})
     stripped = AnswerContract().enforce(claim_only, evidence_ids=EVIDENCE, aggregates=[EXACT], intents=COUNT, targets=TARGETS)
     assert stripped.contract == "stripped" and stripped.violations[0].rule == "claim_without_exact_scope"

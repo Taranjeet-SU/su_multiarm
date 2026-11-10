@@ -34,7 +34,7 @@ def test_payload_exposes_only_listable_values_under_cap_and_plan_is_compiled(v2_
     request = DecisionRequest(query="How many records have status open?", record_context={"subject": "ignored data"})
     decision = agent(v2_backend).decide(v2_ctx, request, None, caps)
     system, payload, schema, stage = seen[0]
-    assert schema is LlmPlan and stage == "planner" and "DATA" in system
+    assert issubclass(schema, LlmPlan) and stage == "planner" and "DATA" in system
     assert set(payload["observed_values"]) == {"kind", "project", "status"}  # never external_id (cap 0) or tag (over cap)
     assert payload["caller_context_unverified"] == {"subject": "ignored data"} and payload["detected_intents"] == ["count"]
     assert {f["name"] for f in payload["filterable_fields"]} == {f.name for f in v2_schema.fields if f.filterable}
@@ -62,7 +62,7 @@ def test_total_question_answered_with_a_count_is_refused(v2_ctx, v2_backend, v2_
 def test_explicit_caller_aggregate_cannot_be_changed_and_validate_checks_secret(v2_ctx, v2_backend, v2_schema, monkeypatch):
     def respond(self, system, payload, schema, budget, stage):
         budget.reserve()
-        assert payload["explicit_aggregate"] == {"kind": "sum", "field": "amount", "unit": None, "granularity": None}
+        assert payload["explicit_aggregate"] == {"kind": "sum", "field": "amount", "unit": None, "granularity": None, "of": None}
         return schema.model_validate({"steps": [{"arm": "structured", "scope": {"measure": {"kind": "count"}}}]})
 
     monkeypatch.setattr(JsonModel, "call", respond)

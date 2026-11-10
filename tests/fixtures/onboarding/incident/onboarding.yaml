@@ -1,0 +1,48 @@
+# Synthetic onboarding example (unified merge plan §8.3b): incident/outage records as one write-path
+# snapshot member. Hand-written; every name, monitor, tenant and URL is invented.
+format_version: 1
+synthetic: true
+member: incident
+D1_provenance:
+  owner: operations team (synthetic)
+  parts:
+  - curated RCA notes and playbook (versioned repository, commit pinned per member)
+  - availability-monitor feed (failed polls grouped into events)
+  - incident tracker issues created by the monitor (with comments)
+  privacy_class: internal
+  masking:
+  - 'tracker comments: staff mentions masked'
+D2_kinds:
+  incident_event: {grain: one declared outage or one run of failed polls per monitor, id: 'incident:event:{sha12}', unit: outage, time_roles: {event_time: incident_started_at}}
+  incident_ticket: {grain: one tracker issue + comments, id: 'incident:ticket:{key}', unit: ticket, time_roles: {event_time: incident_created_at}}
+  incident_rca: {grain: one curated incident file, id: 'incident:rca:{stem}', time_roles: {event_time: incident_day}}
+  incident_pattern: {grain: one playbook row, id: 'incident:pattern:{nn}'}
+D3_field_map:
+  core: {source: incident, kind: kind, title: title, customer_ref: tenant_candidate, status: incident_status, url: url}
+  absent: [component, product, version]
+  source_fields:
+    incident_monitor: string
+    incident_started_at: datetime
+    incident_ended_at: datetime
+    incident_created_at: datetime
+    incident_day: date
+    incident_declared: boolean
+    incident_failed_polls: integer
+    incident_status: string
+    incident_has_rca: boolean
+  rule: source fields are namespaced (incident_*) so a support or log field never takes their values
+D4_identity:
+  customer_field: tenant_candidate
+  namespace: incident.monitor
+  candidates: monitor name with an environment suffix stripped (candidate only; exact/casefold matches auto-join)
+  review: every non-exact
+D5_text:
+  lexical_fields: all text fields
+  dense_fields: {incident_event: [summary], incident_ticket: [rca], incident_rca: [root_cause], incident_pattern: [symptom, likely_cause]}
+  vectors: online (the collection's embedder; no precomputed import holds this text)
+D6_sql: deferred (a write-path member carries no typed projection; the structured arm reads its records)
+D7_graph: deferred (the attached graph covers tickets and docs only)
+D8_communities: none
+D9_links: explicit ticket<->rca refs; rule-derived event<->ticket (same monitor, close in time); candidate event<->log episode
+D10_cadence: {key: snapshot, cadence: manual, producer: write_path}
+D11_evolution: a new pull is registered with --replaces <previous unit>

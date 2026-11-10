@@ -18,7 +18,7 @@ from ..core.errors import SuError
 if TYPE_CHECKING:  # pragma: no cover
     from ..core.config import Config, PipelineConfig
 
-ARM_ORDER: tuple[str, ...] = ("exact_id", "dense", "lexical", "structured", "graph", "community")
+ARM_ORDER: tuple[str, ...] = ("exact_id", "dense", "lexical", "structured", "graph", "community", "segment")
 
 
 class RequestRejected(SuError, ValueError):

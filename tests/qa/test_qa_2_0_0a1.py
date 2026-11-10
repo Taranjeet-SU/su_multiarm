@@ -138,7 +138,7 @@ def test_qa01_llm_count_with_unbound_qualifier_is_not_passed(tmp_path, fake_open
     engine.ingest(corpus())
 
     def handler(name, payload):
-        if name == "LlmPlan":
+        if name in ("LlmPlan", "CapabilityLlmPlan"):  # capability-bound planner schema since the 2026-11 planner change
             return {"steps": [{"arm": "structured", "scope": {"predicates": [{"field": "status", "op": "eq", "value": "open"}], "measure": {"kind": "count"}}}]}
         return grounded_answer("There are 12 open CloudTax tickets.", "count", payload, cite_aggregate=True)
 
@@ -220,7 +220,7 @@ def test_qa04_count_in_answer_text_without_exact_scope(tmp_path, fake_openai):
     engine.ingest(corpus())
 
     def handler(name, payload):
-        if name == "LlmPlan":
+        if name in ("LlmPlan", "CapabilityLlmPlan"):  # capability-bound planner schema since the 2026-11 planner change
             return {"steps": [{"arm": "lexical", "query": "pending LedgerOne tickets"}]}
         return {
             "answer": "There are exactly 2 pending LedgerOne tickets: case:0005 and case:0014. That is the complete list.",
@@ -365,7 +365,7 @@ def test_qa13_openai_native_planner_is_valid_and_sends_a_strict_schema(tmp_path,
     sent: list[dict] = []
     fake_openai["handler"] = lambda name, payload: sent.append(name) or {"steps": [{"arm": "lexical", "query": "rounding", "filters": [], "scope": None}]}
     result = engine.search(SearchRequest(query="How is rounding fixed?"))
-    assert sent == ["LlmPlan"] and result.trace["decision"]["outcome"] == "decided" and result.hits
+    assert sent == ["CapabilityLlmPlan"] and result.trace["decision"]["outcome"] == "decided" and result.hits
 
 
 def test_qa14_offline_ingest_without_query_time_keys(tmp_path, monkeypatch):

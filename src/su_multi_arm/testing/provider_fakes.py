@@ -90,6 +90,7 @@ class FakeChatServer:
         self.requests: list[dict[str, Any]] = []
         self.chunks_sent = 0
         self.disconnected = threading.Event()
+        self.answer: Any = synthetic_answer  # payload -> reply object (tests may return a schema-violating one)
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -103,7 +104,7 @@ class FakeChatServer:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 fake.requests.append(body)
                 payload = json.loads(body["messages"][-1]["content"])
-                text = json.dumps(synthetic_answer(payload))
+                text = json.dumps(fake.answer(payload))
                 usage = {"prompt_tokens": 40, "completion_tokens": len(text) // 4}
                 if not body.get("stream"):
                     reply = json.dumps({"model": "fake-model", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text}}], "usage": usage}).encode()

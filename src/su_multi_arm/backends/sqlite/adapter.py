@@ -1,4 +1,4 @@
-"""``SqliteBackend``: the local default adapter, all eight capabilities on the frozen contracts."""
+"""``SqliteBackend``: the local default adapter, every capability on the contracts (incl. ``relational``)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from .search import SqliteLexical, SqliteVector
 
 
 class SqliteBackend:
-    """One root directory, eight facets. ``protect(gen)`` marks a generation as CURRENT/pinned."""
+    """One root directory, nine facets (``relational``: typed projection files). ``protect(gen)`` marks a generation as CURRENT/pinned."""
 
     kind = KIND
     max_matched = MAX_MATCHED_DEFAULT  # typed records-scan cap (backends/_scope.py); an instance may lower it
@@ -37,6 +37,7 @@ class SqliteBackend:
         clock: Callable[[], float] = time.time,
         lexical_engine: str = "fts5",
         bm25: Any = None,
+        readonly: bool = False,
     ):
         if vector_engine not in {"numpy", "faiss"}:
             raise BackendError(KIND, "init", f"unknown vector engine {vector_engine!r}")
@@ -47,6 +48,11 @@ class SqliteBackend:
 
             bm25 = Bm25Settings()
         self.root = Path(path)
+        # ``readonly`` (unified merge M1b, read-only adoption §6.3): catalog connections are opened
+        # ``mode=ro``, the runtime database is never opened or created, and every write facet
+        # (index, upsert, refresh of a changed generation, projection files, delete) is refused, so a
+        # store adopted as a collection member cannot be written through this backend.
+        self.readonly = readonly
         self.vector_engine = vector_engine
         self.lexical_engine = lexical_engine
         self.bm25 = bm25
@@ -63,10 +69,14 @@ class SqliteBackend:
         self.cache = SqliteCache(self)
         self.ledger = SqliteLedger(self)
         self.session = SqliteSessions(self)
+        from ...projection.store import FileProjectionFiles
+
+        # typed projection files live in the generation's snapshot folder (removed with it)
+        self.relational = FileProjectionFiles(self.snapshot_dir, timeout_seconds, readonly=readonly)
 
     @classmethod
-    def from_config(cls, config: Any, clock: Callable[[], float] = time.time) -> SqliteBackend:
-        return cls(config.path, config.vector_engine, config.timeout_seconds, clock, config.lexical_engine, config.bm25)
+    def from_config(cls, config: Any, clock: Callable[[], float] = time.time, readonly: bool = False) -> SqliteBackend:
+        return cls(config.path, config.vector_engine, config.timeout_seconds, clock, config.lexical_engine, config.bm25, readonly=readonly)
 
     def analyzer_id(self, gen: GenerationId) -> str:
         """The lexical analyzer recorded in the generation manifest."""
@@ -114,7 +124,14 @@ class SqliteBackend:
     def catalog_path(self, gen: GenerationId) -> Path:
         return self.snapshot_dir(gen) / "catalog.sqlite"
 
+    def refuse_write(self, operation: str) -> None:
+        """Raise when this backend is read-only (an adopted member store)."""
+        if self.readonly:
+            raise BackendError(KIND, operation, f"the store at {self.root.name!r} is opened read-only (adopted member): {operation} is refused")
+
     def catalog_db_exists(self, gen: GenerationId, create: bool = False) -> Path:
+        if create:
+            self.refuse_write("create")
         path = self.catalog_path(gen)
         if not path.exists():
             if not create:
@@ -128,13 +145,14 @@ class SqliteBackend:
     def catalog_db(self, gen: GenerationId, create: bool = False) -> Iterator[sqlite3.Connection]:
         path = self.catalog_db_exists(gen, create=create)
         try:
-            with connect(path, self.timeout) as db:
+            with connect(path, self.timeout, readonly=self.readonly) as db:
                 yield db
         except sqlite3.Error as exc:
             raise BackendError(KIND, "catalog", str(exc)) from exc
 
     @contextmanager
     def runtime_db(self) -> Iterator[sqlite3.Connection]:
+        self.refuse_write("runtime")  # an adopted store's runtime file belongs to its own service
         path = self.root / "runtime.sqlite"
         if not path.exists():
             ensure_runtime(path, self.timeout)
@@ -154,6 +172,12 @@ class SqliteBackend:
             version = db.execute("SELECT sqlite_version()").fetchone()[0]
         return {"sqlite_version": version, "root": str(self.root), "generations": len(self.generations()), "vector_engine": self.vector_engine, "lexical_engine": self.lexical_engine}
 
+    def warm(self, gen: GenerationId) -> dict[str, Any]:
+        """Startup warm-up of a served generation (``Engine.warmup``): the lexical segment and the
+        vector matrix/row map are loaded once so the first request does not pay them."""
+        self.lexical.warm(gen)
+        return {"vector_rows": self.vector.warm(gen)}
+
     def protect(self, gen: GenerationId) -> None:
         self._protected.add(gen.prefix())
 
@@ -161,10 +185,12 @@ class SqliteBackend:
         self._protected.discard(gen.prefix())
 
     def delete_generation(self, gen: GenerationId) -> None:
+        self.refuse_write("delete_generation")
         if gen.prefix() in self._protected:
             raise BackendError(KIND, "delete_generation", "generation is active or pinned by a live session")
         self.vector.forget(gen)
         self.lexical.forget(gen)
+        self.relational.forget(gen)
         folder = self.snapshot_dir(gen)
         if folder.exists():
             shutil.rmtree(folder)

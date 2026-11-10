@@ -1,0 +1,14 @@
+{
+  "name": "su-multi-arm-ui",
+  "version": "2.0.0a3",
+  "content_sha256": "c7847979d8b5a17870b309ad59c843d1a7eff917aa67f470ba043b5474ce71d4",
+  "files": {
+    "assets/GraphCanvas-DTlMU1-S.js": "31c244891070a109c530f827756e3e30f46614ceb7b5500a1249dfdba9f849f8",
+    "assets/GraphView-B3KD03LG.js": "04f43614f701b456cf32aa92df05ba3389298792f65793b797b99a275b3d7af0",
+    "assets/MiniGraph-C1StMi49.js": "920c1cf4f6f60a4e995d1cac5d58e3b94b39055f467d3caf4d4d7b5fe649272e",
+    "assets/index-BqvASNPN.css": "03c41648d898697bff587409b82b2bffed924d18987b51266a3675243cc43ffc",
+    "assets/index-Da2aW0Q7.js": "b2a329d018a459668e9c47d2293419312fd7c01b8f4a60a450a26170b9cb3284",
+    "index.html": "669c98e4008b4004834554d3146902f9050ab154e3233d942717cf893848971c",
+    "theme.css": "cd22ca2d14bfe8cd24841427b0d1c8ec913c4335b207459b73e442cf1a0a6467"
+  }
+}

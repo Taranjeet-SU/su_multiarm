@@ -1,9 +1,15 @@
-"""Declarative configuration v2 (plan §3.3). ``schema_version: 2``.
+"""Declarative configuration v2 (plan §3.3). ``schema_version: 2`` (or ``3``, below).
 
 Top-level keys: ``dataset``, ``profile``, ``plugins``, ``backends`` (named instances), ``storage``
 (authoritative backend per non-arm capability), ``metadata_schema``, ``models.roles``, ``pipeline``
 (decision, arms, selection, review, guards, generation), ``extraction``, ``communities``,
-``ingestion``, ``sessions``, ``budgets``, ``privacy``, ``serving``.
+``ingestion``, ``sessions``, ``budgets``, ``privacy``, ``serving``, ``sources`` (read-only log
+sources, ``core/config_sources.py``), ``learning`` (LLM pattern learning, ``core/config_learning.py``).
+
+``schema_version: 3`` (docs/plans/unified_merge.md §7) accepts everything v2 does plus the unified
+collection surface: ``collection`` (``core/config_collection.py``), ``crosssource``
+(``core/config_crosssource.py``) and ``communities.layers``. A v2 file is loaded unchanged and keeps
+its index fingerprint; a v2 file that sets any v3 block is refused with a migration message.
 
 Validation is static: it never connects to anything (that is ``doctor --probe``). Every failure is a
 ``ConfigError`` with the dotted path of the offending key. Unknown keys are errors. No value in a
@@ -29,12 +35,19 @@ from ..backends import capabilities as caps
 from ..models import StrictModel
 from ..profiles import apply_profile, available_profiles
 from .component import scan_for_code_references
+from .config_collection import CollectionConfig, CommunityLayer
+from .config_crosssource import CrossSourceConfig
 from .config_decision import StagePolicies
 from .config_graph import GraphOntology, TraversalTemplate
-from .config_selection import OrderingKind, PackingConfig
+from .config_learning import LearningConfig
+from .config_m0 import PlanCheckMode, QuestionConfig, RoleResilience
+from .config_selection import OrderingKind, PackingConfig, RerankOptions
+from .config_projection import ProjectionConfig
+from .config_logs import LINE_TEXT_FIELDS, PIN_REGISTRY_KINDS, LineRecipeConfig, LogsConfig, ProjectionsConfig
+from .config_sources import SOURCE_NAME, SourceConfig
 from .errors import ConfigError
 from .request import RequestConfig
-from .types import MetadataSchema
+from .types import EdgeKind, MetadataSchema
 
 IDENTIFIER = r"^[a-z][a-z0-9_]{0,63}$"
 SQL_IDENTIFIER = r"^[a-z][a-z0-9_]{0,40}$"
@@ -44,6 +57,25 @@ SQL_IDENTIFIER = r"^[a-z][a-z0-9_]{0,40}$"
 BUILTIN_GUARDS: frozenset[str] = frozenset()
 # Built-in read-only tools and write actions (``runtime/builtin_tools.py``, ``builtin_actions.py``).
 BUILTIN_TOOLS: tuple[str, ...] = ("search", "get_document", "list_values", "aggregate")
+# Typed read-only log tools (addendum A2 §4.1.5, §4.5.1; ``runtime/log_tools.py``); they need
+# ``logs.intents.enabled``.
+LOG_TOOLS: tuple[str, ...] = (
+    "log_top",
+    "log_new",
+    "log_affected",
+    "log_trend",
+    "log_compare",
+    "log_tenants",
+    "log_around",
+    "log_endpoints",
+    "log_signature",
+    "log_coverage",
+    "incidents",
+    "graph_neighbourhood",
+    "incident_episodes",
+    "issue_history",
+    "log_liveness",
+)
 BUILTIN_ACTIONS: tuple[str, ...] = ("ingest_delta", "invalidate_cache")
 DEFAULT_PIPELINE = "default"
 AVAILABLE_PROFILES: frozenset[str] = available_profiles()
@@ -142,12 +174,32 @@ class KnnConfig(StrictModel):
     exact_rescore: bool = True
 
 
+class LuceneRecordsConfig(StrictModel):
+    """How the ``records`` facet evaluates a typed scope. ``client`` (default): the matched records are
+    scanned and the operations computed in Python, bounded by ``max_matched`` (typed refusal above
+    it). ``native``: the operations are compiled to aggregations on the server (no record scan);
+    ``matched_ids`` then holds at most ``matched_ids_cap`` ids (``matched_ids_truncated`` above it), more
+    than ``max_groups`` groups is a ``bounded`` result, and ``count_distinct`` is exact up to
+    ``distinct_exact_cap`` distinct values, ``approximate`` (engine ``cardinality``) above it. A query-time
+    setting: not part of the index recipe."""
+
+    aggregation: Literal["client", "native"] = "client"
+    matched_ids_cap: int = Field(default=10000, ge=1, le=100000)
+    max_groups: int = Field(default=10000, ge=1, le=50000)
+    distinct_exact_cap: int = Field(default=100000, ge=1, le=1000000)
+
+
 class LuceneBackend(StrictModel):
     kind: Literal["opensearch", "elasticsearch"]
     hosts_env: str
     index_prefix: str = Field(default="su_multi_arm", pattern=SQL_IDENTIFIER)
     knn: KnnConfig = Field(default_factory=KnnConfig)
     timeout_seconds: float = Field(default=30, gt=0, le=600)
+    records: LuceneRecordsConfig = Field(default_factory=LuceneRecordsConfig)
+
+    def recipe(self) -> dict[str, Any]:
+        """The index-recipe dump: ``records`` is query-time only, so it never changes an index identity."""
+        return self.model_dump(mode="json", exclude={"records"})
 
 
 class Neo4jBackend(StrictModel):
@@ -239,7 +291,7 @@ class EvidenceBudget(StrictModel):
     chars: int = Field(default=60000, ge=500, le=500000)
 
 
-class ChatRole(StrictModel):
+class ChatRole(RoleResilience):  # on_incomplete / retry_transient: core/config_m0.py
     provider: Literal["openai_compatible", "openai", "anthropic"]
     model: str = Field(min_length=1)
     base_url: str | None = None
@@ -253,6 +305,17 @@ class ChatRole(StrictModel):
     # ``/v1`` ignores ``max_completion_tokens``: set ``max_tokens`` for it (docs/CONFIGURATION.md).
     max_tokens_parameter: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
     reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
+    # Anthropic thinking/effort control (2026-11-09), validated per model against the registry:
+    # ``off`` is realised as the model allows (Haiku 5.x: ``disabled``, only at effort <= high;
+    # Sonnet 5.x: ``between_tools``, it cannot disable thinking; Haiku 4.5: no thinking field);
+    # ``enabled`` needs ``thinking_budget_tokens`` (a budget alone means ``enabled``). ``effort`` is
+    # sent as ``output_config.effort``. Unset: nothing is sent (the model's default).
+    thinking: Literal["off", "adaptive", "between_tools", "enabled"] | None = None
+    thinking_budget_tokens: int | None = Field(default=None, ge=1024, le=63999)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    # Stream the call even when no client consumes the deltas, so the call record carries
+    # ``first_token_seconds`` (time to the first reply token). Needs ``capabilities.streaming``.
+    measure_first_token: bool = False
     capabilities: CapabilityDeclaration = Field(default_factory=CapabilityDeclaration)
     evidence_budget: EvidenceBudget | None = None
     pricing_key: str | None = None  # key into budgets.price_table; ``price_key()`` falls back to the model id
@@ -315,7 +378,12 @@ class ChatRole(StrictModel):
             self.reasoning_effort,
             self.max_tokens_parameter if self.provider == "openai" else None,
             self.max_tokens,
+            self.thinking,
+            self.thinking_budget_tokens,
+            self.effort,
         )
+        if self.measure_first_token and not self.capabilities.streaming:
+            problems.append(("measure_first_token", "measure_first_token streams the call; declare capabilities.streaming: true"))
         if problems:
             raise ValueError("; ".join(f"{key}: {message}" for key, message in problems))
         return self
@@ -395,8 +463,16 @@ class EmbedderRole(StrictModel):
 
 
 class RerankerRole(StrictModel):
+    """A local cross-encoder (``selection/rerank.py``). ``device: auto`` = CUDA when available, else
+    CPU; an unavailable explicit ``cuda`` is a load error (never a silent CPU fallback). ``dtype:
+    auto`` = float16 on CUDA, float32 on CPU."""
+
     provider: Literal["sentence_transformers"] = "sentence_transformers"
     model: str = Field(min_length=1)
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    dtype: Literal["auto", "float32", "float16"] = "auto"
+    batch_size: int = Field(default=32, ge=1, le=1024)
+    max_length: int | None = Field(default=None, ge=16, le=8192)
 
 
 # Configuration keys for features that do not exist in this release (completeness review risk R3).
@@ -426,6 +502,13 @@ class ModelRoles(StrictModel):
     extractor: ChatRole | None = None
     generator: ChatRole | None = None
     community: ChatRole | None = None
+    pattern_learner: ChatRole | None = None  # ``patterns learn|propose`` (learning.patterns)
+    log_extractor: ChatRole | None = None  # per-line quotes of the log fallback (learning.extraction)
+    # The typed router and the SQL writer (2026-11-08 parity fix): select it with
+    # ``pipeline.decision.typed_query.router_role`` / ``pipeline.arms.typed_query.sql_surface.role``.
+    # Its schemas (``TypedRoute``, ``SqlDraft``) are small and flat, so a registry-default ``native``
+    # stays native, unlike the planner role whose ``LlmPlan`` schema moves it to prompt mode.
+    query_writer: ChatRole | None = None
     embedder: EmbedderRole = Field(default_factory=EmbedderRole)
     reranker: RerankerRole | None = None
 
@@ -453,12 +536,66 @@ class ModelRoles(StrictModel):
         return self
 
     def chat_roles(self) -> dict[str, ChatRole]:
-        names = ("planner", "reviewer", "extractor", "generator", "community")
+        names = ("planner", "reviewer", "extractor", "generator", "community", "pattern_learner", "log_extractor", "query_writer")
         return {n: getattr(self, n) for n in names if getattr(self, n) is not None}
+
+
+class ModelRoute(StrictModel):
+    """One provider route of a learning role (owner decision 2026-11-04: local models first).
+
+    ``health_url`` is probed (HTTP GET, 2xx = ready) before the first call of a run; for an
+    ``openai_compatible`` role it defaults to ``<base_url>/models``. ``capacity_url`` is an optional
+    second GET whose JSON ``{"available": true|false}`` (or a 2xx without a body) says whether the
+    server takes work now. A hosted route without a ``health_url`` is not probed. There is no probe
+    *command*: config never names code."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    role: ChatRole
+    # ``local`` (loopback), ``lan`` (a self-hosted server on the private network; needs
+    # ``egress.allow_lan``) or ``paid`` (anything else). Unset: ``local`` for a loopback
+    # openai_compatible role, else ``paid``. A route declared ``local`` must be loopback.
+    tier: Literal["local", "lan", "paid"] | None = None
+    health_url: str | None = Field(default=None, pattern=r"^https?://")
+    capacity_url: str | None = Field(default=None, pattern=r"^https?://")
+    probe_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    # UTC time windows ``HH:MM-HH:MM`` in which the route takes work (a window may wrap midnight);
+    # empty: always. Outside every window the route is skipped (``outside_window``).
+    windows: list[str] = Field(default_factory=list, max_length=8)
+    # After this many invalid replies (schema violations) in one run the route is marked down.
+    max_invalid_replies: int | None = Field(default=3, ge=1, le=1000)
+
+    @field_validator("windows")
+    @classmethod
+    def window_syntax(cls, value):
+        for window in value:
+            if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]", window):
+                raise ValueError(f"window {window!r} is not HH:MM-HH:MM (UTC)")
+        return value
+
+
+class ModelRoutes(StrictModel):
+    """Ordered provider routes per learning role (``pattern_learner``: cluster calls;
+    ``log_extractor``: line and fill calls). The first available route is used; when none is
+    available the items are ``unresolved: capacity_deferred`` and the next run retries them. A paid
+    (non-loopback) route after a local one is used only with ``allow_paid_fallback: true``. Empty
+    lists mean the single route ``models.roles.<role>``."""
+
+    pattern_learner: list[ModelRoute] = Field(default_factory=list)
+    log_extractor: list[ModelRoute] = Field(default_factory=list)
+    allow_paid_fallback: bool = False
+
+    @model_validator(mode="after")
+    def unique(self):
+        for name in ("pattern_learner", "log_extractor"):
+            routes = getattr(self, name)
+            if len({r.name for r in routes}) != len(routes):
+                raise ValueError(f"models.routes.{name}: route names must be unique")
+        return self
 
 
 class ModelsConfig(StrictModel):
     roles: ModelRoles = Field(default_factory=ModelRoles)
+    routes: ModelRoutes = Field(default_factory=ModelRoutes)
 
 
 # --- pipeline ----------------------------------------------------------------------------------
@@ -483,12 +620,61 @@ class ClassifierArtifactConfig(StrictModel):
         return ArtifactRef.check_path(value)
 
 
+class TypedQueryDecision(StrictModel):
+    """Typed-query planning on the ``llm`` planner (typed-query plan §5.4/§6, M6). ``enabled`` offers
+    ``arm: typed_query`` to the planner (only while the pipeline enables the ``typed_query`` arm and
+    the pinned generation has a sealed projection); ``repair_attempts: 1`` feeds typed compile errors
+    back for one re-plan that may not drop a question qualifier or a request filter.
+
+    ``routing``: ``planner`` (default; the typed catalog and ``arm: typed_query`` are part of the main
+    planner request, M6 / SQL route) or ``router`` (opt-in, after M7): the main planner request is the
+    one of a deployment without typed queries, and a separate metered call (stage ``typed_router``,
+    ``models.roles.<router_role>``) sees only the question, the request filters and a compact catalog
+    summary and returns ``{route: typed | retrieval, sub_question, reason}``. A typed route executes
+    before the planner (mode ir: one typed-plan call, stage ``typed_ir``; mode sql_surface: the SQL
+    route) and its evidence is packed ahead of the retrieval evidence; one that does not execute is a
+    recorded ``DroppedStep`` and the planner runs as usual (``on_step_failure: partial`` for that step).
+
+    ``parallel`` (routing router only; default on, 2026-11-08 latency fix): the router chain (router
+    call, then the SQL writer or the typed IR call) runs in a worker thread while the planner call
+    runs, since the planner request does not depend on the route. Metering, the trace's call order
+    and the merge are those of the sequential run; it runs sequentially when the call budget cannot
+    cover both chains. ``router_role: query_writer`` selects ``models.roles.query_writer``.
+    When the planner abstains, an executed typed route that answers the question's aggregate is
+    kept as the plan (``policy_applied: typed_route_only``, the planner's failure recorded)."""
+
+    enabled: bool = False
+    repair_attempts: Literal[0, 1] = 0
+    routing: Literal["planner", "router"] = "planner"
+    router_role: Literal["planner", "reviewer", "generator", "query_writer"] = "planner"
+    parallel: bool = True
+
+    @model_validator(mode="after")
+    def coherent(self):
+        if self.routing == "router" and not self.enabled:
+            raise ValueError("typed_query.routing router needs typed_query.enabled")
+        if self.routing == "router" and self.repair_attempts:
+            raise ValueError("typed_query.repair_attempts re-plans the planner's typed step; with routing router the planner has none (set it to 0)")
+        if self.routing == "planner" and self.router_role != "planner":
+            raise ValueError("typed_query.router_role is read only with routing router")
+        return self
+
+
 class DecisionConfig(StrictModel):
     kind: Literal["rules", "classifier", "llm", "cascade"] = "rules"
     stages: list[Literal["rules", "classifier", "llm"]] = Field(default_factory=list)
     on_failure: Literal["fail_closed", "raw_all_arms"] = "fail_closed"
     stage_policies: StagePolicies = Field(default_factory=StagePolicies)  # cascade stages only (§3.7.1)
     max_steps: int = Field(default=10, ge=1, le=20)
+    schema_repair_attempts: Literal[0, 1] = 0
+    # ``llm`` planner step-level failure policy (typed-query plan M1; ``decision/llm.py``):
+    # ``abstain`` (default, unchanged) | ``partial`` | ``retrieval_only``.
+    on_step_failure: Literal["abstain", "partial", "retrieval_only"] = "abstain"
+    typed_query: TypedQueryDecision = Field(default_factory=TypedQueryDecision)
+    # Opt-in generated arm cards (``decision/arm_cards.py``): a domain-neutral description of every
+    # enabled arm (purpose, use/avoid, wire input shape, limits, returned evidence) in the llm planner
+    # payload, the typed router payload and the SQL writer prompt. Off: requests are unchanged.
+    arm_cards: bool = False
     prompt: str | None = None
     prompt_file: Path | None = None
     artifact: ClassifierArtifactConfig | None = None  # built-in onnx_classifier
@@ -508,6 +694,14 @@ class DecisionConfig(StrictModel):
             raise ValueError("artifact/component are only valid for a classifier decision agent")
         if self.prompt and self.prompt_file:
             raise ValueError("use either prompt or prompt_file, not both")
+        if self.on_step_failure != "abstain" and not self.uses_llm():
+            raise ValueError("on_step_failure applies to the llm planner only (kind llm or an llm cascade stage)")
+        if self.typed_query.enabled and not self.uses_llm():
+            raise ValueError("typed_query planning needs the llm planner (kind llm or an llm cascade stage)")
+        if self.typed_query.repair_attempts and not self.typed_query.enabled:
+            raise ValueError("typed_query.repair_attempts needs typed_query.enabled")
+        if self.arm_cards and not self.uses_llm():
+            raise ValueError("arm_cards are read by the llm planner only (kind llm or an llm cascade stage)")
         return self
 
     def uses_llm(self) -> bool:
@@ -592,6 +786,13 @@ class GraphArm(StrictModel):
     templates: dict[str, TraversalTemplate] = Field(default_factory=dict)
     # Optional ontology the templates are validated against (an attached store's mapping is used too).
     ontology: GraphOntology | None = None
+    # Edge kinds the free-text mode traverses (A1 §3.12). ``co_firing`` is statistical
+    # co-occurrence, never a fact: admit it only deliberately (the logs ``around`` question does).
+    edge_kinds: list[EdgeKind] = Field(default_factory=lambda: ["fact"], min_length=1)
+    # Opt-in: free-text traversal also returns the documents its path edges are anchored in, with the
+    # edge quotes as provenance (as typed templates do). Needed for an attached store (kuzu
+    # ``mode: attach``) whose mention spans are not catalog chunks; off: mention passages only.
+    path_evidence: bool = False
 
     @model_validator(mode="after")
     def templates_fit(self):
@@ -606,12 +807,80 @@ class GraphArm(StrictModel):
 
 class CommunityArm(StrictModel):
     backend: str = Field(pattern=IDENTIFIER)
+    # Opt-in: a community whose report claims match the query also contributes the cited member
+    # passages of its eligible claims as hits (communities without extracted entities otherwise
+    # return reports only). Off by default: existing behaviour is unchanged.
+    claim_hits: bool = False
+    # claim_hits only: content terms (3+ characters, not function words) a claim must share with the
+    # query (capped at the query's own content-term count)
+    claim_min_terms: int = Field(default=2, ge=1, le=10)
+
+
+class SegmentArm(StrictModel):
+    """The ``segment`` arm (``arms/segment.py``): a sealed child-record index (``segments/``) built
+    with ``su-multi-arm segments build``. Hits are parent records with their best segments as
+    provenance; the request scope is evaluated on the parent. ``kinds`` narrows the segment kinds
+    searched (empty: all). ``lexical`` fuses a BM25 list over segment text by reciprocal rank."""
+
+    path: Path
+    candidates: int = Field(default=200, ge=1, le=10000)
+    kinds: list[str] = Field(default_factory=list, max_length=64)
+    lexical: bool = True
+    lexical_candidates: int = Field(default=400, ge=1, le=10000)
+    rrf_k: int = Field(default=60, ge=1)
+    max_segments_per_parent: int = Field(default=3, ge=1, le=20)
 
 
 class CacheArm(StrictModel):
     backend: str = Field(pattern=IDENTIFIER)
     mode: Literal["exact"] = "exact"  # semantic tier arrives with the cache arm (Phase 2)
     ttl_seconds: int = Field(default=3600, ge=1)
+
+
+class SqlSurfaceConfig(StrictModel):
+    """``typed_query`` in ``mode: sql_surface`` (opt-in; adapted from NVIDIA Auto-Ontology's
+    catalog + text-to-SQL flow): a model writes one SQLite ``SELECT`` over the logical projection
+    catalog; the arm parses it (``sqlglot``, extra ``su-multi-arm[sql-surface]``), refuses anything
+    outside the catalog/allowlists, checks every filter value against the ``ValueResolver``, binds
+    the principal's ACL and executes read-only on the per-tenant file. ``repair_attempts``: at most
+    one re-prompt with the typed parse/validation/database error (never for unknown values or
+    security refusals). ``sample_values``: observed values shown per listable column (0: none).
+    ``list_values_up_to`` (2026-11-09 corpus-B fix F7; with ``sample_values`` > 0): a listable column with at most this many
+    ACL-scoped observed values (or an enum with at most this many declared values) shows **every**
+    value, marked complete, instead of ``sample_values`` samples; 0 keeps samples only. The
+    column's ``max_catalog_cardinality`` still caps what is enumerated at all.
+    ``group_lineage_max`` (2026-11-09, corpus-B B7): a grouped result over one table lists the
+    record ids of every returned group with at most this many contributing records (a bounded
+    second read-only read on the same ACL-bound projection file), and a filtered scalar aggregate
+    keeps up to this many contributor ids (at least 8); 0 disables the group read."""
+
+    # models.roles.<role> writes the SQL; ``query_writer`` keeps native structured output (the planner
+    # role is moved to prompt mode by its large ``LlmPlan`` schema when its mode is a registry default)
+    role: Literal["planner", "reviewer", "generator", "query_writer"] = "planner"
+    repair_attempts: int = Field(default=1, ge=0, le=1)
+    max_sql_chars: int = Field(default=4000, ge=200, le=20000)
+    sample_values: int = Field(default=5, ge=0, le=20)
+    list_values_up_to: int = Field(default=64, ge=0, le=500)
+    group_lineage_max: int = Field(default=10, ge=0, le=50)
+    max_joins: int = Field(default=3, ge=0, le=8)
+    max_subqueries: int = Field(default=4, ge=0, le=16)
+
+
+class TypedQueryArm(StrictModel):
+    """The ``typed_query`` arm (typed-query plan §5.5): compiled typed queries over the projection
+    of ``projection.backend``; needs ``projection.enabled``. Limits bound every execution.
+    ``mode``: ``ir`` (default; the compiled ``TypedQueryDraft``) or ``sql_surface`` (validated
+    model-written SQL, ``sql_surface`` settings); the arm executes only the input of its mode."""
+
+    row_limit: int = Field(default=200, ge=1, le=10000)
+    max_groups: int = Field(default=500, ge=1, le=10000)
+    timeout_ms: int = Field(default=2000, ge=10, le=60000)
+    max_text_ids: int = Field(default=10000, ge=1, le=100000)
+    # Backend whose lexical index resolves a ``text`` condition (as ``structured.text_backend``);
+    # None: text conditions are reported unsupported.
+    text_backend: str | None = Field(default=None, pattern=IDENTIFIER)
+    mode: Literal["ir", "sql_surface"] = "ir"
+    sql_surface: SqlSurfaceConfig = Field(default_factory=SqlSurfaceConfig)
 
 
 class ArmsConfig(StrictModel):
@@ -622,13 +891,15 @@ class ArmsConfig(StrictModel):
     graph: GraphArm | None = None
     community: CommunityArm | None = None
     cache: CacheArm | None = None
+    typed_query: TypedQueryArm | None = None
+    segment: SegmentArm | None = None
 
     def enabled(self) -> dict[str, Any]:
         return {name: arm for name, arm in self.__dict__.items() if arm is not None}
 
     @model_validator(mode="after")
     def at_least_one_retrieval_arm(self):
-        if not any(getattr(self, n) is not None for n in ("exact_id", "dense", "lexical", "structured", "graph", "community")):
+        if not any(getattr(self, n) is not None for n in ("exact_id", "dense", "lexical", "structured", "graph", "community", "segment")):
             raise ValueError("at least one retrieval arm must be configured")
         return self
 
@@ -665,6 +936,7 @@ class SelectionConfig(StrictModel):
     # ``i`` takes the best remaining record of that source, then the budget fills by score.
     source_slots: list[str] = Field(default_factory=list, max_length=1000)
     rerank: bool = False  # uses models.roles.reranker; off by default (measured negative, plan §6.4)
+    reranking: RerankOptions = Field(default_factory=RerankOptions)  # read only with rerank: true
     packing: PackingConfig = Field(default_factory=PackingConfig)
 
     @model_validator(mode="after")
@@ -693,8 +965,11 @@ class AnswerContractConfig(StrictModel):
     # no aggregate, the unbacked count/list/absence sentences of a narrative answer (recorded); an
     # unbacked statement answering an aggregate question still abstains. abstain_with_reason:
     # abstain (a non-narrative claim on an answer whose text states no count/list/absence is
-    # stripped instead). fail: raise. See generation/contract.py.
-    on_violation: Literal["abstain_with_reason", "strip", "fail"] = "strip"
+    # stripped instead). annotate (opt-in, 2026-11-09): keep the generator's evidence-cited answer and
+    # append one deterministic limitation note per violated claim; unknown/uncited evidence, an empty
+    # answer and a number contradicting an exact aggregate are still removed or abstained. fail:
+    # raise. See generation/contract.py.
+    on_violation: Literal["abstain_with_reason", "strip", "annotate", "fail"] = "strip"
 
 
 class GenerationStageConfig(StrictModel):
@@ -703,6 +978,11 @@ class GenerationStageConfig(StrictModel):
     prompt: str | None = None
     prompt_file: Path | None = None
     evidence_fields: list[str] = Field(default_factory=list)  # packing priority; empty = chunking order, then document order
+    # Staging round 6 (N15): ``1`` sends one more generator call when the reply fails the answer
+    # schema (the previous reply and its validation paths, as the planner's repair). Metered like any
+    # call (max_llm_calls, max_usd, serving.answers ledger) and traced; a refused or failed repair
+    # leaves the schema-violation answer standing. ``0`` (default): no repair, as before.
+    schema_repair_attempts: Literal[0, 1] = 0
 
     @model_validator(mode="after")
     def coherent(self):
@@ -746,8 +1026,48 @@ class GroundingConfig(StrictModel):
     ambiguous: Literal["reject", "first"] = "reject"
 
 
+class PatternGateConfig(StrictModel):
+    """The deterministic validation gate a learned pattern must pass (``learning/patterns/gate.py``)."""
+
+    min_support: int = Field(default=3, ge=1, le=1000)  # evidence lines the pattern must match
+    require_re2: bool = True  # the gate compiles with RE2; the ``regex`` engine cannot pass it
+    # Learning loop (L4b) only: share of the cluster's lines the pattern must match, and the absolute
+    # bound on matches among unparsed lines outside the cluster.
+    min_cluster_coverage: float = Field(default=0.9, gt=0, le=1)
+    max_out_of_cluster: int = Field(default=0, ge=0, le=100_000)
+
+
+class PatternLibraryRef(StrictModel):
+    """``extraction.pattern_library``: the library directory of the ``pattern`` extractor.
+
+    Only ``engine``, ``max_line_bytes`` and ``mode`` enter the index recipe. The library contents,
+    the engine version and the promotion policy are build provenance (generation manifest), so a
+    library edit never changes the live fingerprint; it changes the extraction reuse salt instead.
+    """
+
+    path: Path
+    engine: Literal["re2", "regex"] = "re2"  # explicit; a missing engine is an error, never a fallback
+    max_line_bytes: int = Field(default=8192, ge=256, le=1_048_576)
+    mode: Literal["line"] = "line"  # every line of a chunk is matched on its own (line-scoped facts)
+    # ``auto``: a proposal that passes the gate is appended to learned.yaml with its decision record;
+    # ``manual``: it waits in proposed.yaml for a human ``approve`` decision.
+    promotion: Literal["auto", "manual"] = "auto"
+    min_literal_chars: int = Field(default=4, ge=0, le=64)
+    regex_timeout_ms: int = Field(default=100, ge=1, le=10_000)  # ``regex`` engine only
+    gate: PatternGateConfig = Field(default_factory=PatternGateConfig)
+    # The logs profile's header ontology (addendum A2 §4.1.3): ``emits``/``runs``/``serves``/
+    # ``raises`` native links from day-rollup headers and ``co_fires_with`` from incident headers
+    # (``extraction/patterns/log_links.py``). Enters the extraction reuse salt, not the recipe.
+    log_links: bool = False
+
+    def recipe(self) -> dict[str, Any]:
+        return {"engine": self.engine, "max_line_bytes": self.max_line_bytes, "mode": self.mode}
+
+
 class ExtractionConfig(StrictModel):
-    extractors: list[Literal["gazetteer", "regex", "spacy", "gliner", "llm"]] = Field(default_factory=lambda: ["gazetteer"])
+    extractors: list[Literal["pattern", "gazetteer", "regex", "spacy", "gliner", "llm"]] = Field(default_factory=lambda: ["gazetteer"])
+    # Omitted from the extractor recipe while unset, so existing index fingerprints are unchanged.
+    pattern_library: PatternLibraryRef | None = None
     grounding: GroundingConfig = Field(default_factory=GroundingConfig)
     policy: Literal["strict", "quarantine", "partial"] = "strict"
     prompt: str | None = None  # llm extractor prompt; built-in neutral prompt when unset
@@ -776,6 +1096,8 @@ class ExtractionConfig(StrictModel):
             raise ValueError("extractors must be unique")
         if any(e in self.extractors for e in ("gliner", "llm")) and not self.labels:
             raise ValueError("extraction.labels must declare entity types when gliner or llm extraction is selected")
+        if ("pattern" in self.extractors) != (self.pattern_library is not None):
+            raise ValueError("the pattern extractor and extraction.pattern_library are set together")
         return self
 
 
@@ -796,24 +1118,60 @@ class CommunityStats(StrictModel):
     top_entities: int = Field(default=5, ge=0, le=50)
 
 
+class ImportedCommunities(StrictModel):
+    """``communities.strategy: imported`` (``communities/imported.py``): a JSONL file of communities
+    built elsewhere, pinned by ``sha256``. Only claims whose quotes occur verbatim in a member's
+    passage are stored; summary prose is refused. ``extractive_sentences`` (0 = off) gives a
+    community left without a grounded claim that many verbatim member sentences as claims."""
+
+    path: Path
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    on_ungrounded: Literal["drop_claim", "fail"] = "drop_claim"
+    extractive_sentences: int = Field(default=0, ge=0, le=10)
+    min_members: int = Field(default=1, ge=1)
+    # ``path`` as written in the file, before ``load_config`` resolved it against the config's
+    # directory (S0). The index recipe keeps hashing the written value, so resolving the path did
+    # not change any fingerprint; the file itself is pinned by ``sha256``.
+    _declared_path: str | None = PrivateAttr(default=None)
+
+    def recipe(self) -> dict[str, Any]:
+        data = self.model_dump(mode="json")
+        if self._declared_path is not None:
+            data["path"] = self._declared_path
+        return data
+
+
 class CommunitiesConfig(StrictModel):
-    strategy: Literal["entity", "louvain", "louvain_hierarchical"] = "entity"
+    # ``declared``: one community per distinct ``community_id`` metadata value (the co-firing
+    # incidents composed by the logs profile, addendum A2 §4.1.4); no graph clustering runs.
+    # ``imported``: communities and grounded claims from ``imported`` (no clustering, no model).
+    strategy: Literal["entity", "louvain", "louvain_hierarchical", "declared", "imported"] = "entity"
     min_documents: int = Field(default=2, ge=1)
     seed: int = 42
     prompt: str | None = None
-    # Both enter the index recipe only when set, so existing generations keep their fingerprint.
+    # All enter the index recipe only when set, so existing generations keep their fingerprint.
     hierarchy: CommunityHierarchy | None = None
     stats: CommunityStats | None = None
+    imported: ImportedCommunities | None = None
+    # Schema v3 only (unified merge §6.4): community layers of a unified collection; inert in S0.
+    layers: list[CommunityLayer] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def hierarchy_only_when_hierarchical(self):
         if self.hierarchy is not None and self.strategy != "louvain_hierarchical":
             raise ValueError("communities.hierarchy applies to strategy louvain_hierarchical only")
+        if (self.imported is not None) != (self.strategy == "imported"):
+            raise ValueError("communities.imported is required by, and only read with, strategy imported")
         return self
 
     def recipe(self) -> dict[str, Any]:
         """The index-recipe view: unset optional blocks are omitted (2.0.0a1 golden values hold)."""
-        return self.model_dump(mode="json", exclude={k for k in ("hierarchy", "stats") if getattr(self, k) is None})
+        data = self.model_dump(mode="json", exclude={"layers"} | {k for k in ("hierarchy", "stats", "imported") if getattr(self, k) is None})
+        if self.imported is not None:
+            data["imported"] = self.imported.recipe()
+        if self.layers:  # schema v3 only; absent from every v2 recipe
+            data["layers"] = [layer.model_dump(mode="json") for layer in self.layers]
+        return data
 
 
 class ChunkingConfig(StrictModel):
@@ -838,9 +1196,37 @@ class InputMapping(StrictModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
+class AttachSource(StrictModel):
+    """``ingestion.attach`` entry (``ingestion/attach.py``): one-to-one attributes of ``table`` (a
+    table or view of a read-only SQLite file pinned by ``sha256``) joined onto document metadata.
+    ``document_id``: the document id with ``{key}`` standing for ``key_column``'s value;
+    ``columns``: source column -> declared metadata field."""
+
+    path: Path
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    table: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+    key_column: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+    document_id: str = Field(min_length=5, max_length=200, pattern=r"\{key\}")
+    columns: dict[str, str] = Field(min_length=1, max_length=100)
+    on_conflict: Literal["fail", "keep_document"] = "fail"
+
+    @model_validator(mode="after")
+    def identifiers(self):
+        for source, target in self.columns.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", source) or not re.fullmatch(IDENTIFIER, target):
+                raise ValueError(f"ingestion.attach column {source!r} -> {target!r}: both must be identifiers")
+        if len(set(self.columns.values())) != len(self.columns):
+            raise ValueError("ingestion.attach: two columns map to the same field")
+        return self
+
+
 class IngestionConfig(StrictModel):
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     input_mapping: InputMapping | None = None
+    attach: list[AttachSource] = Field(default_factory=list, max_length=8)
+    # Addendum A1 (L3a). Both enter the index recipe only when set, so existing fingerprints hold.
+    line_recipe: LineRecipeConfig | None = None
+    projections: ProjectionsConfig | None = None
 
 
 # --- sessions, budgets, privacy, serving -------------------------------------------------------
@@ -892,6 +1278,14 @@ class IngestBudget(StrictModel):
     max_usd: float | None = Field(default=None, gt=0)
 
 
+class ProviderBudget(StrictModel):
+    """A lifetime (total-period) USD cap for one provider key across every learning and extraction
+    scope (addendum A2 §4.2.6). Reservations persist in the learning spend ledger; reaching the cap
+    stops the step (``budget_deferred``), never a switch to another provider."""
+
+    max_usd_total: float = Field(gt=0)
+
+
 class BudgetsConfig(StrictModel):
     max_llm_calls: int = Field(default=12, ge=1, le=1000000)
     max_input_tokens: int | None = Field(default=None, ge=1)
@@ -901,9 +1295,13 @@ class BudgetsConfig(StrictModel):
     price_table: Path | None = None
     session: SessionBudget | None = None  # per-session limits on top of the per-request ones above
     ingest: IngestBudget = Field(default_factory=IngestBudget)  # whole-build limits of the write path
+    providers: dict[Literal["anthropic", "openai", "openai_compatible"], ProviderBudget] = Field(default_factory=dict)
+    plan_check: PlanCheckMode = "warn"  # startup worst-case spend check (runtime/plan_cost.py, core/config_m0.py)
 
     @model_validator(mode="after")
     def usd_needs_prices(self):
+        if self.providers and self.price_table is None:
+            raise ValueError("budgets.providers caps require price_table (operator-supplied; no bundled prices)")
         if self.max_usd is not None and self.price_table is None:
             raise ValueError("max_usd requires price_table (operator-supplied; no bundled prices)")
         if self.ingest.max_usd is not None and self.price_table is None:
@@ -913,13 +1311,134 @@ class BudgetsConfig(StrictModel):
         return self
 
 
+REDACTOR_NAMES = (
+    "email", "ipv4", "ipv6", "bearer_token", "jwt", "api_key", "aws_key", "url_credentials", "query_values", "uuid", "request_id", "hex_secret",
+    "llm_text", "content", "query", "tracking_id", "record_payload", "pg_row",
+    "phone", "long_numeric_id", "person_name", "record_list", "product_prose",
+)
+FIELD_NAME = r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+
+
+class CustomRedactor(StrictModel):
+    """A user redactor of the ``safe`` engine: a regular expression in the RE2 subset that passes
+    the ReDoS lint (validated at load), and what replaces each match. ``mask`` writes
+    ``[REDACTED_<NAME>]``; ``hash`` writes ``[<NAME>:<12 hex>]``, a keyed sha256 of the match, so
+    equal values stay joinable without being readable."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    regex: str = Field(min_length=1, max_length=2048)
+    action: Literal["mask", "hash"] = "mask"
+
+
 class PrivacyConfig(StrictModel):
-    """Opt-in conservative redaction; not a complete PII detector."""
+    """Opt-in conservative redaction; not a complete PII detector.
+
+    ``engine: legacy`` (default) is the a1/a2 behaviour: ``redact_emails`` and ``patterns`` with
+    Python ``re`` on documents. ``engine: safe`` (B11) runs the named built-in ``redactors``, the
+    ``custom`` redactors and the ``patterns`` (as ``mask`` redactors) through the pattern engine's
+    validator (RE2 subset, ReDoS lint) and runtime (``regex_engine``: ``re2``, or the ``regex``
+    development engine with a per-call timeout that fails the redaction rather than skipping it).
+    It redacts log records before any persistence, ingested documents and every prompt line. The
+    new keys are omitted from every fingerprint while they hold their defaults."""
 
     redact_emails: bool = False
     patterns: dict[str, str] = Field(default_factory=dict)
     metadata_fields: list[str] = Field(default_factory=list)
     trace_masking: Literal["privacy", "raw"] = "privacy"
+    engine: Literal["legacy", "safe"] = "legacy"
+    redactors: list[Literal[REDACTOR_NAMES]] = Field(default_factory=list)  # type: ignore[valid-type]
+    custom: list[CustomRedactor] = Field(default_factory=list)
+    regex_engine: Literal["re2", "regex"] = "re2"
+    regex_timeout_ms: int = Field(default=100, ge=1, le=10_000)
+    # Environment variable holding the key of ``hash`` redactors (keyed sha256). Unset: plain sha256.
+    hash_key_env: str | None = Field(default=None, pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")
+    # Per built-in override of mask/hash (``query: hash`` keeps equal queries joinable).
+    actions: dict[Literal[REDACTOR_NAMES], Literal["mask", "hash"]] = Field(default_factory=dict)  # type: ignore[valid-type]
+    # ``record_payload``: JSON field names whose values are masked (``None``: the built-in list of
+    # entity fields: names, ids, addresses, contact data), minus ``record_fields_allow``.
+    record_fields: list[str] | None = None
+    record_fields_allow: list[str] = Field(default_factory=list)
+    # ``person_name``: JSON/key=value keys whose values are person names (``None``: name, firstName,
+    # lastName, fullName, displayName, userName, author and their snake_case forms; case-insensitive).
+    person_name_fields: list[str] | None = None
+    # ``record_list``: JSON keys whose array-of-objects value is a list of business-entity records
+    # (``None``: records, rows, items, results, entities, customers, accounts, companies, ...).
+    record_list_fields: list[str] | None = None
+    # ``product_prose``: product or technology names (an allow-list: they stay visible) whose
+    # following free text is masked to the end of the line; required when ``product_prose`` is on.
+    prose_products: list[str] = Field(default_factory=list, max_length=200)
+
+    @field_validator("prose_products")
+    @classmethod
+    def product_names(cls, value):
+        for name in value:
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9 ._+#-]{0,62}[A-Za-z0-9])?", name):
+                raise ValueError(f"prose product {name!r} must be a name of letters, digits, spaces and . _ + # - (starting and ending with a letter or digit)")
+        return value
+
+    @field_validator("record_fields", "record_fields_allow", "person_name_fields", "record_list_fields")
+    @classmethod
+    def field_names(cls, value):
+        for name in value or []:
+            if not re.fullmatch(FIELD_NAME, name):
+                raise ValueError(f"record field {name!r} must be a plain field name")
+        return value
+
+    @model_validator(mode="after")
+    def coherent(self):
+        safe_only = {
+            "redactors": self.redactors,
+            "custom": self.custom,
+            "hash_key_env": self.hash_key_env,
+            "actions": self.actions,
+            "record_fields": self.record_fields is not None,
+            "record_fields_allow": self.record_fields_allow,
+            "person_name_fields": self.person_name_fields is not None,
+            "record_list_fields": self.record_list_fields is not None,
+            "prose_products": self.prose_products,
+        }
+        if self.engine == "legacy":
+            used = sorted(k for k, v in safe_only.items() if v)
+            if used:
+                raise ValueError(f"{used} need privacy.engine: safe")
+            return self
+        if len(set(self.redactors)) != len(self.redactors):
+            raise ValueError("privacy.redactors must be unique")
+        names = [c.name for c in self.custom] + [label.casefold() for label in self.patterns]
+        if len(set(names)) != len(names) or set(names) & set(self.redactors):
+            raise ValueError("custom redactor and pattern names must be unique and differ from the built-in names")
+        unused = sorted(set(self.actions) - set(self.redactors))
+        if unused:
+            raise ValueError(f"privacy.actions names redactors that are not enabled: {unused}")
+        if self.record_fields == []:
+            raise ValueError("privacy.record_fields cannot be empty (omit it for the built-in list)")
+        for key in ("person_name_fields", "record_list_fields"):
+            if getattr(self, key) == []:
+                raise ValueError(f"privacy.{key} cannot be empty (omit it for the built-in list)")
+        if ("product_prose" in self.redactors) != bool(self.prose_products):
+            raise ValueError("privacy.prose_products and the product_prose redactor go together: list the product names when product_prose is enabled, and enable it when names are listed")
+        if not (self.redactors or self.custom or self.patterns or self.redact_emails):
+            raise ValueError("privacy.engine: safe needs at least one redactor (redactors, custom, patterns or redact_emails)")
+        from ..extraction.patterns.engine import validate_regex
+
+        for label, regex in [*((c.name, c.regex) for c in self.custom), *self.patterns.items()]:
+            errors = [i for i in validate_regex(regex, pattern_id=label, source="privacy") if i.severity == "error"]
+            if errors:
+                raise ValueError(f"redactor {label!r} is outside the safe engine: {errors[0].message}")
+        return self
+
+    def recipe(self) -> dict[str, Any]:
+        """The fingerprint dump: the a1/a2 keys, plus the B11 keys only when they differ from their
+        defaults (so existing index identities are unchanged)."""
+        data = self.model_dump(mode="json", exclude={"trace_masking"})
+        defaults = {
+            "engine": "legacy", "redactors": [], "custom": [], "regex_engine": "re2", "regex_timeout_ms": 100, "hash_key_env": None,
+            "actions": {}, "record_fields": None, "record_fields_allow": [], "person_name_fields": None, "record_list_fields": None, "prose_products": [],
+        }
+        for key, default in defaults.items():
+            if data.get(key) == default:
+                data.pop(key, None)
+        return data
 
 
 class HttpConfig(StrictModel):
@@ -940,6 +1459,18 @@ class HttpConfig(StrictModel):
 
 class McpConfig(StrictModel):
     transports: list[Literal["stdio", "streamable_http"]] = Field(default_factory=lambda: ["stdio"])
+    # the enabled log tools (tools.enabled) are MCP tools too, read-only (addendum A2 §4.5.1)
+    log_tools: bool = True
+    # mount the streamable-HTTP MCP app at /mcp on the HTTP app (one process, one engine; N14)
+    mount_on_http: bool = False
+    # a separate bearer token for /mcp (else the HTTP resolver is used)
+    token_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,127}$")
+
+    @model_validator(mode="after")
+    def mount_needs_http(self):
+        if self.mount_on_http and "streamable_http" not in self.transports:
+            raise ValueError("serving.mcp.mount_on_http needs streamable_http in transports")
+        return self
 
 
 class ActionsServingConfig(StrictModel):
@@ -981,17 +1512,105 @@ class ActionsConfig(StrictModel):
         return value
 
 
+class AccessConfig(StrictModel):
+    """The access policy (``runtime/acl.py``) selected by name; no class is loaded from config.
+
+    * ``none``: every principal sees the whole dataset (single-tenant serving, the default).
+    * ``tenant``: every arm, tool, value listing and graph read is restricted to records whose
+      ``field`` equals the principal's ``tenant``. A principal without a tenant sees nothing
+      (fail closed) unless its id is listed in ``unrestricted`` (an operator)."""
+
+    policy: Literal["none", "tenant"] = "none"
+    field: str = Field(default="tenant", pattern=IDENTIFIER)
+    unrestricted: list[str] = Field(default_factory=list, max_length=100)
+
+
+HOST_NAME = r"^(?:\[[0-9a-fA-F:.]{2,45}\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$"
+
+
+class UiConfig(StrictModel):
+    """The static web UI (addendum A2 §4.4; wheel ``su-multi-arm-ui``). ``enabled`` mounts it at
+    ``mount`` on the HTTP app; without the wheel the server refuses to start (``ConfigError``). The
+    UI needs bearer auth (or an injected resolver) unless ``allow_unauthenticated_loopback`` is set
+    explicitly for single-user development."""
+
+    enabled: bool = False
+    mount: str = Field(default="/ui", pattern=r"^/[a-z][a-z0-9_-]{0,31}$")
+    display_timezone: str | None = Field(default=None, max_length=64)  # display only; never changes partition dates
+    navigation_profile: Literal["standard", "focused"] = "standard"
+    session_storage_token: bool = False  # keep the token in sessionStorage (never localStorage or a cookie)
+    allow_unauthenticated_loopback: bool = False
+    # A JSON theme file (brand colours, product name, logo, fonts; ``serving/ui_theme.py``). None: the
+    # neutral default. Branding is deployment data and stays outside this repository.
+    theme: Path | None = None
+
+    @field_validator("mount")
+    @classmethod
+    def not_api(cls, value):
+        if value in {"/v2", "/mcp", "/health", "/ready", "/docs", "/redoc", "/openapi.json", "/search", "/answer"}:
+            raise ValueError(f"ui mount {value!r} collides with a server route")
+        return value
+
+    @field_validator("display_timezone")
+    @classmethod
+    def known_zone(cls, value):
+        if value is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(value)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError(f"unknown IANA timezone {value!r}") from None
+        return value
+
+
+class ServingAnswersSpend(StrictModel):
+    """``serving.answers`` (addendum A2 rev 4): answer-time model calls (planner, generator,
+    reviewer) reserve on a persistent per-day ledger under their own scope ``serving.answers``,
+    separate from the learning scopes, and on ``budgets.providers.<provider>.max_usd_total`` when
+    the provider has one. Off by default (per-request ``budgets`` only). A refused reservation fails
+    the call before it is sent; there is no fallback to another provider."""
+
+    enabled: bool = False
+    max_usd_per_day: float | None = Field(default=None, gt=0)
+    max_calls_per_day: int = Field(default=10_000, ge=1, le=10_000_000)
+    ledger: Path | None = None  # default <state dir of the first sqlite backend>/.answers_spend.sqlite, else ./.answers_spend.sqlite
+    timezone: str = "UTC"
+    # A reservation still open after this long was left by a crashed or killed process: its USD hold
+    # is released (audited in the ledger's ``spend_audit`` table, logged). Keep it above the longest
+    # answer (``budgets.deadline_seconds``); a late commit still records its spend.
+    stale_reservation_seconds: float = Field(default=3600, ge=60, le=7 * 86400)
+
+
 class ServingConfig(StrictModel):
     http: HttpConfig = Field(default_factory=HttpConfig)
+    answers: ServingAnswersSpend = Field(default_factory=ServingAnswersSpend)
     mcp: McpConfig = Field(default_factory=McpConfig)
     actions: ActionsServingConfig = Field(default_factory=ActionsServingConfig)
+    # Extra Host names admitted by the Host allow-list (reverse proxy names), exact match; the list
+    # is active when the UI is enabled or the list is non-empty (addendum A2 B10, n-r3-4;
+    # ``serving/hosts.py``).
+    allowed_hosts: list[str] = Field(default_factory=list)
+    ui: UiConfig = Field(default_factory=UiConfig)
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def host_names(cls, value):
+        for host in value:
+            if not re.fullmatch(HOST_NAME, host) or host == "*":
+                raise ValueError(f"allowed host {host!r} must be an exact host name or address (no port, no wildcard)")
+        return [h.lower() for h in value]
 
 
 # --- root --------------------------------------------------------------------------------------
 
 
+# Keys a schema_version 2 file may not set (unified merge plan §7).
+V3_ONLY_KEYS: tuple[str, ...] = ("collection", "crosssource", "communities.layers")
+
+
 class Config(StrictModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2, 3] = 2
     dataset: str = Field(default="default", min_length=1)
     profile: str = Field(default="neutral", pattern=IDENTIFIER)
     plugins: list[str] = Field(default_factory=list)
@@ -1012,6 +1631,46 @@ class Config(StrictModel):
     serving: ServingConfig = Field(default_factory=ServingConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     actions: ActionsConfig = Field(default_factory=ActionsConfig)
+    access: AccessConfig = Field(default_factory=AccessConfig)
+    # Read-only log sources (addendum A1 §3.1, slice L1). Consumed by ``su-multi-arm sources``; the
+    # engine never opens a source on the request path.
+    sources: dict[str, SourceConfig] = Field(default_factory=dict)
+    # LLM pattern learning (addendum A1 §3.6, slice L4b; ``core/config_learning.py``).
+    learning: LearningConfig = Field(default_factory=LearningConfig)
+    # Daily log analytics (addendum A1 L3a/L3b; ``core/config_logs.py``): partitions, compose, retention.
+    logs: LogsConfig | None = None
+    # Typed relational projection (typed-query plan §5.2/§6; ``core/config_projection.py``); off by default.
+    projection: ProjectionConfig = Field(default_factory=ProjectionConfig)
+    # The question clock and the reviewed term vocabulary (M0; ``core/config_m0.py``).
+    question: QuestionConfig = Field(default_factory=QuestionConfig)
+    # Unified collection (schema v3; unified merge plan §6, §7; ``core/config_collection.py``).
+    # Validated but not served yet: an engine refuses it until the partition core lands.
+    collection: CollectionConfig | None = None
+    # Identity registry and cross-source links (schema v3; ``core/config_crosssource.py``).
+    crosssource: CrossSourceConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def log_count_fields(cls, data):
+        """``logs_example`` profile: the per-unit source counts ``count_<query>`` (integer) and their
+        basis ``basis_<query>`` (``role: basis``) are declared for every count query of the logs
+        source unless the configuration declares them itself (the names depend on the source)."""
+        if not isinstance(data, dict) or data.get("profile") != "logs_example" or not isinstance(data.get("logs"), dict):
+            return data
+        source = (data.get("sources") or {}).get(data["logs"].get("source"))
+        schema = data.get("metadata_schema")
+        if not isinstance(source, dict) or not isinstance(schema, dict) or not isinstance(schema.get("fields"), list):
+            return data
+        declared = {f.get("name") for f in schema["fields"] if isinstance(f, dict)}
+        extra = []
+        for name in sorted(source.get("counts") or {}):
+            if f"count_{name}" not in declared:
+                extra.append({"name": f"count_{name}", "type": "integer", "sortable": True})
+            if f"basis_{name}" not in declared:
+                extra.append({"name": f"basis_{name}", "type": "string", "role": "basis"})
+        if not extra:
+            return data
+        return {**data, "metadata_schema": {**schema, "fields": [*schema["fields"], *extra]}}
 
     @model_validator(mode="before")
     @classmethod
@@ -1057,6 +1716,14 @@ class Config(StrictModel):
             raise ValueError("plugins must be unique")
         return value
 
+    @field_validator("sources")
+    @classmethod
+    def source_names(cls, value):
+        for name in value:
+            if not re.fullmatch(SOURCE_NAME, name):
+                raise ValueError(f"source name {name!r} must be an identifier")
+        return value
+
     @field_validator("backends")
     @classmethod
     def backend_names(cls, value):
@@ -1079,6 +1746,158 @@ class Config(StrictModel):
                 warnings.warn(f"{diagnostic.path}: {diagnostic.message}" if diagnostic.path else diagnostic.message, stacklevel=2)
         raise_for(diagnostics)
         scan_for_code_references(self.model_dump(mode="json"), skip_keys=SCAN_EXEMPT_KEYS)
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def v3_blocks_need_schema_v3(cls, data):
+        """A v2 file that sets any v3 block is refused before the block itself is validated, with a
+        migration message (unified merge plan §7)."""
+        if not isinstance(data, dict) or data.get("schema_version", 2) != 2:
+            return data
+        communities = data.get("communities")
+        layers = communities.get("layers") if isinstance(communities, dict) else None
+        # ``None`` / ``[]`` are what a v2 Config dumps, so a re-validated v2 dump is still accepted.
+        used = [key for key, value in (("collection", data.get("collection")), ("crosssource", data.get("crosssource")), ("communities.layers", layers)) if value not in (None, [])]
+        if used:
+            raise ConfigError(
+                f"{', '.join(used)} belong to schema_version 3 (unified collection); this file declares schema_version 2. "
+                "Migrate by setting schema_version: 3: every other v2 key keeps its meaning and the index fingerprint "
+                "of the non-collection settings is unchanged (docs/CONFIGURATION.md, 'Schema v3: unified collection')",
+                used[0],
+            )
+        return data
+
+    @model_validator(mode="after")
+    def schema_v3_coherent(self):
+        """Cross-key rules of the v3 blocks (unified merge plan §7)."""
+        if self.schema_version == 2:
+            return self
+        collection = self.collection
+        if collection is not None:
+            for name, member in collection.members.items():
+                source = member.producer.source
+                if source is not None and source not in self.sources:
+                    raise ConfigError(
+                        f"collection.members.{name}.producer.source {source!r} is not a configured source ({sorted(self.sources)})",
+                        f"collection.members.{name}.producer.source",
+                    )
+                if member.metadata_fields is not None:
+                    undeclared = sorted(f for f in member.metadata_fields if self.metadata_schema.field(f) is None)
+                    if undeclared:
+                        raise ConfigError(
+                            f"collection.members.{name}.metadata_fields names fields metadata_schema does not declare: {undeclared}",
+                            f"collection.members.{name}.metadata_fields",
+                        )
+            for layer in collection.layers:
+                if layer.backend is not None and layer.backend not in self.backends:
+                    raise ConfigError(f"collection.layers {layer.name!r}: no backend instance named {layer.backend!r}", "collection.layers")
+                if layer.kind == "graph_attach" and layer.backend is not None:
+                    spec = self.backends[layer.backend]
+                    if getattr(spec, "kind", None) != "kuzu" or getattr(spec, "mode", None) != "attach":
+                        raise ConfigError(f"collection.layers {layer.name!r}: graph_attach needs a kuzu backend with mode: attach", "collection.layers")
+            if collection.slices.gc_grace_seconds < self.budgets.deadline_seconds:
+                raise ConfigError(
+                    "collection.slices.gc_grace_seconds must be at least budgets.deadline_seconds (no slice is deleted under a pinned request)",
+                    "collection.slices.gc_grace_seconds",
+                )
+        names = [layer.name for layer in self.communities.layers]
+        if len(set(names)) != len(names):
+            raise ConfigError("communities.layers names must be unique", "communities.layers")
+        for layer in self.communities.layers:
+            if collection is None:
+                raise ConfigError("communities.layers needs a collection block (schema v3)", "communities.layers")
+            unknown = sorted(set(layer.sources) - collection.sources())
+            if unknown:
+                raise ConfigError(f"communities.layers {layer.name!r} covers sources no member declares: {unknown}", "communities.layers")
+            if layer.layer is not None and layer.layer not in {item.name for item in collection.layers}:
+                raise ConfigError(f"communities.layers {layer.name!r}: no collection layer named {layer.layer!r}", "communities.layers")
+        links = self.crosssource.links if self.crosssource is not None else None
+        if links is not None and links.review.role not in self.models.roles.chat_roles():
+            raise ConfigError(f"crosssource.links.review.role {links.review.role!r} is not a configured chat role", "crosssource.links.review.role")
+        return self
+
+    @model_validator(mode="after")
+    def logs_coherent(self):
+        """Cross-key rules of ``logs`` (addendum A1 §3.4.2 n1, §3.8.3, §3.8.4 n4)."""
+        logs = self.logs
+        if logs is None:
+            return self
+        if logs.source not in self.sources:
+            raise ConfigError(f"logs.source {logs.source!r} is not a configured source ({sorted(self.sources)})", "logs.source")
+        if "pattern" not in self.extraction.extractors:
+            raise ConfigError("logs needs the pattern extractor (extraction.extractors: [pattern, ...])", "extraction.extractors")
+        kind = self.backends[self.storage.catalog].kind
+        if kind not in PIN_REGISTRY_KINDS:
+            raise ConfigError(
+                f"logs needs a pin registry on the catalog's generation registry; {kind!r} has none (planned), "
+                f"use one of {list(PIN_REGISTRY_KINDS)}",
+                "storage.catalog",
+            )
+        recipe = self.ingestion.line_recipe
+        if recipe is None or "exemplars" not in recipe.fields:
+            raise ConfigError("logs needs ingestion.line_recipe with the exemplars field (one chunk per log record)", "ingestion.line_recipe")
+        source = self.sources[logs.source]
+        bound = source.max_line_bytes + source.multiline.max_bytes
+        if bound > recipe.max_chunk_chars:
+            raise ConfigError(
+                f"sources.{logs.source}.max_line_bytes + multiline.max_bytes ({bound}) exceeds "
+                f"ingestion.line_recipe.max_chunk_chars ({recipe.max_chunk_chars}); a record could span two chunks",
+                "ingestion.line_recipe.max_chunk_chars",
+            )
+        if self.pipeline.arms.dense is not None:
+            projections = self.ingestion.projections or ProjectionsConfig()
+            for kind, fields in LINE_TEXT_FIELDS.items():
+                if kind == "signature_examples" and logs.compose.exemplars != "per_tenant":
+                    continue  # not composed
+                embedded = [f for f in fields if projections.embeds(kind, f)]
+                if embedded:
+                    raise ConfigError(
+                        f"documents of kind {kind!r} carry log-line text in {embedded}; exclude the kind from vector "
+                        f"or set ingestion.projections.embed_fields.{kind} without them (retention invariant)",
+                        "ingestion.projections",
+                    )
+        raw = logs.partitions.raw
+        if raw.enabled and raw.path is not None:
+            from .config_logs import _absolute
+
+            root = _absolute(raw.path)
+            readers = {f"backends.{n}.path": b.path for n, b in self.backends.items() if getattr(b, "path", None) is not None and isinstance(b.path, Path)}
+            if self.extraction.pattern_library is not None:
+                readers["extraction.pattern_library.path"] = self.extraction.pattern_library.path
+            readers["the installed package (served code)"] = Path(__file__).resolve().parents[1]
+            try:  # the static UI bundle, when the wheel is installed
+                import su_multi_arm_ui  # type: ignore[import-not-found]
+
+                readers["the web UI bundle (served files)"] = Path(su_multi_arm_ui.STATIC_DIR)
+            except ImportError:
+                pass
+            for key, path in readers.items():
+                other = _absolute(path)
+                if other == root or root in other.parents or other in root.parents:
+                    raise ConfigError(f"logs.partitions.raw.path overlaps {key}; raw copies must sit where nothing else reads", "logs.partitions.raw.path")
+        if self.privacy.trace_masking != "privacy":
+            raise ConfigError("logs requires privacy.trace_masking: privacy (traces hold no passages)", "privacy.trace_masking")
+        if self.sessions.memory.store_text:
+            raise ConfigError("logs refuses sessions.memory.store_text (sessions keep ids and hashes only)", "sessions.memory.store_text")
+        kinds = logs.compose.kinds
+        if logs.intents.enabled:
+            missing = [k for k in ("log_day", "endpoint_day", "exception_day", "coverage_day") if not getattr(kinds, k)]
+            if missing:
+                raise ConfigError(f"logs.intents needs the analytics kinds {missing} (logs.compose.kinds)", "logs.compose.kinds")
+            if logs.compose.exemplars != "per_tenant":
+                raise ConfigError("logs.intents needs logs.compose.exemplars: per_tenant (no cross-tenant lines in one document)", "logs.compose.exemplars")
+        if kinds.incident:
+            try:
+                import networkx  # noqa: F401
+            except ImportError:
+                raise ConfigError("logs.compose.kinds.incident needs networkx (install the communities extra)", "logs.compose.kinds.incident") from None
+        if self.profile == "logs_example" and self.access.policy != "none":
+            raise ConfigError("the logs profile serves a single tenant (addendum A2 B4): access.policy must be none", "access.policy")
+        if self.access.policy == "tenant":
+            spec = self.metadata_schema.field(self.access.field)
+            if spec is None or not spec.filterable:
+                raise ConfigError(f"access.field {self.access.field!r} must be a declared filterable metadata field", "access.field")
         return self
 
     def capability_problem(self, backend_name: str, capability: str, flag: str | None = None) -> str | None:
@@ -1104,12 +1923,21 @@ class Config(StrictModel):
         It covers resolved absolute paths and inlined prompt text, so it differs per checkout. It is
         **not** an index identity: that is composed from component ``recipe_fingerprint()`` values.
         """
-        return hashlib.sha256(json.dumps(self.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
+        data = self.model_dump(mode="json")
+        # Unset v3 blocks are omitted, so adding them (S0) changed no v2 config's fingerprint.
+        for key in ("collection", "crosssource"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        if not data["communities"].get("layers"):
+            data["communities"].pop("layers", None)
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     def legacy_fingerprint(self) -> str:
         """v1 index fingerprint of the equivalent v1 config (``compat.config_v1.downgrade``)."""
         from ..compat.config_v1 import downgrade
 
+        if self.schema_version != 2:
+            raise ConfigError("v1 cannot express a schema_version 3 config", "schema_version")
         return downgrade(self).index_fingerprint()
 
 
@@ -1161,8 +1989,68 @@ def _resolve_paths(config: Config, base: Path) -> Config:
                 stage.prompt = stage.prompt_file.read_text()
         if pipeline.arms.exact_id and pipeline.arms.exact_id.alias_map:
             pipeline.arms.exact_id.alias_map = (base / pipeline.arms.exact_id.alias_map).resolve()
+        if pipeline.arms.segment is not None:  # S0: was resolved against the working directory
+            pipeline.arms.segment.path = (base / pipeline.arms.segment.path.expanduser()).resolve()
+    for item in config.ingestion.attach:  # S0: was resolved against the working directory
+        item.path = (base / item.path.expanduser()).resolve()
+    imported = config.communities.imported
+    if imported is not None:  # S0: was resolved against the working directory; the recipe keeps the written value
+        if imported._declared_path is None:
+            imported._declared_path = str(imported.path)
+        imported.path = (base / imported.path.expanduser()).resolve()
+    if config.collection is not None:
+        for member in config.collection.members.values():
+            if member.adopt is not None:
+                member.adopt.store = (base / member.adopt.store.expanduser()).resolve()
+                member.adopt.original_config = (base / member.adopt.original_config.expanduser()).resolve()
+        for layer in config.collection.layers:
+            if layer.path is not None:
+                layer.path = (base / layer.path.expanduser()).resolve()
+        if config.collection.id_directory.path is not None:
+            config.collection.id_directory.path = (base / config.collection.id_directory.path.expanduser()).resolve()
+    if config.crosssource is not None and config.crosssource.identity is not None:
+        identity = config.crosssource.identity
+        identity.registry_path = (base / identity.registry_path.expanduser()).resolve()
+    if config.crosssource is not None and config.crosssource.links is not None and config.crosssource.links.store_path is not None:
+        links = config.crosssource.links
+        links.store_path = (base / links.store_path.expanduser()).resolve()  # type: ignore[union-attr]
     if config.budgets.price_table:
         config.budgets.price_table = (base / config.budgets.price_table).resolve()
+    for source in config.sources.values():
+        if source.ca_bundle is not None:
+            source.ca_bundle = (base / source.ca_bundle.expanduser()).resolve()
+    if config.extraction.pattern_library is not None:
+        library = config.extraction.pattern_library
+        library.path = (base / library.path.expanduser()).resolve()
+    if config.learning.patterns is not None and config.learning.patterns.spend_ledger is not None:
+        config.learning.patterns.spend_ledger = (base / config.learning.patterns.spend_ledger.expanduser()).resolve()
+    if config.learning.patterns is not None and config.learning.patterns.stop_file is not None:
+        config.learning.patterns.stop_file = (base / config.learning.patterns.stop_file.expanduser()).resolve()
+    if config.serving.answers.ledger is not None:
+        config.serving.answers.ledger = (base / config.serving.answers.ledger.expanduser()).resolve()
+    if config.serving.ui.theme is not None:  # relative to the config file, like every other path
+        config.serving.ui.theme = (base / config.serving.ui.theme.expanduser()).resolve()
+    if config.learning.extraction is not None:
+        for name in ("spend_ledger", "reply_cache", "stop_file"):
+            value = getattr(config.learning.extraction, name)
+            if value is not None:
+                setattr(config.learning.extraction, name, (base / value.expanduser()).resolve())
+    if config.question.vocabulary.file is not None:
+        config.question.vocabulary.file = (base / config.question.vocabulary.file.expanduser()).resolve()
+        config.question.vocabulary.entries()  # read and digest-checked at load (ConfigError on a pin mismatch)
+    if config.logs is not None:
+        config.logs.partitions.path = (base / config.logs.partitions.path.expanduser()).resolve()
+        if config.logs.partitions.raw.path is not None:
+            config.logs.partitions.raw.path = (base / config.logs.partitions.raw.path.expanduser()).resolve()
+        if config.logs.intents.few_shot_file is not None:
+            config.logs.intents.few_shot_file = (base / config.logs.intents.few_shot_file.expanduser()).resolve()
+            config.logs.intents.examples()  # read and validated at load (ConfigError naming the file)
+        collection = config.logs.collection
+        for item in collection.keywords.files:
+            item.path = (base / item.path.expanduser()).resolve()
+        for section in (collection.archive, collection.staging):
+            if section.path is not None:
+                section.path = (base / section.path.expanduser()).resolve()
     embedder = config.models.roles.embedder
     if embedder is not None and embedder.precomputed is not None:
         embedder.precomputed.vectors = (base / embedder.precomputed.vectors.expanduser()).resolve()
@@ -1191,7 +2079,43 @@ def _path_slots(data: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
         for stage in ("decision", "generation"):
             add(pipeline.get(stage), "prompt_file", f"{prefix}.{stage}.prompt_file")
         add((pipeline.get("arms") or {}).get("exact_id"), "alias_map", f"{prefix}.arms.exact_id.alias_map")
+        add((pipeline.get("arms") or {}).get("segment"), "path", f"{prefix}.arms.segment.path")
+    for i, item in enumerate((data.get("ingestion") or {}).get("attach") or []):
+        add(item, "path", f"ingestion.attach.{i}.path")
+    add((data.get("communities") or {}).get("imported"), "path", "communities.imported.path")
+    collection_v3 = data.get("collection")
+    if isinstance(collection_v3, dict):
+        for name, member in (collection_v3.get("members") or {}).items():
+            adopt = member.get("adopt") if isinstance(member, dict) else None
+            add(adopt, "store", f"collection.members.{name}.adopt.store")
+            add(adopt, "original_config", f"collection.members.{name}.adopt.original_config")
+        for i, layer in enumerate(collection_v3.get("layers") or []):
+            add(layer, "path", f"collection.layers.{i}.path")
+        add(collection_v3.get("id_directory"), "path", "collection.id_directory.path")
+    add((data.get("crosssource") or {}).get("identity"), "registry_path", "crosssource.identity.registry_path")
+    add((data.get("crosssource") or {}).get("links"), "store_path", "crosssource.links.store_path")
     add(data.get("budgets"), "price_table", "budgets.price_table")
+    for name, source in (data.get("sources") or {}).items():
+        add(source, "ca_bundle", f"sources.{name}.ca_bundle")
+    add((data.get("extraction") or {}).get("pattern_library"), "path", "extraction.pattern_library.path")
+    add((data.get("learning") or {}).get("patterns"), "spend_ledger", "learning.patterns.spend_ledger")
+    add((data.get("learning") or {}).get("patterns"), "stop_file", "learning.patterns.stop_file")
+    add((data.get("learning") or {}).get("extraction"), "spend_ledger", "learning.extraction.spend_ledger")
+    add((data.get("learning") or {}).get("extraction"), "reply_cache", "learning.extraction.reply_cache")
+    add((data.get("learning") or {}).get("extraction"), "stop_file", "learning.extraction.stop_file")
+    add((data.get("serving") or {}).get("answers"), "ledger", "serving.answers.ledger")
+    add((data.get("serving") or {}).get("ui"), "theme", "serving.ui.theme")
+    add((data.get("logs") or {}).get("partitions"), "path", "logs.partitions.path")
+    add(((data.get("logs") or {}).get("partitions") or {}).get("raw"), "path", "logs.partitions.raw.path")
+    add(((data.get("logs") or {}).get("intents") or {}), "few_shot_file", "logs.intents.few_shot_file")
+    add(((data.get("question") or {}).get("vocabulary") or {}), "file", "question.vocabulary.file")
+    collection = (data.get("logs") or {}).get("collection") or {}
+    if isinstance(collection, dict):
+        for i, item in enumerate(((collection.get("keywords") or {}).get("files") or [])):
+            add(item, "path", f"logs.collection.keywords.files.{i}.path")
+        add(collection.get("archive"), "path", "logs.collection.archive.path")
+        add(collection.get("staging"), "path", "logs.collection.staging.path")
+        add(collection.get("provisional"), "path", "logs.collection.provisional.path")
     embedder = ((data.get("models") or {}).get("roles") or {}).get("embedder")
     precomputed = embedder.get("precomputed") if isinstance(embedder, dict) else None
     add(precomputed, "vectors", "models.roles.embedder.precomputed.vectors")
@@ -1217,7 +2141,9 @@ def rebase_paths(data: dict[str, Any], source_dir: Path, target_dir: Path) -> li
 
 
 def load_config(path: str | Path, *, check_plugins: bool = True, warn: bool = True) -> Config:
-    """Load a v2 YAML file, or a v1 file through the deterministic upgrade (with a warning)."""
+    """Load a v2 or v3 YAML file, or a v1 file through the deterministic upgrade (with a warning).
+
+    Relative file paths are resolved against the YAML file's directory (``_resolve_paths``)."""
     path = Path(path).expanduser().resolve()
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
@@ -1234,7 +2160,7 @@ def load_config(path: str | Path, *, check_plugins: bool = True, warn: bool = Tr
                 stacklevel=2,
             )
         config = result.config
-    elif version == 2:
+    elif version in (2, 3):
         config = validate_config(data)
     else:
         raise ConfigError(f"unsupported schema_version {version!r}", "schema_version")

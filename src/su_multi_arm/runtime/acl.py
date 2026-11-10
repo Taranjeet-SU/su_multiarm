@@ -68,3 +68,41 @@ def acl_key(constraints: ScopePredicates) -> str:
     """Deterministic hash of constraints for cache keys and value-listing scoping."""
     data = [p.model_dump(mode="json") for p in constraints]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
+
+class TenantPolicy(StaticPolicy):
+    """``access.policy: tenant`` (configuration): ``StaticPolicy`` on ``access.field`` with the
+    principal's tenant; principals listed in ``access.unrestricted`` (operators) see everything.
+    A principal without a tenant that is not listed sees nothing (fail closed)."""
+
+    def __init__(self, field: str, unrestricted: list[str] | tuple[str, ...] = ()):
+        super().__init__(field, "tenant", deny_when_missing=True)
+        self.unrestricted = frozenset(unrestricted)
+
+    def constraints(self, principal: Principal) -> ScopePredicates:
+        if principal.id in self.unrestricted:
+            return []
+        return super().constraints(principal)
+
+
+def policy_from_config(access) -> AccessPolicy:
+    """The access policy a configuration names (a closed set; no class loading)."""
+    if access is None or access.policy == "none":
+        return NoConstraints()
+    return TenantPolicy(access.field, list(access.unrestricted))
+
+
+LOGS_PROFILES = frozenset({"logs_example"})
+
+
+def require_single_tenant(config, acl) -> None:
+    """Addendum A2 rev 2 B4 / rev 3 n4: serving under the logs profile is single-tenant (the
+    operator sees all tenants; ``tenant`` is a dimension, not an ACL field). A tenant-scoped policy,
+    configured or injected, is refused at start-up instead of serving cross-tenant rollups to it."""
+    from ..core.errors import ConfigError
+
+    if getattr(config, "profile", None) in LOGS_PROFILES and not isinstance(acl, NoConstraints):
+        raise ConfigError(
+            "the logs profile serves a single tenant (addendum A2 B4): remove the access policy; per-tenant ACL over log rollups is deferred",
+            "access.policy",
+        )

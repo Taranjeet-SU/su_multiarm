@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 from ..core.errors import DeadlineExceeded
 from ..core.types import GenerationId, ScopePredicates
@@ -32,6 +32,9 @@ class RunContext:
     profile: str = "neutral"
     config_fingerprint: str | None = None
     clock: Callable[[], float] = time.monotonic
+    # ``serving.answers`` (A2 rev 4): a persistent spend scope every answer-time call reserves on
+    # (``runtime/answers_spend.AnswerSpend``); ``None`` = per-request budgets only.
+    spend: Any = None
 
     def __post_init__(self):
         self.trace.root.set(
@@ -79,6 +82,7 @@ def new_context(
     profile: str = "neutral",
     config_fingerprint: str | None = None,
     trace: Trace | None = None,
+    spend: Any = None,
 ) -> RunContext:
     """Build a context, reusing the session's memory so episodic exclusions carry across turns."""
     return RunContext(
@@ -91,4 +95,5 @@ def new_context(
         acl=acl or NoConstraints(),
         profile=profile,
         config_fingerprint=config_fingerprint,
+        spend=spend,
     )

@@ -29,7 +29,11 @@ def test_enum_value_must_be_declared(resolver):
     assert resolver.resolve(eq("kind", "note")).ok()
     bad = resolver.resolve(eq("kind", "memo"))
     assert bad.unsupported.reason == "value_not_observed" and bad.predicate is None
-    assert resolver.resolve(eq("kind", "Note")).unsupported.reason == "value_not_observed"  # no casefold declared
+    # 2026-11-09 (B5): an agent's case variant grounds by the documented normalization and is
+    # recorded (it was refused); a caller's request filter is still applied as given
+    variant = resolver.resolve(eq("kind", "Note"))
+    assert variant.predicate.value == "note" and variant.canonical == [{"field": "kind", "as_written": "Note", "value": "note", "rule": "normalized"}]
+    assert resolver.resolve(eq("kind", "Memo")).unsupported.reason == "value_not_observed"
 
 
 def test_string_under_cap_matches_observed_values_with_casefold(resolver):
@@ -37,7 +41,8 @@ def test_string_under_cap_matches_observed_values_with_casefold(resolver):
     assert resolver.resolve(eq("project", "alpha")).predicate.value == "Alpha"
     assert resolver.resolve(eq("project", "Delta")).unsupported.reason == "value_not_observed"
     assert resolver.resolve(Predicate(field="project", op="in", value=["alpha", "Beta"])).predicate.value == ["Alpha", "Beta"]
-    assert resolver.resolve(eq("status", "Open")).unsupported.reason == "value_not_observed"  # status has no casefold
+    # status has no casefold: "Open" grounds by the normalization rule (recorded), never silently
+    assert resolver.resolve(eq("status", "Open")).canonical[0]["rule"] == "normalized"
 
 
 def test_above_cap_uses_record_store_exists(resolver, v2_schema):

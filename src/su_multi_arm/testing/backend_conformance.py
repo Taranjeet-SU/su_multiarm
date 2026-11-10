@@ -227,14 +227,20 @@ def check_vector(adapter: Any) -> None:
         pass
 
 
-def check_records(adapter: Any) -> None:
-    records = adapter.records
-    seed(adapter)
-    rows = [
+def record_rows() -> list[StructuredRecord]:
+    """The three typed records of ``check_records`` (adapters' native-type tests reuse them: the
+    later text-count check overwrites ``GEN``'s records with untyped rows)."""
+    return [
         StructuredRecord(schema_id="document", id="d1", values={"source": "case", "product": "CloudTax", "created_at": "2024-01-01T00:00:00+00:00", "size": 3, "secret_id": "s1", "touched_at": "2025-01-02T08:00:00", "day": "2024-03-05"}, provenance=PROV),
         StructuredRecord(schema_id="document", id="d2", values={"source": "case", "product": "SearchDesk", "created_at": "2024-01-02T00:00:00+00:00", "size": 5, "secret_id": "s2", "touched_at": "2025-01-02T09:00:00+01:00", "day": "2024-03-06"}, provenance=PROV),
         StructuredRecord(schema_id="document", id="d3", values={"source": "article", "product": "CloudTax", "created_at": None, "size": None, "secret_id": "s3", "touched_at": "2025-01-01T23:30:00-02:00", "day": None}, provenance=PROV),
     ]
+
+
+def check_records(adapter: Any) -> None:
+    records = adapter.records
+    seed(adapter)
+    rows = record_rows()
     records.upsert(GEN, rows, SCHEMA)
     for bad in ({"created_at": 12}, {"created_at": "not a date"}, {"created_at": "2024-01-01T00:00:00"}):
         try:
@@ -265,16 +271,29 @@ def check_records(adapter: Any) -> None:
     _ensure(naive.unsupported[0].reason == "timezone_missing" and naive.applied == [], "naive bound is unsupported, never guessed")
     _ensure(naive.exactness == "bounded", "a dropped predicate makes the result bounded, never exact")
     # Every records adapter refuses a scope above ``max_matched`` with a typed error (no silent cut).
+    # Under native aggregation (Lucene ``records.aggregation: native``) nothing is scanned: the count
+    # stays exact and only the id list is capped, flagged ``matched_ids_truncated``.
+    native = getattr(adapter, "aggregation", "client") == "native"
     saved = adapter.max_matched
     adapter.max_matched = 2
     try:
-        try:
-            records.execute(GEN, ScopeSpec(measure=Measure(kind="count")), [])
-            raise AssertionError("a scope above max_matched must raise BackendError")
-        except BackendError as error:
-            _ensure("max_matched" in str(error), "max_matched: typed refusal names the cap")
+        if native:
+            saved_ids = adapter.matched_ids_cap
+            adapter.matched_ids_cap = 2
+            try:
+                over = records.execute(GEN, ScopeSpec(measure=Measure(kind="count")), [])
+                _ensure((over.value, over.total, over.exactness) == (3, 3, "exact"), "native: a scope above max_matched is still counted exactly")
+                _ensure(over.matched_ids == ["d1", "d2"] and over.matched_ids_truncated, "native: matched ids are capped and flagged, never silently cut")
+            finally:
+                adapter.matched_ids_cap = saved_ids
+        else:
+            try:
+                records.execute(GEN, ScopeSpec(measure=Measure(kind="count")), [])
+                raise AssertionError("a scope above max_matched must raise BackendError")
+            except BackendError as error:
+                _ensure("max_matched" in str(error), "max_matched: typed refusal names the cap")
         capped = records.execute(GEN, ScopeSpec(predicates=[Predicate(field="source", op="eq", value="case")], measure=Measure(kind="count")), [])
-        _ensure(capped.value == 2 and capped.matched_ids == ["d1", "d2"], "max_matched: a scope at the cap still answers exactly")
+        _ensure(capped.value == 2 and capped.matched_ids == ["d1", "d2"] and not capped.matched_ids_truncated, "max_matched: a scope at the cap still answers exactly")
     finally:
         adapter.max_matched = saved
     _ensure(records.execute(GEN, ScopeSpec(predicates=[Predicate(field="size", op="missing")]), []).matched_ids == ["d3"], "missing")
@@ -754,6 +773,51 @@ def check_ledger(adapter: Any) -> None:
     ledger.put_raw("c1:extract", "{not json", valid=False)
     raw = ledger.get_raw("c1:extract")
     _ensure(raw is not None and raw.valid is False and raw.raw_reply == "{not json" and ledger.get_raw("zz") is None, "raw replies kept, valid or not")
+    from ..backends.extras import LedgerRetention
+
+    if isinstance(ledger, LedgerRetention):
+        check_ledger_retention(ledger)
+
+
+def check_ledger_retention(ledger: Any) -> None:
+    """Tags, ``ledger_refs`` and ``purge`` (addendum A1 §3.8.3): tagged entries go with their tag,
+    unreferenced entries under a prefix go once their last referencing generation's refs are
+    dropped, referenced and other-prefix entries stay, job entries are dropped per generation."""
+    from ..backends.extras import PurgeSpec
+
+    ledger.put_raw("raw:a", "reply a", True, tags=["partition:s:2026-01-01", "partition:s:2026-01-02"])
+    ledger.put_raw("raw:b", "reply b", True, tags=["partition:s:2026-01-02"])
+    ledger.put_raw("extraction:r:c1", "{}", True)
+    ledger.put_raw("extraction:r:c2", "{}", True)
+    ledger.put_raw("embedding:e:x", "AAAA", True)
+    ledger.put_raw("other:keep", "kept", True)
+    ledger.put_raw("raw:learn", "reply in window", True, tags=["partition:s:2026-01-09"])
+    try:
+        ledger.tag_raw("raw:ghost", ["t"])
+        raise AssertionError("tagging an unknown entry")
+    except BackendError:
+        pass
+    _ensure(ledger.raw_tags("raw:a") == ["partition:s:2026-01-01", "partition:s:2026-01-02"], "raw tags")
+    _ensure(ledger.tagged("partition:s:2026-01-02") == ["raw:a", "raw:b"], "tagged lookup")
+    ledger.add_refs("g1", ["extraction:r:c1", "embedding:e:x"])
+    ledger.add_refs("g2", ["extraction:r:c1"])
+    ledger.add_refs("g2", ["extraction:r:c1"])  # idempotent
+    _ensure(ledger.refs("g1") == ["embedding:e:x", "extraction:r:c1"] and ledger.refs("g2") == ["extraction:r:c1"], "refs")
+    _ensure(ledger.referencing_generations() == ["g1", "g2"], "referencing generations")
+    page = ledger.raw_entries("extraction:", None, 1)
+    _ensure([r.key for r in page] == ["extraction:r:c1"] and [r.key for r in ledger.raw_entries("extraction:", page[-1].key, 10)] == ["extraction:r:c2"], "raw entries paged by key")
+    ledger.append("g1", LedgerEntry(sequence=0, kind="start", at="t0"))
+    _ensure("g1" in ledger.jobs() and ledger.drop_job("g1") == 1 and ledger.replay("g1") == [] and "g1" not in ledger.jobs(), "drop job entries")
+    counts = ledger.purge(PurgeSpec(drop_refs_of=["g1"], tags=["partition:s:2026-01-01"], unreferenced_prefixes=["extraction:", "embedding:"]))
+    _ensure(counts["refs_dropped"] == 2 and counts["tagged"] == 1 and counts["unreferenced"] == 2, f"purge counts {counts}")
+    _ensure(ledger.get_raw("raw:a") is None and ledger.raw_tags("raw:a") == [], "tagged entry purged with its tags")
+    _ensure(ledger.get_raw("raw:b") is not None, "entry with another tag kept")
+    _ensure(ledger.get_raw("extraction:r:c1") is not None, "entry referenced by a remaining generation kept")
+    _ensure(ledger.get_raw("extraction:r:c2") is None and ledger.get_raw("embedding:e:x") is None, "unreferenced entries purged")
+    _ensure(ledger.get_raw("other:keep") is not None, "other prefixes untouched")
+    ledger.purge(PurgeSpec(unreferenced_prefixes=["raw:"]))
+    _ensure(ledger.get_raw("raw:learn") is not None, "a tagged entry of a live partition survives the unreferenced purge")
+    _ensure(ledger.referencing_generations() == ["g2"], "refs of the dropped generation gone")
 
 
 def check_session(adapter: Any) -> None:
@@ -786,6 +850,52 @@ def check_session(adapter: Any) -> None:
     _ensure(sessions.expire(now=120.0, ttl_seconds=60) == 1 and sessions.get("s1") is None, "expired")
 
 
+def check_relational(adapter: Any) -> None:
+    """Typed projection files: written per generation, read back byte-identical, opened read-only
+    (writes and unlisted columns refused), removed with ``delete_generation``."""
+    import sqlite3
+
+    from ..projection.store import open_readonly
+
+    facet = adapter.relational
+    seed(adapter)
+    db = sqlite3.connect(":memory:")
+    db.execute('CREATE TABLE "t" ("id" TEXT PRIMARY KEY, "a" TEXT, "secret" TEXT, "_rejected" TEXT)')
+    db.execute("INSERT INTO t VALUES ('r1', 'x', 's', NULL)")
+    db.commit()
+    data = db.serialize()
+    db.close()
+    facet.put_file(GEN, "all.sqlite", data)
+    facet.put_file(GEN, "manifest.json", b"{}")
+    _ensure(facet.read_file(GEN, "all.sqlite") == data, "relational: file bytes differ after read-back")
+    _ensure(facet.file_names(GEN) == ["all.sqlite", "manifest.json"], "relational: file listing")
+    _ensure(facet.read_file(GEN2, "all.sqlite") is None, "relational: files are generation-scoped")
+    conn = open_readonly(facet, GEN, "all.sqlite", {"t": {"id", "a"}}, 1000)
+    try:
+        _ensure(conn.execute('SELECT "id", "a" FROM "t"').fetchall() == [("r1", "x")], "relational: read")
+        for statement in ("INSERT INTO t VALUES ('r2', 'y', 'z', NULL)", 'SELECT "secret" FROM "t"', "DROP TABLE t", "PRAGMA query_only=0"):
+            try:
+                conn.execute(statement)
+            except sqlite3.DatabaseError:
+                continue
+            raise AssertionError(f"relational: read-only connection accepted {statement!r}")
+    finally:
+        conn.close()
+    try:
+        facet.put_file(GEN, "../escape.sqlite", data)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("relational: a path-like file name was accepted")
+    _delete_generation(adapter, GEN)
+    _ensure(facet.file_names(GEN) == [], "relational: delete_generation leaves projection files")
+
+
+def _delete_generation(adapter: Any, gen: GenerationId) -> None:
+    delete = getattr(adapter, "delete_generation", None)
+    (delete if callable(delete) else adapter.catalog.delete_generation)(gen)
+
+
 CHECKS: dict[str, Callable[..., Any]] = {
     "catalog": check_catalog,
     "lexical": check_lexical,
@@ -794,6 +904,7 @@ CHECKS: dict[str, Callable[..., Any]] = {
     "graph": check_graph,
     "ledger": check_ledger,
     "session": check_session,
+    "relational": check_relational,
 }
 
 

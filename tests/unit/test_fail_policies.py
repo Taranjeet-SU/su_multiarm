@@ -154,7 +154,7 @@ def test_row_classifier_cascade_stage(v2_ctx, tmp_path):
     [
         ({"steps": [{"arm": "dense", "scope": {"measure": {"kind": "count"}}}]}, "schema_violation", None),
         ({"steps": [{"arm": "cache", "query": "x"}]}, "schema_violation", None),
-        ({"steps": [{"arm": "graph", "query": "x"}]}, "invalid_step", None),  # disabled arm
+        ({"steps": [{"arm": "graph", "query": "x"}]}, "schema_violation", None),  # disabled arm: closed by the capability-bound schema
         ({"steps": [{"arm": "dense", "query": "x", "filters": {"region": "north"}}]}, "invalid_step", "field_not_filterable"),
         ({"steps": [{"arm": "dense", "query": "x", "filters": {"project": "Beta"}}]}, "invalid_step", None),  # overrides request filter
         ({"steps": [{"arm": "dense", "query": "x", "filters": {"status": "archived"}}]}, "unresolvable_value", "value_not_observed"),
@@ -223,7 +223,8 @@ def test_row_llm_cascade_stage_default_abstain(v2_ctx, v2_backend, v2_schema, mo
     deps = Dependencies(components={"llm": llm(v2_backend), "rules": Deciding(RulesConfig(), Dependencies())})
     assert StagePolicies().llm == "abstain"
     decision = CascadeAgent(CascadeConfig(stages=["llm", "rules"]), deps).decide(v2_ctx, DecisionRequest(query="q"), None, caps)
-    assert decision.outcome == "abstain" and decision.stage == "llm" and decision.failure == "invalid_step"
+    # A disabled arm is rejected by the capability-bound plan schema before compilation.
+    assert decision.outcome == "abstain" and decision.stage == "llm" and decision.failure == "schema_violation"
     lenient = CascadeAgent(CascadeConfig(stages=["llm", "rules"], stage_policies=StagePolicies(llm="fallback_to_next_stage")), deps)
     assert lenient.decide(v2_ctx, DecisionRequest(query="q"), None, caps).stage == "rules"
 

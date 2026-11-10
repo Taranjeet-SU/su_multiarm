@@ -1,0 +1,137 @@
+# Example profile: daily log analytics (addendum A2 §4.1). The pattern extractor's output feeds every
+# arm: dense (signature and incident documents only, never line text), lexical (signatures, their
+# per-tenant redacted examples, incidents), structured (typed rollups with exactness and basis
+# roles), graph (span-anchored header links and line-scoped facts) and communities (co-firing
+# incidents). Serving is single-tenant: the operator sees all tenants (review B4); a tenant-scoped
+# access policy is refused under this profile.
+#
+# The deployment supplies sources:, logs: (source and partitions path), backends, storage and
+# extraction.pattern_library.path; configuration values override everything here.
+name: logs_example
+overlay:
+  pipeline:
+    decision:
+      schema_repair_attempts: 1
+  metadata_schema:
+    timezone: UTC
+    unknown_fields: allow
+    fields:
+      - {name: date, type: date, groupable: true, sortable: true, time_basis: index_date}
+      - {name: ts_hour, type: datetime, groupable: true, sortable: true, time_basis: event_hour}
+      - {name: first_hour, type: datetime, sortable: true}
+      - {name: peak_hour, type: datetime, sortable: true}
+      - {name: last_hour, type: datetime, sortable: true}
+      - {name: first_seen, type: date, groupable: true, sortable: true}
+      - {name: last_seen, type: date, groupable: true, sortable: true}
+      - {name: tenant, type: string, groupable: true, listable: true}
+      - {name: env, type: string, groupable: true, listable: true}
+      - {name: deployment, type: string, groupable: true, listable: true}
+      - {name: deployment_id, type: string, groupable: true, listable: true}
+      - {name: service, type: string, groupable: true, listable: true}
+      - {name: level, type: string, groupable: true, listable: true}
+      - {name: status, type: enum, enum_values: [parsed, noise, unparsed, format_only, timeout, provisional, model_line], groupable: true}
+      - {name: signature_id, type: string, groupable: true, listable: true, max_catalog_cardinality: 2000}
+      - {name: category, type: string, groupable: true, listable: true}
+      - {name: pattern_id, type: string, groupable: true}
+      - {name: pattern_owner, type: enum, enum_values: [user, learned, none], groupable: true}
+      - {name: endpoint, type: string, groupable: true, listable: true}
+      - {name: http_method, type: string, groupable: true}
+      - {name: status_class, type: string, groupable: true, listable: true}
+      - {name: exception_class, type: string, groupable: true, listable: true}
+      - {name: community_id, type: string, groupable: true}
+      - {name: community_family_id, type: string, groupable: true}
+      - {name: signatures, type: string}
+      - {name: services, type: string}
+      - {name: lines, type: integer, sortable: true}
+      - {name: lines_total, type: integer, sortable: true}
+      - {name: lines_pulled, type: integer, sortable: true}
+      - {name: documents_collected, type: integer, sortable: true}
+      - {name: documents_in_collection_scope, type: integer, sortable: true}
+      - {name: collection_known_units, type: integer, sortable: true}
+      - {name: incident_units, type: integer, sortable: true}
+      - {name: source_window_documents, type: integer, sortable: true}
+      - {name: selected_seed_documents, type: integer, sortable: true}
+      - {name: seeds_collected, type: integer, sortable: true}
+      - {name: context_documents, type: integer, sortable: true}
+      - {name: context_pending_seeds, type: integer, sortable: true}
+      - {name: collection_scope, type: string, groupable: true}
+      - {name: count_scope, type: string, groupable: true}
+      - {name: selected_tier_units, type: integer, sortable: true}
+      - {name: records_collected, type: integer, sortable: true}
+      - {name: records_scanned, type: integer, sortable: true}
+      - {name: records_extracted, type: integer, sortable: true}
+      - {name: scanning_known_units, type: integer, sortable: true}
+      - {name: collection_invalid_units, type: integer, sortable: true}
+      - {name: scanning_invalid_units, type: integer, sortable: true}
+      - {name: extraction_invalid_units, type: integer, sortable: true}
+      - {name: lines_parsed, type: integer, sortable: true}
+      - {name: lines_noise, type: integer, sortable: true}
+      - {name: lines_unparsed, type: integer, sortable: true}
+      - {name: lines_format_only, type: integer, sortable: true}
+      - {name: lines_timeout, type: integer, sortable: true}
+      - {name: fragments, type: integer, sortable: true}
+      - {name: lines_window, type: integer, sortable: true}
+      - {name: lines_history, type: integer, sortable: true}
+      - {name: days_seen, type: integer, sortable: true}
+      - {name: tenants_affected, type: integer, sortable: true}
+      - {name: cells, type: integer, sortable: true}
+      - {name: latency_ms_sum, type: number, sortable: true}
+      - {name: latency_ms_count, type: integer, sortable: true}
+      - {name: latency_ms_max, type: number, sortable: true}
+      - {name: latency_ms_p95, type: number, sortable: true, additive: false}
+      - {name: coverage, type: number, sortable: true, additive: false}
+      - {name: extracted_coverage, type: number, sortable: true, additive: false}
+      - {name: lines_provisional, type: integer, sortable: true}
+      - {name: lines_model_line, type: integer, sortable: true}
+      - {name: lines_parsed_filled, type: integer, sortable: true}
+      - {name: row_exactness, type: enum, enum_values: [exact, approximate], role: exactness}
+      - {name: basis, type: string, role: basis}
+      - {name: extraction_source, type: enum, enum_values: [deterministic, model_assisted], role: extraction}
+      - {name: method, type: string}
+  extraction:
+    extractors: [pattern]
+    pattern_library:
+      log_links: true
+  communities:
+    strategy: declared
+    min_documents: 1
+  ingestion:
+    line_recipe:
+      fields: [exemplars]
+    projections:
+      exclude_kinds:
+        lexical: [unit_day, signature_day, service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour, log_day, log_hour, endpoint_day, endpoint_window, exception_day, coverage_day, signature_catalog, graph_link, signature_history, signature_lineage]
+        vector: [unit_day, signature_day, service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour, log_day, log_hour, endpoint_day, endpoint_window, exception_day, coverage_day, signature_catalog, signature_examples, graph_link, signature_history, signature_lineage]
+        graph: [service_day, signature_service_day, signature_window, signature_tenant_window, signature_hour, log_day, log_hour, endpoint_window, coverage_day, signature_catalog, signature_history, signature_lineage]
+      embed_fields:
+        signature: [template]
+        incident: [summary]
+        shared_error: [summary]
+  privacy:
+    trace_masking: privacy
+  logs:
+    compose:
+      exemplars: per_tenant
+      kinds: {log_day: true, log_hour: true, endpoint_day: true, exception_day: true, coverage_day: true, incident: true}
+    retention:
+      derived: forever
+    history:
+      tier: true
+    intents:
+      enabled: true
+      # Synthetic planner examples (question -> intent call) for the llm planner's context pack; a
+      # deployment replaces them with logs.intents.few_shot_file.
+      few_shot:
+        - {question: "which service is failing the most", intent: log_top, args: {by: service, level: [error, fatal]}}
+        - {question: "what are the issues that need my attention", intent: log_top, args: {by: signature, level: [error, fatal], window: yesterday}}
+        - {question: "anything new I should look at", intent: log_new, args: {window: last 2 days}}
+        - {question: "which customers hit FATAL today", intent: log_top, args: {by: tenant, level: [fatal], window: today}}
+        - {question: "which clients had the most problems yesterday", intent: log_top, args: {by: tenant, level: [error, fatal], window: yesterday}}
+        - {question: "how many errors did tenant t01 have per day", intent: log_trend, args: {tenant: t01, level: [error, fatal], window: last 7 days, granularity: day}}
+        - {question: "did errors increase on 2026-03-05 compared to 2026-03-04", intent: log_compare, args: {periods: ["2026-03-04", "2026-03-05"], level: [error, fatal]}}
+        - {question: "which service has the worst error rate this week", intent: log_top, args: {by: service, metric: error_rate, window: last 7 days}}
+        - {question: "how have failures trended over the last week", intent: log_trend, args: {level: [error, fatal], window: last 7 days}}
+        - {question: "is the parser keeping up", intent: log_coverage, args: {window: yesterday}}
+        - {question: "what happened around 3pm on 2026-03-05", intent: log_around, args: {at: "2026-03-05T15:00:00+00:00"}}
+  tools:
+    enabled: [search, get_document, list_values, aggregate, log_top, log_new, log_affected, log_trend, log_compare, log_tenants, log_around, log_endpoints, log_signature, log_coverage, incidents, graph_neighbourhood]

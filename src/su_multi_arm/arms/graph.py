@@ -2,7 +2,7 @@
 
 * **free text** (no graph intent): seeds are stored entities whose name tokens all occur in the
   query and that have a mention inside the scope; a minimal ``TraversalSpec`` follows ``fact`` edges
-  only (co-occurrence is never traversed); evidence is the mention passages of reached entities with
+  only by default (``edge_kinds``; co-occurrence is never traversed unless configured); evidence is the mention passages of reached entities with
   depth and edge provenance;
 * **typed intent** (``step.graph = {template, seeds}``): a declared traversal template
   (``pipeline.arms.graph.templates``) is run through ``arms/traversal.py``; evidence is the documents
@@ -48,7 +48,12 @@ class GraphArm(BaseArm):
 
     def _run(self, ctx: RunContext, inputs: ArmInput) -> ArmResult:
         graph = extras.require(self.backend, extras.GraphExtras, "graph", "find_entities")
-        scope = self.graph_scope(ctx, inputs.scope)
+        layered = self.layer_scope(ctx, inputs.scope)
+        if layered is None:
+            reason = f"the request scope names sources outside the graph layer's sources {sorted(self.backend.covered_sources())}"
+            return ArmResult(arm=self.name, reports=[{"kind": "scope_outside_layer", "arm": self.name, "reason": reason}],
+                             diagnostics=[Diagnostic(severity="info", code="graph_scope_outside_layer", message=reason, component=self.name)])
+        scope = self.graph_scope(ctx, layered)
         if inputs.graph is not None:
             return self._run_template(ctx, inputs, graph, scope)
         seeds = graph.find_entities(ctx.generation, tokens(inputs.query), scope)
@@ -59,7 +64,7 @@ class GraphArm(BaseArm):
             hops=self.cfg.hops,
             predicates=list(self.cfg.predicates),
             direction=self.cfg.direction,
-            edge_kinds=["fact"],
+            edge_kinds=list(inputs.edge_kinds or getattr(self.cfg, "edge_kinds", None) or ["fact"]),
             limit=inputs.candidates,
         )
         paths = graph.traverse(ctx.generation, spec, scope) if self.cfg.hops else []
@@ -77,7 +82,51 @@ class GraphArm(BaseArm):
             for m in mentions
         ]
         scored.sort(key=lambda row: (-row[1], row[0]))
-        return ArmResult(arm=self.name, hits=self.collapse(ctx, scored), paths=paths)
+        hits = self.collapse(ctx, scored)
+        if self.cfg.path_evidence and paths:
+            # Opt-in: the documents the traversed edges are anchored in (their quotes as provenance),
+            # after the mention passages. An attached store's mention spans are not catalog chunks,
+            # so without this its free-text traversal returns paths but no hits.
+            from types import SimpleNamespace
+
+            seen = {h.document_id for h in hits}
+            extra, _outside = self._evidence_hits(ctx, SimpleNamespace(paths=paths, mentions=[], template=None))
+            hits.extend(h for h in extra if h.document_id not in seen)
+            hits = hits[: inputs.candidates]
+        return ArmResult(arm=self.name, hits=hits, paths=paths)
+
+    def layer_scope(self, ctx: RunContext, scope: Any) -> Any:
+        """The scope an attached graph layer of a partitioned collection can serve (unified merge
+        §6.4: a layer covers declared sources). ``None`` when the scope's ``source`` condition
+        excludes every covered source (``filters: {source: logs}`` over the support graph): the arm
+        returns no graph evidence, says why in the trace and its report, and the request goes on
+        (staging F3; before, the catalog resolution of every log document exceeded the resolved-
+        scope bound and failed the whole search). Otherwise, when predicates are resolved through
+        the catalog (``predicate_scope: false``), the scope is narrowed to the covered sources: the
+        layer holds no other document, so the eligible set it can match is unchanged. A backend that
+        is not a layer, or a scope without predicates, is returned unchanged."""
+        from ..backends import capabilities as caps
+        from ..core.types import Predicate, Scope
+
+        covered_of = getattr(self.backend, "covered_sources", None)
+        if not callable(covered_of) or scope is None or not scope.predicates:
+            return scope
+        covered = set(covered_of())
+        named: set[str] | None = None
+        for p in scope.predicates:
+            if p.field == "source" and not p.negate and p.op in {"eq", "in"}:
+                values = {str(p.value)} if p.op == "eq" else {str(v) for v in (p.value or [])}
+                named = values if named is None else named & values
+        if named is not None and not named & covered:
+            ctx.trace.event("graph_scope_outside_layer", arm=self.name, layer=getattr(getattr(self.backend, "layer", None), "name", None), sources=sorted(named), covered=sorted(covered))
+            return None
+        kind = getattr(self.backend, "kind", None)
+        if kind in caps.MATRIX and caps.flags(kind, "graph").get("predicate_scope", False):
+            return scope
+        if named is not None and named <= covered:
+            return scope
+        narrowed = Predicate(field="source", op="in", value=sorted(covered if named is None else named & covered))
+        return Scope(predicates=[*scope.predicates, narrowed], document_ids=scope.document_ids, exclude_ids=list(scope.exclude_ids))
 
     # --- typed intents -----------------------------------------------------------------------
 

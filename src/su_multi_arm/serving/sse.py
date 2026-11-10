@@ -29,6 +29,9 @@ SAFE_ERROR_CATEGORIES = frozenset({"cancelled", "budget_exhausted", "deadline_ex
 
 def public_error(event: ErrorEvent) -> ErrorEvent:
     message = event.message if event.category in SAFE_ERROR_CATEGORIES else PUBLIC_ERROR
+    if event.category == "provider_incomplete":
+        action = {"planner": "planning the query", "generator": "generating the answer", "reviewer": "reviewing the evidence", "community": "summarizing the evidence"}.get(event.stage, "completing the response")
+        message = f"The model stopped before finishing {action}. No completed answer is available. Try a narrower question or fewer results."
     return event.model_copy(update={"message": message})
 
 

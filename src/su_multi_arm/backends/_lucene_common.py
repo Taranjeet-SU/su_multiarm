@@ -301,6 +301,38 @@ def bulk_body(actions: Sequence[tuple[dict[str, Any], dict[str, Any] | None]]) -
     return "\n".join(lines) + "\n"
 
 
+def bulk_batches(body: str, max_bytes: int):
+    """Bound UTF-8 NDJSON requests without separating an action from its source.
+
+    A single oversized operation remains intact and is left to the server's normal
+    size validation. Neither source content nor operation ordering is changed.
+    """
+    if max_bytes < 1:
+        raise ValueError("bulk byte budget must be positive")
+    lines = iter(body.split("\n"))
+    pending, size = [], 0
+    for header in lines:
+        if not header:
+            continue
+        action = json.loads(header)
+        if not isinstance(action, dict) or len(action) != 1 or next(iter(action)) not in {"index", "create", "update", "delete"}:
+            raise ValueError("invalid bulk operation header")
+        record = header + "\n"
+        if "delete" not in action:
+            source = next(lines, None)
+            if not source:
+                raise ValueError("bulk operation has no source")
+            record += source + "\n"
+        cost = len(record.encode("utf-8"))
+        if pending and size + cost > max_bytes:
+            yield "".join(pending)
+            pending, size = [], 0
+        pending.append(record)
+        size += cost
+    if pending:
+        yield "".join(pending)
+
+
 def check_bulk(kind: str, operation: str, reply: Any, describe: Callable[[str], str] | None = None) -> None:
     """A bulk reply with any failed item is a typed error (no partial success is ever silent)."""
     if not isinstance(reply, dict) or "items" not in reply:

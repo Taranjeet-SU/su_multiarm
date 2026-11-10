@@ -153,6 +153,9 @@ class SearchRequest(StrictModel):
     # Anchor for relative calendar expressions ("this month", "last 7 days"): an ISO date or
     # datetime, read in ``metadata_schema.timezone`` when it has no offset. Default: now.
     as_of: str | None = Field(default=None, max_length=64)
+    # Per-request evidence budget in characters (replaces the configured generator/packing budget for
+    # this request). Refused unless ``request.evidence_chars_max`` is configured and not exceeded.
+    evidence_chars: int | None = Field(default=None, ge=500, le=2_000_000)
 
     @field_validator("as_of")
     @classmethod
@@ -211,6 +214,21 @@ UnsupportedReason = Literal[
     "not_supported_by_backend",
     "aggregate_intent_without_scope",
     "qualifier_not_applied",  # a question qualifier the compiled scope does not express (QA-01)
+    "intent_required",  # logs profile: an ad-hoc scope over several log kinds (A2 rev 3, R2-B4)
+    # typed-query route (typed-query plan §5.1)
+    "join_not_declared",
+    "fanout_unsafe",
+    "filter_not_applicable",
+    "column_not_projectable",
+    "projection_unavailable",
+    "result_truncated",
+    "planner_not_answerable",
+    "sql_refused",  # typed_query sql_surface: model SQL outside the guard's catalog/allowlists
+    "sql_route_failed",  # typed_query sql_surface route: no SQL could be written (provider/schema/budget/availability)
+    "typed_route_failed",  # typed router, mode ir: no executable typed query was written for the routed sub-question
+    # 2026-11-09 (corpus-B B4): two aggregates state different counts for the same mention claim; the
+    # one that does not match the question's text columns is demoted (``engine._reconcile_counts``)
+    "conflicting_count",
 ]
 
 
@@ -222,7 +240,9 @@ class UnsupportedConstraint(StrictModel):
     suggestion: str | None = None  # also masked
 
 
-ClaimKind = Literal["narrative", "count", "exhaustive_list", "absence"]
+# ``examples``: a bounded sample of records cited as examples next to an aggregate; never a claim of
+# completeness (``generation/contract.py`` rule 6).
+ClaimKind = Literal["narrative", "count", "exhaustive_list", "absence", "examples"]
 ContractRule = Literal[
     "unknown_evidence",
     "claim_without_exact_scope",
@@ -231,6 +251,11 @@ ContractRule = Literal[
     "answer_text_without_exact_scope",  # a count/list/absence statement in the answer text (QA-04)
     "empty_answer",  # a factual answer whose text is empty (observed in the 2.0.0a2 QA-08 rerun)
     "answer_number_mismatch",  # the count stated in the text differs from the backing aggregate (N2)
+    "examples_claim_invalid",  # an ``examples`` claim without record citations, over the cap, or claiming completeness
+    # the operations half of a two-halves answer (staging round 5, N14; ``generation/operations.py``)
+    "operations_claim_unbacked",  # a current halt/outage/recovery/cause no operations evidence item states
+    "records_presented_as_current",  # earlier records presented as current or recent incidents
+    "operations_restated",  # the model restated the operations evidence, which is shown as rendered
 ]
 
 
@@ -265,7 +290,8 @@ class Coverage(StrictModel):
 class Violation(StrictModel):
     rule: ContractRule
     detail: str
-    action: Literal["abstain", "strip"] = "abstain"  # what the contract did about it (QA-08)
+    # what the contract did about it (QA-08); ``annotate``: kept with a limitation note (opt-in mode)
+    action: Literal["abstain", "strip", "annotate"] = "abstain"
 
 
 class AnswerResult(StrictModel):
@@ -278,4 +304,6 @@ class AnswerResult(StrictModel):
     unsupported_constraints: list[UnsupportedConstraint] = Field(default_factory=list)  # engine-injected only
     coverage: Coverage | None = None
     violations: list[Violation] = Field(default_factory=list)
-    contract: Literal["passed", "stripped", "abstained"] = "passed"  # stripped: unbacked claims/sentences removed
+    contract: Literal["passed", "stripped", "abstained", "annotated"] = "passed"  # stripped: unbacked claims/sentences removed
+    # ``annotated`` (``on_violation: annotate``): the deterministic limitation notes appended to the answer
+    limitations: list[str] = Field(default_factory=list)

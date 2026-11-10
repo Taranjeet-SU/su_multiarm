@@ -145,4 +145,8 @@ if _importlib_util.find_spec("fastapi") is None:
         "parity/test_request_parity.py",
         "parity/test_serving_parity.py",
         "test_interfaces.py",
+        "contract/test_inspect_routes.py",
+        "contract/test_logs_surface_parity.py",
+        "contract/test_ui_forwarder.py",
+        "contract/test_ui_mount.py",
     ]

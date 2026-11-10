@@ -42,6 +42,16 @@ STOP_WORDS: frozenset[str] = frozenset(
 )
 WORD = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 DEFAULT_LIST_LIMIT = 50  # records a ``list`` question shows; the total is always reported
+# A ranking phrase the targeted intent grammar may miss ("which customer currently has the most
+# open+pending tickets", "who is second for ..."): such a question is never answered by one total.
+_RANKING = re.compile(
+    r"\b(?:which|who)\b[^?.!]{0,80}?\b(?:most|fewest|least|highest|lowest|largest|smallest|biggest|greatest)\b"
+    r"|\b(?:second|third|fourth|fifth|\d+(?:st|nd|rd|th))(?:[\s-]+(?:most|highest|lowest|largest|fewest|place))?\s+(?:for|in|by|among)\b"
+    r"|\btop\s+\d+\b",
+    re.I,
+)
+# Mention phrasings: a semantic "mentions X", not the literal match the text scope counts.
+_MENTION = re.compile(r"\b(?:mention(?:s|ed|ing)?|about|regarding|referencing|refer(?:s|red|ring)?\s+to|related\s+to|relating\s+to|involving)\b|-(?:mention(?:s|ed|ing)?|related)\b", re.I)
 
 
 class RulesConfig(StrictModel):
@@ -57,8 +67,10 @@ class RulesAgent(DecisionAgent):
         super().__init__(config, deps)
         self.records = deps.backends.get("records")
 
-    def resolver(self, ctx: RunContext, schema: MetadataSchema, anchor: Any = None) -> ValueResolver:
-        return ValueResolver(schema, self.records, ctx.generation, ctx.constraints(), anchor=anchor)
+    def resolver(self, ctx: RunContext, schema: MetadataSchema, anchor: Any = None, scope: Any = ()) -> ValueResolver:
+        # ``scope``: ``Capabilities.value_scope`` (the two-halves knowledge half lists the knowledge
+        # sources' values only)
+        return ValueResolver(schema, self.records, ctx.generation, [*ctx.constraints(), *scope], anchor=anchor, value_scoped=bool(scope))
 
     def attempt(self, ctx: RunContext, request: DecisionRequest, intents: Intents, capabilities: Capabilities) -> Decision:
         if request.scope is None and (intents.aggregate() or request.aggregate is not None):
@@ -100,7 +112,7 @@ class RulesAgent(DecisionAgent):
             ] or [UnsupportedConstraint(constraint_text="aggregate", reason="aggregate_intent_without_scope", suggestion="enable the structured arm")]
             raise DecisionFailure("no_plan", "aggregate intent but the structured arm is not enabled", flagged)
         schema = capabilities.metadata_schema
-        resolver = self.resolver(ctx, schema, request.as_of)
+        resolver = self.resolver(ctx, schema, request.as_of, capabilities.value_scope)
         compiler = ScopeCompiler(schema, resolver)
         if request.aggregate is not None:
             draft = ScopeDraft(measure=request.aggregate, time_basis=self._time_basis(schema, request.query, request.aggregate))
@@ -126,16 +138,56 @@ class RulesAgent(DecisionAgent):
             elif problem is None:
                 draft.measure = measure
                 draft.time_basis = draft.time_basis or time_basis
+        if self._ranking_by_total(kinds, request.query, draft):
+            # 2026-11-08 parity fix: a ranking question compiled to one total ("which customer has
+            # the most open tickets" -> the count of all open tickets) is refused, never answered
+            # by a single number labelled exact.
+            unsupported.append(
+                UnsupportedConstraint(
+                    constraint_text=next((a.text for a in intents.aggregates if a.kind == "rank"), "ranking"),
+                    reason="measure_unsupported",
+                    suggestion="the question asks a ranking of groups; the grammar compiled only a single total, which never answers it",
+                )
+            )
         if not (draft.group_by or draft.periods) and draft.limit is None and "list" in kinds and "count" not in kinds and "absence" not in kinds:
             if draft.measure is None:
                 draft.limit = DEFAULT_LIST_LIMIT
+        semantic = self._semantic_text(request.query, draft)
         if unsupported:
             dropped = parsed.residual or any(u.reason == "qualifier_not_applied" for u in unsupported)
             raise DecisionFailure("unresolvable_value" if dropped else "unsupported_measure", "grammar left unbound qualifiers", unsupported)
         compiled = compiler.compile(draft, request.filters)
-        return self._finish(compiled, intents)
+        return self._finish(compiled, intents, [semantic] if semantic is not None else [])
 
-    def _finish(self, compiled: CompiledScope, intents: Intents) -> Decision:
+    @staticmethod
+    def _ranking_by_total(kinds: list[str], query: str, draft: ScopeDraft) -> bool:
+        """The question ranks groups (a ``rank`` intent or a superlative/ordinal ranking phrase)
+        but the draft is one ungrouped total (count, distinct count or sum), not a ranking."""
+        if not ("rank" in kinds or _RANKING.search(query)):
+            return False
+        if draft.group_by or draft.periods or draft.sort is not None or draft.top_n is not None or draft.nth is not None or draft.order is not None:
+            return False
+        return draft.measure is None or draft.measure.kind in {"count", "count_distinct", "sum"}
+
+    @staticmethod
+    def _semantic_text(query: str, draft: ScopeDraft) -> UnsupportedConstraint | None:
+        """A text condition read from a *mention* phrasing ("X-mention tickets", "mentioning X",
+        "about X") counts records with an indexed chunk holding the words: a literal lexical
+        match, which is a different counting basis from "records that mention X" (other wordings,
+        other fields, quoted or negated mentions). The count is then ``bounded`` with this reason
+        attached, never ``exact`` (2026-11-08 parity fix). A quoted phrase or ``containing <words>``
+        is the literal match the question defines, and stays exact."""
+        if draft.text is None or draft.text.role != "scope" or draft.text.kind == "phrase":
+            return None
+        if not _MENTION.search(query):
+            return None
+        return UnsupportedConstraint(
+            constraint_text=draft.text.text,
+            reason="qualifier_not_applied",
+            suggestion="the question counts mentions; the scope counts records whose indexed text contains the words (a literal lexical match), a different counting basis",
+        )
+
+    def _finish(self, compiled: CompiledScope, intents: Intents, unapplied: list[UnsupportedConstraint] | None = None) -> Decision:
         if not compiled.executable():
             category = "unsupported_measure" if any(u.reason == "measure_unsupported" for u in compiled.unsupported) else "unresolvable_value"
             raise DecisionFailure(category, "scope cannot be executed as asked", compiled.unsupported)
@@ -143,8 +195,9 @@ class RulesAgent(DecisionAgent):
         if compiled.zero_match_fields:
             note = f"request filters with no observed value: {compiled.zero_match_fields}"
         return Decision(
-            plan=Plan(steps=[StructuredStep(arm="structured", scope=compiled.spec)]),  # type: ignore[arg-type]
+            plan=Plan(steps=[StructuredStep(arm="structured", scope=compiled.spec, unapplied=list(unapplied or []))]),  # type: ignore[arg-type]
             scope=compiled.spec,
+            unsupported=list(unapplied or []),
             outcome="decided",
             agent=self.name,
             policy_applied="rules",

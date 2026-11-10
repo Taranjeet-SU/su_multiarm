@@ -16,6 +16,8 @@ still metered with the reported usage.
 from __future__ import annotations
 
 import os
+import threading
+import time
 from typing import Any, Callable, ClassVar
 
 import httpx
@@ -29,10 +31,16 @@ from .base import (
     CapabilityMismatch,
     HttpCall,
     MeteredCall,
+    ProviderConnectionError,
     ProviderError,
+    ProviderIncomplete,
     ProviderLimitIgnored,
+    ProviderRateLimited,
+    ProviderServerError,
+    ProviderTimeout,
     ProviderSchemaTooComplex,
     RoleSpec,
+    SchemaViolation,
     StrictSchemaError,
     T,
     Usage,
@@ -53,6 +61,40 @@ def _complexity_problems(schema: type[BaseModel]) -> list[str]:
     except StrictSchemaError:
         return []
     return output_format_limit_problems(wire, schema.__name__)
+
+
+# Appended to the system prompt of a ``retry_shorter`` attempt (M0). Neutral; no domain text.
+SHORTER_INSTRUCTION = (
+    "\n\nYour previous reply to this request was cut off at the output limit. Answer again, complete"
+    " and well-formed, but substantially shorter: keep only the most important points and citations."
+)
+TRUNCATION_STOPS = frozenset({"max_tokens", "length"})
+
+
+def _discard(_text: str) -> None:
+    return None
+
+
+def _incomplete_cause(call: MeteredCall, consumer: Any) -> str:
+    """``max_tokens`` | ``stop`` | ``stream_end`` for a ``ProviderIncomplete`` (M0: recorded in the
+    call record so a 502 says whether the reply was truncated or the stream was cut)."""
+    stop = call.extra.get("stop_reason")
+    if stop in TRUNCATION_STOPS:
+        return "max_tokens"
+    if "stop_reason" in call.extra:
+        return "stop"
+    message = getattr(consumer, "message", None)
+    partial = message.get("stop_reason") if isinstance(message, dict) else None
+    if partial is not None:
+        call.extra["stream_stop_reason"] = partial if isinstance(partial, str) else "other"
+    return "max_tokens" if partial in TRUNCATION_STOPS else "stream_end"
+
+
+def _transient(error: ProviderError) -> bool:
+    """Failures another identical attempt may not repeat (never auth, bad request, refusal, schema)."""
+    if isinstance(error, ProviderIncomplete):
+        return getattr(error, "cause", None) == "stream_end"
+    return isinstance(error, (ProviderServerError, ProviderRateLimited, ProviderTimeout, ProviderConnectionError))
 
 
 class MissingSecret(ProviderError, ValueError):
@@ -92,11 +134,15 @@ class HttpChatProvider:
             self.role.prompt_caching,
             self.role.reasoning_effort,
             max_tokens=self.role.max_tokens,
+            thinking=self.role.thinking,
+            thinking_budget_tokens=self.role.thinking_budget_tokens,
+            effort=self.role.effort,
         )
         if problems:
             raise CapabilityMismatch("; ".join(f"{key}: {message}" for key, message in problems))
         self.http = HttpCall(transport)
         self._prompt_fallback: dict[str, dict[str, str]] = {}  # schema name -> {from, reason} of a recorded switch to prompt mode
+        self._last = threading.local()  # the stop reason of this thread's last call (for SchemaViolation)
 
     # --- public API ----------------------------------------------------------------------------
 
@@ -116,7 +162,14 @@ class HttpChatProvider:
 
     def complete_json(self, system: str, payload: Any, schema: type[T], budget: CallMeter, ctx: CallContext) -> tuple[T, Usage]:
         raw, usage = self.complete_json_raw(system, payload, schema, budget, ctx)
-        return validate_reply(schema, raw, ctx.stage), usage
+        return self._validated(schema, raw, ctx), usage
+
+    def _validated(self, schema: type[T], raw: str, ctx: CallContext) -> T:
+        try:
+            return validate_reply(schema, raw, ctx.stage)
+        except SchemaViolation as error:
+            error.stop_reason = getattr(self._last, "stop_reason", None)  # this thread's last call
+            raise
 
     def complete_json_raw(self, system: str, payload: Any, schema: type[BaseModel], budget: CallMeter, ctx: CallContext) -> tuple[str, Usage]:
         return self._schema_exchange(system, user_content(payload), schema, budget, ctx)
@@ -172,7 +225,7 @@ class HttpChatProvider:
         self, system: str, payload: Any, schema: type[T], budget: CallMeter, ctx: CallContext, on_delta: Callable[[str], None]
     ) -> tuple[T, Usage]:
         raw, usage = self._schema_exchange(system, user_content(payload), schema, budget, ctx, on_delta=self._require_streaming(on_delta, ctx))
-        return validate_reply(schema, raw, ctx.stage), usage
+        return self._validated(schema, raw, ctx), usage
 
     def complete_text_stream(self, system: str, payload: Any, budget: CallMeter, ctx: CallContext, on_delta: Callable[[str], None]) -> tuple[str, Usage]:
         return self._exchange(system, user_content(payload), None, "text", budget, ctx, on_delta=self._require_streaming(on_delta, ctx))
@@ -197,31 +250,140 @@ class HttpChatProvider:
         on_delta: Callable[[str], None] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> tuple[str, Usage]:
+        """One logical call: the first attempt plus the role's explicit retries (M0, §6.13).
+
+        * ``on_incomplete`` (``ProviderIncomplete`` with cause ``max_tokens``): ``retry_shorter``
+          sends the call once more with the same ceiling and ``SHORTER_INSTRUCTION`` appended to the
+          system prompt; ``retry_larger`` once more with ``incomplete_retry_max_tokens``.
+        * ``retry_transient`` (5xx/overloaded, 429, timeout, connection error, a stream that ended
+          before its final event without a ``max_tokens`` stop): up to ``attempts`` more calls after
+          ``backoff_seconds``.
+
+        Every attempt is its own metered call (reserved on the budget, recorded with ``attempt`` and
+        ``retry_reason``). An attempt is made only while the request deadline leaves room for the
+        backoff; a retry the budget refuses (``BudgetExhausted``/``DeadlineExceeded`` at reservation)
+        leaves the original error standing. Nothing else is retried; the model is never changed.
+        Streamed calls: once deltas were emitted, a retry's deltas are not forwarded (the streamed
+        text is provisional; the validated reply is the result)."""
+        from ..core.errors import BudgetExhausted, DeadlineExceeded
+
+        role = self.role
+        transient_left = role.retry_attempts
+        incomplete_left = 1 if role.on_incomplete in {"retry_shorter", "retry_larger"} else 0
+        attempt, reason, max_tokens, prompt = 1, None, None, system
+        emitted = [False]
+        pending: ProviderError | None = None
+        forward = None
+        if on_delta is not None:
+
+            def forward(text: str) -> None:
+                emitted[0] = True
+                on_delta(text)
+
+        while True:
+            sink = forward
+            if on_delta is not None and attempt > 1 and emitted[0]:
+                sink = _discard
+            record = {**(extra or {}), **({"attempt": attempt, "retry_reason": reason} if attempt > 1 else {})}
+            try:
+                return self._exchange_once(prompt, user, schema, mode, budget, ctx, on_delta=sink, extra=record, max_tokens=max_tokens)
+            except (BudgetExhausted, DeadlineExceeded):
+                if attempt > 1 and pending is not None:
+                    raise pending from None  # the retry could not be reserved: the original failure stands
+                raise
+            except ProviderError as error:
+                pending = error
+                cause = getattr(error, "cause", None)
+                if isinstance(error, ProviderIncomplete) and cause == "max_tokens":
+                    if incomplete_left <= 0:
+                        raise
+                    incomplete_left -= 1
+                    reason = f"incomplete:{role.on_incomplete}"
+                    if role.on_incomplete == "retry_larger":
+                        max_tokens = role.incomplete_retry_max_tokens
+                    else:
+                        prompt = system + SHORTER_INSTRUCTION
+                elif _transient(error) and transient_left > 0 and self._room_for(budget, role.retry_backoff_seconds):
+                    transient_left -= 1
+                    reason = f"transient:{getattr(error, 'category', type(error).__name__)}" + (f":{cause}" if cause else "")
+                    if role.retry_backoff_seconds:
+                        self._sleep(role.retry_backoff_seconds)
+                else:
+                    raise
+                attempt += 1
+
+    @staticmethod
+    def _room_for(budget: CallMeter, backoff: float) -> bool:
+        """The request deadline (when the meter knows it) leaves the backoff plus one second."""
+        remaining = getattr(budget, "remaining_seconds", None)
+        left = remaining() if callable(remaining) else None
+        return left is None or left > backoff + 1.0
+
+    def _exchange_once(
+        self,
+        system: str,
+        user: str,
+        schema: type[BaseModel] | None,
+        mode: str,
+        budget: CallMeter,
+        ctx: CallContext,
+        on_delta: Callable[[str], None] | None = None,
+        extra: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, Usage]:
         path, headers, body = self._request(system, user, schema, mode)  # CapabilityMismatch before any call
+        ceiling = self.role.max_tokens
+        if max_tokens is not None:
+            ceiling = max_tokens
+            for key in ("max_tokens", "max_completion_tokens", self.caps.max_output_tokens_param):
+                if key in body:
+                    body[key] = max_tokens
         if on_delta is not None:
             body = self._stream_body(body)
         key = secret(self.role.api_key_env, ctx.stage)
         headers = {**headers, **self._auth(key)}
         url = (self.role.base_url or self.default_base_url).rstrip("/") + path
-        estimate = CallEstimate.of(len(system) + len(user) + len(str(body.get("tools") or body.get("response_format") or body.get("output_config") or "")), self.role.max_tokens)
-        with MeteredCall(self, budget, ctx, mode, estimate) as call:
-            call.extra.update(extra or {})
-            if on_delta is None:
-                data = self.http.post(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage)
-            else:
-                consumer = self._stream_consumer(on_delta, ctx.stage)
-                call.extra["stream"] = True
-                data = self.http.post_stream(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage, consumer=consumer)
-            text = self._parse(data, mode, ctx, call, body)
-            if call.usage.reported and call.usage.output_tokens > self.role.max_tokens:
+        estimate = CallEstimate.of(len(system) + len(user) + len(str(body.get("tools") or body.get("response_format") or body.get("output_config") or "")), ceiling)
+        consumer = None
+        with MeteredCall(self, budget, ctx, mode, estimate, max_tokens=ceiling) as call:
+            call.extra.update({k: v for k, v in (extra or {}).items() if v is not None})
+            try:
+                if on_delta is None:
+                    data = self.http.post(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage)
+                else:
+                    consumer = self._stream_consumer(self._timed(on_delta, call), ctx.stage)
+                    call.extra["stream"] = True
+                    data = self.http.post_stream(url, headers=headers, body=body, timeout=timeout_for(self.role, budget), stage=ctx.stage, consumer=consumer)
+                text = self._parse(data, mode, ctx, call, body)
+            except ProviderIncomplete as error:
+                error.cause = _incomplete_cause(call, consumer)
+                call.extra["incomplete_cause"] = error.cause
+                raise
+            self._last.stop_reason = call.extra.get("stop_reason")
+            if call.usage.reported and call.usage.output_tokens > ceiling:
                 raise ProviderLimitIgnored(
-                    f"reply used {call.usage.output_tokens} output tokens, more than max_tokens {self.role.max_tokens} "
+                    f"reply used {call.usage.output_tokens} output tokens, more than max_tokens {ceiling} "
                     f"sent as {self._ceiling_param(body)}; the server ignored the output ceiling",
                     stage=ctx.stage,
                 )
         if mode.startswith("native:") or mode == "text":
             return text, call.usage
         return FENCE.sub("", text.strip()), call.usage
+
+    def _sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    @staticmethod
+    def _timed(on_delta: Callable[[str], None], call: MeteredCall) -> Callable[[str], None]:
+        """``on_delta`` that records ``first_token_seconds`` (call start to the first reply text or
+        JSON fragment; thinking is not a reply token) in the call record (2026-11-09)."""
+
+        def timed(text: str) -> None:
+            if "first_token_seconds" not in call.extra:
+                call.extra["first_token_seconds"] = round(time.perf_counter() - call.started, 4)
+            on_delta(text)
+
+        return timed
 
     @staticmethod
     def _ceiling_param(body: dict[str, Any]) -> str:

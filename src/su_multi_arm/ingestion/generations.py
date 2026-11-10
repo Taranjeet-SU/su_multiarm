@@ -11,6 +11,7 @@ projection      backends
 ``vector``      ``pipeline.arms.dense.backend``
 ``graph``       ``pipeline.arms.graph.backend``, ``pipeline.arms.community.backend``, ``storage.communities``
 ``communities`` ``storage.communities`` and ``pipeline.arms.community.backend``
+``projection``  ``projection.backend`` when ``projection.enabled`` (typed projection files)
 =============== ===================================================================================
 
 ``storage.ledger``/``sessions``/``cache`` are not generation-scoped and take no part in staging,
@@ -52,7 +53,7 @@ from ..core.types import GenerationId
 from .lease import stale_base
 from .release import ANY
 
-PROJECTION_ORDER: tuple[str, ...] = ("vector", "lexical", "records", "graph", "communities", "catalog")
+PROJECTION_ORDER: tuple[str, ...] = ("vector", "lexical", "records", "graph", "communities", "projection", "catalog")
 NEEDS_CATALOG_ROWS = ("lexical", "vector")  # facets that refuse chunks of documents they do not hold
 
 
@@ -60,10 +61,18 @@ def _unique(*names: str | None) -> list[str]:
     return list(dict.fromkeys(n for n in names if n))
 
 
+def attached_read_only(config: Any, name: str | None) -> bool:
+    """A backend opened read-only over a store built outside the package (``kuzu`` ``mode: attach``):
+    the graph arm reads it, but it is never a write-path projection (no writes, no activation, not
+    part of the index recipe)."""
+    spec = config.backends.get(name) if name else None
+    return getattr(spec, "kind", None) == "kuzu" and getattr(spec, "mode", None) == "attach"
+
+
 def placement(config: Any) -> dict[str, list[str]]:
     """Projection -> backend names (configuration order, without duplicates)."""
     storage, arms = config.storage, config.pipeline.arms
-    graph = arms.graph.backend if arms.graph else None
+    graph = arms.graph.backend if arms.graph and not attached_read_only(config, arms.graph.backend) else None
     community = arms.community.backend if arms.community else None
     placed = {
         "catalog": [storage.catalog],
@@ -75,6 +84,9 @@ def placement(config: Any) -> dict[str, list[str]]:
         placed["lexical"] = [arms.lexical.backend]
     if arms.dense:
         placed["vector"] = [arms.dense.backend]
+    projection = getattr(config, "projection", None)
+    if projection is not None and projection.enabled and projection.backend:
+        placed["projection"] = [projection.backend]  # typed projection files (opt-in)
     return placed
 
 

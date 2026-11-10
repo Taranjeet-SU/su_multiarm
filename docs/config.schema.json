@@ -1,5 +1,64 @@
 {
   "$defs": {
+    "AccessConfig": {
+      "additionalProperties": false,
+      "description": "The access policy (``runtime/acl.py``) selected by name; no class is loaded from config.\n\n* ``none``: every principal sees the whole dataset (single-tenant serving, the default).\n* ``tenant``: every arm, tool, value listing and graph read is restricted to records whose\n  ``field`` equals the principal's ``tenant``. A principal without a tenant sees nothing\n  (fail closed) unless its id is listed in ``unrestricted`` (an operator).",
+      "properties": {
+        "policy": {
+          "default": "none",
+          "enum": [
+            "none",
+            "tenant"
+          ],
+          "title": "Policy",
+          "type": "string"
+        },
+        "field": {
+          "default": "tenant",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Field",
+          "type": "string"
+        },
+        "unrestricted": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Unrestricted",
+          "type": "array"
+        }
+      },
+      "title": "AccessConfig",
+      "type": "object"
+    },
+    "AccountingConfig": {
+      "additionalProperties": false,
+      "description": "Line accounting (addendum A2 \u00a74.2.1): ``required_fields`` maps a signature category to the\nfields a ``parsed`` line of that category must carry with a valid value; a line an approved\npattern matched without one is a field gap (``learning.extraction.fill``).",
+      "properties": {
+        "required_fields": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Required Fields",
+          "type": "object"
+        },
+        "validators": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FieldValidatorConfig"
+          },
+          "title": "Validators",
+          "type": "object"
+        },
+        "targets": {
+          "$ref": "#/$defs/CoverageTargets"
+        }
+      },
+      "title": "AccountingConfig",
+      "type": "object"
+    },
     "ActionsConfig": {
       "additionalProperties": false,
       "description": "Write actions (plan \u00a73.4). Default: none. Only built-in actions named here are registered;\nevery invocation (also a denied one) is audited on ``storage.ledger`` before it runs.",
@@ -43,6 +102,7 @@
           "enum": [
             "abstain_with_reason",
             "strip",
+            "annotate",
             "fail"
           ],
           "title": "On Violation",
@@ -50,6 +110,46 @@
         }
       },
       "title": "AnswerContractConfig",
+      "type": "object"
+    },
+    "ArchiveConfig": {
+      "additionalProperties": false,
+      "description": "The long-term archive of keyword/episode day aggregates: append-only day shards served\nthrough the history tier (``ingestion/episode_archive.py``).",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "max_text_chars": {
+          "anyOf": [
+            {
+              "maximum": 1000000,
+              "minimum": 64,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Text Chars"
+        }
+      },
+      "title": "ArchiveConfig",
       "type": "object"
     },
     "ArmsConfig": {
@@ -131,9 +231,92 @@
             }
           ],
           "default": null
+        },
+        "typed_query": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypedQueryArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "segment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SegmentArm"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "title": "ArmsConfig",
+      "type": "object"
+    },
+    "AttachSource": {
+      "additionalProperties": false,
+      "description": "``ingestion.attach`` entry (``ingestion/attach.py``): one-to-one attributes of ``table`` (a\ntable or view of a read-only SQLite file pinned by ``sha256``) joined onto document metadata.\n``document_id``: the document id with ``{key}`` standing for ``key_column``'s value;\n``columns``: source column -> declared metadata field.",
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "table": {
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+          "title": "Table",
+          "type": "string"
+        },
+        "key_column": {
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+          "title": "Key Column",
+          "type": "string"
+        },
+        "document_id": {
+          "maxLength": 200,
+          "minLength": 5,
+          "pattern": "\\{key\\}",
+          "title": "Document Id",
+          "type": "string"
+        },
+        "columns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 100,
+          "minProperties": 1,
+          "title": "Columns",
+          "type": "object"
+        },
+        "on_conflict": {
+          "default": "fail",
+          "enum": [
+            "fail",
+            "keep_document"
+          ],
+          "title": "On Conflict",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "table",
+        "key_column",
+        "document_id",
+        "columns"
+      ],
+      "title": "AttachSource",
       "type": "object"
     },
     "Bm25Settings": {
@@ -187,6 +370,58 @@
         }
       },
       "title": "Bm25Settings",
+      "type": "object"
+    },
+    "BootstrapConfig": {
+      "additionalProperties": false,
+      "description": "``learning.bootstrap`` (A2 rev 4): the first ``days`` days of the fallback, when the residue\nbacklog is largest. Off by default. While active, cluster calls go to self-hosted routes only\n(``local``/``lan``; paid routes are skipped) and are capped at ``max_clusters_per_day``.\n``require_measured_throughput`` (default) refuses to start unless ``patterns measure-throughput``\nhas recorded a self-hosted tier, and the cap is then also bounded by the measured calls/hour over\n``hours_per_day``. ``max_usd_per_day`` is required (finite) when a paid route can be reached.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "require_measured_throughput": {
+          "default": true,
+          "title": "Require Measured Throughput",
+          "type": "boolean"
+        },
+        "days": {
+          "default": 3,
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Days",
+          "type": "integer"
+        },
+        "max_clusters_per_day": {
+          "default": 150,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Clusters Per Day",
+          "type": "integer"
+        },
+        "hours_per_day": {
+          "default": 8.0,
+          "exclusiveMinimum": 0,
+          "maximum": 24,
+          "title": "Hours Per Day",
+          "type": "number"
+        },
+        "max_usd_per_day": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Day"
+        }
+      },
+      "title": "BootstrapConfig",
       "type": "object"
     },
     "BudgetsConfig": {
@@ -271,6 +506,30 @@
         },
         "ingest": {
           "$ref": "#/$defs/IngestBudget"
+        },
+        "providers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProviderBudget"
+          },
+          "propertyNames": {
+            "enum": [
+              "anthropic",
+              "openai",
+              "openai_compatible"
+            ]
+          },
+          "title": "Providers",
+          "type": "object"
+        },
+        "plan_check": {
+          "default": "warn",
+          "enum": [
+            "off",
+            "warn",
+            "refuse"
+          ],
+          "title": "Plan Check",
+          "type": "string"
         }
       },
       "title": "BudgetsConfig",
@@ -347,6 +606,41 @@
     "ChatRole": {
       "additionalProperties": false,
       "properties": {
+        "on_incomplete": {
+          "default": "fail",
+          "enum": [
+            "fail",
+            "retry_shorter",
+            "retry_larger"
+          ],
+          "title": "On Incomplete",
+          "type": "string"
+        },
+        "incomplete_retry_max_tokens": {
+          "anyOf": [
+            {
+              "maximum": 64000,
+              "minimum": 128,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incomplete Retry Max Tokens"
+        },
+        "retry_transient": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RetryTransient"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "provider": {
           "enum": [
             "openai_compatible",
@@ -425,6 +719,62 @@
           ],
           "default": null,
           "title": "Reasoning Effort"
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "enum": [
+                "off",
+                "adaptive",
+                "between_tools",
+                "enabled"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thinking"
+        },
+        "thinking_budget_tokens": {
+          "anyOf": [
+            {
+              "maximum": 63999,
+              "minimum": 1024,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thinking Budget Tokens"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
+        "measure_first_token": {
+          "default": false,
+          "title": "Measure First Token",
+          "type": "boolean"
         },
         "capabilities": {
           "$ref": "#/$defs/CapabilityDeclaration"
@@ -543,6 +893,547 @@
       "title": "ClassifierManifestConfig",
       "type": "object"
     },
+    "CoFiringConfig": {
+      "additionalProperties": false,
+      "description": "Co-firing communities (addendum A2 \u00a74.1.4, A1 N6): signatures that fire together in hourly\ncells. A cell is ``(tenant, env, hour)`` (``tenant_env_hour``, default; review N8), ``(deployment, hour)``\n(``deployment_hour``, format-2 cells) or ``(tenant, env,\nservice, hour)`` (``service_hour``). Communities are computed **per tenant** (review B4), so an\nincident never mixes tenants.",
+      "properties": {
+        "min_support_cells": {
+          "default": 3,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Min Support Cells",
+          "type": "integer"
+        },
+        "min_lift": {
+          "default": 2.0,
+          "exclusiveMinimum": 0,
+          "title": "Min Lift",
+          "type": "number"
+        },
+        "max_signatures": {
+          "default": 20000,
+          "maximum": 1000000,
+          "minimum": 2,
+          "title": "Max Signatures",
+          "type": "integer"
+        },
+        "resolution": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Resolution",
+          "type": "number"
+        },
+        "seed": {
+          "default": 42,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "split_above": {
+          "default": 12,
+          "maximum": 100000,
+          "minimum": 2,
+          "title": "Split Above",
+          "type": "integer"
+        },
+        "unit": {
+          "default": "tenant_env_hour",
+          "enum": [
+            "tenant_env_hour",
+            "service_hour",
+            "deployment_hour"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "title": "CoFiringConfig",
+      "type": "object"
+    },
+    "CollectionConfig": {
+      "additionalProperties": false,
+      "description": "``collection`` (schema v3). ``mode: partitioned`` is the only mode.",
+      "properties": {
+        "mode": {
+          "const": "partitioned",
+          "title": "Mode",
+          "type": "string"
+        },
+        "members": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CollectionMember"
+          },
+          "maxProperties": 64,
+          "minProperties": 1,
+          "title": "Members",
+          "type": "object"
+        },
+        "embedding_space": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmbeddingSpace"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "lexical": {
+          "additionalProperties": {
+            "$ref": "#/$defs/LexicalStratum"
+          },
+          "title": "Lexical",
+          "type": "object"
+        },
+        "selection": {
+          "$ref": "#/$defs/CollectionSelection"
+        },
+        "layers": {
+          "items": {
+            "$ref": "#/$defs/CollectionLayer"
+          },
+          "maxItems": 32,
+          "title": "Layers",
+          "type": "array"
+        },
+        "slices": {
+          "$ref": "#/$defs/SliceSettings"
+        },
+        "id_directory": {
+          "$ref": "#/$defs/IdDirectoryConfig"
+        }
+      },
+      "required": [
+        "mode",
+        "members"
+      ],
+      "title": "CollectionConfig",
+      "type": "object"
+    },
+    "CollectionLayer": {
+      "additionalProperties": false,
+      "description": "``collection.layers[]`` (\u00a76.4): a read-only store outside the write path, pinned by digest,\ncovering ``sources`` and serving ``arms``. ``backend`` names an existing backend instance when\nthe layer is one (``graph_attach``: the ``kuzu`` ``mode: attach`` backend); otherwise ``path``\nand ``sha256`` pin the file or the sealed directory manifest.",
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "graph_attach",
+            "segment_sidecar",
+            "communities_imported",
+            "communities_shared_errors",
+            "communities_unified",
+            "identity",
+            "links",
+            "graph_overlay"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Sources",
+          "type": "array"
+        },
+        "arms": {
+          "items": {
+            "enum": [
+              "lexical",
+              "dense",
+              "structured",
+              "typed_query",
+              "graph",
+              "community",
+              "segment",
+              "exact_id"
+            ],
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Arms",
+          "type": "array"
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "member": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Member"
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "sources"
+      ],
+      "title": "CollectionLayer",
+      "type": "object"
+    },
+    "CollectionMember": {
+      "additionalProperties": false,
+      "description": "One declared member (\u00a76.1, \u00a78 output). Its instances (``MemberRef``) are built, adopted or\nhanded off later; this block only declares their shape.",
+      "properties": {
+        "kind": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Sources",
+          "type": "array"
+        },
+        "record_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Record Kinds",
+          "type": "array"
+        },
+        "cadence": {
+          "default": "daily",
+          "enum": [
+            "adopted",
+            "minutes",
+            "hourly",
+            "daily",
+            "weekly",
+            "close_day",
+            "manual"
+          ],
+          "title": "Cadence",
+          "type": "string"
+        },
+        "key": {
+          "default": "snapshot",
+          "enum": [
+            "adopted",
+            "snapshot",
+            "day",
+            "month"
+          ],
+          "title": "Key",
+          "type": "string"
+        },
+        "producer": {
+          "$ref": "#/$defs/MemberProducer"
+        },
+        "id_namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Id Namespaces",
+          "type": "array"
+        },
+        "identity_namespace": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}\\.[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Identity Namespace"
+        },
+        "time_roles": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "enum": [
+                "event_time",
+                "update_time",
+                "ingest_time"
+              ]
+            },
+            "type": "object"
+          },
+          "title": "Time Roles",
+          "type": "object"
+        },
+        "canonical_units": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Canonical Units",
+          "type": "object"
+        },
+        "catalog_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Catalog Kinds",
+          "type": "array"
+        },
+        "field_map": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Field Map",
+          "type": "object"
+        },
+        "visibility": {
+          "const": "operator",
+          "default": "operator",
+          "title": "Visibility",
+          "type": "string"
+        },
+        "embed_fields": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Embed Fields",
+          "type": "object"
+        },
+        "adopt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemberAdoption"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "vectors": {
+          "default": "import",
+          "enum": [
+            "import",
+            "online"
+          ],
+          "title": "Vectors",
+          "type": "string"
+        },
+        "metadata_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metadata Fields"
+        }
+      },
+      "required": [
+        "kind",
+        "sources",
+        "record_kinds",
+        "id_namespaces"
+      ],
+      "title": "CollectionMember",
+      "type": "object"
+    },
+    "CollectionPolicyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "schedule": {
+          "$ref": "#/$defs/CollectionScheduleConfig"
+        },
+        "keywords": {
+          "$ref": "#/$defs/KeywordPolicyConfig"
+        },
+        "archive": {
+          "$ref": "#/$defs/ArchiveConfig"
+        },
+        "staging": {
+          "$ref": "#/$defs/StagingConfig"
+        },
+        "provisional": {
+          "$ref": "#/$defs/ProvisionalConfig"
+        },
+        "serving": {
+          "$ref": "#/$defs/CollectionServingConfig"
+        },
+        "liveness": {
+          "$ref": "#/$defs/LivenessConfig"
+        }
+      },
+      "title": "CollectionPolicyConfig",
+      "type": "object"
+    },
+    "CollectionScheduleConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "summary_refresh_minutes": {
+          "default": 15,
+          "maximum": 1440,
+          "minimum": 1,
+          "title": "Summary Refresh Minutes",
+          "type": "integer"
+        },
+        "heavy_window_utc": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcWindow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "day_close_delay_minutes": {
+          "default": 0,
+          "maximum": 1440,
+          "minimum": 0,
+          "title": "Day Close Delay Minutes",
+          "type": "integer"
+        },
+        "close_after_days": {
+          "default": 1,
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Close After Days",
+          "type": "integer"
+        },
+        "grace_days": {
+          "default": 2,
+          "maximum": 30,
+          "minimum": 0,
+          "title": "Grace Days",
+          "type": "integer"
+        }
+      },
+      "title": "CollectionScheduleConfig",
+      "type": "object"
+    },
+    "CollectionSelection": {
+      "additionalProperties": false,
+      "properties": {
+        "source_quotas": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "number"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Quotas"
+        }
+      },
+      "title": "CollectionSelection",
+      "type": "object"
+    },
+    "CollectionServingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_window_days": {
+          "default": 31,
+          "maximum": 3660,
+          "minimum": 1,
+          "title": "Max Window Days",
+          "type": "integer"
+        },
+        "default_view_days": {
+          "default": 3,
+          "maximum": 366,
+          "minimum": 1,
+          "title": "Default View Days",
+          "type": "integer"
+        }
+      },
+      "title": "CollectionServingConfig",
+      "type": "object"
+    },
     "CommunitiesConfig": {
       "additionalProperties": false,
       "properties": {
@@ -551,7 +1442,9 @@
           "enum": [
             "entity",
             "louvain",
-            "louvain_hierarchical"
+            "louvain_hierarchical",
+            "declared",
+            "imported"
           ],
           "title": "Strategy",
           "type": "string"
@@ -600,6 +1493,25 @@
             }
           ],
           "default": null
+        },
+        "imported": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImportedCommunities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "layers": {
+          "items": {
+            "$ref": "#/$defs/CommunityLayer"
+          },
+          "maxItems": 16,
+          "title": "Layers",
+          "type": "array"
         }
       },
       "title": "CommunitiesConfig",
@@ -612,6 +1524,18 @@
           "pattern": "^[a-z][a-z0-9_]{0,63}$",
           "title": "Backend",
           "type": "string"
+        },
+        "claim_hits": {
+          "default": false,
+          "title": "Claim Hits",
+          "type": "boolean"
+        },
+        "claim_min_terms": {
+          "default": 2,
+          "maximum": 10,
+          "minimum": 1,
+          "title": "Claim Min Terms",
+          "type": "integer"
         }
       },
       "required": [
@@ -646,6 +1570,56 @@
         }
       },
       "title": "CommunityHierarchy",
+      "type": "object"
+    },
+    "CommunityLayer": {
+      "additionalProperties": false,
+      "description": "``communities.layers[]`` (schema v3): one community layer of a unified collection. The single\n``communities.strategy`` keeps working for v2 configs; ``layers`` is refused there.",
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "strategy": {
+          "enum": [
+            "imported",
+            "declared",
+            "shared_errors",
+            "unified_epoch"
+          ],
+          "title": "Strategy",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Sources",
+          "type": "array"
+        },
+        "layer": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Layer"
+        }
+      },
+      "required": [
+        "name",
+        "strategy",
+        "sources"
+      ],
+      "title": "CommunityLayer",
       "type": "object"
     },
     "CommunityStats": {
@@ -683,6 +1657,212 @@
         }
       },
       "title": "CommunityStats",
+      "type": "object"
+    },
+    "ComposeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "signature_hour": {
+          "default": false,
+          "title": "Signature Hour",
+          "type": "boolean"
+        },
+        "max_exemplars_per_signature": {
+          "default": 3,
+          "maximum": 50,
+          "minimum": 0,
+          "title": "Max Exemplars Per Signature",
+          "type": "integer"
+        },
+        "kinds": {
+          "$ref": "#/$defs/ComposeKinds"
+        },
+        "exemplars": {
+          "default": "signature",
+          "enum": [
+            "signature",
+            "per_tenant"
+          ],
+          "title": "Exemplars",
+          "type": "string"
+        },
+        "endpoints": {
+          "$ref": "#/$defs/EndpointsConfig"
+        }
+      },
+      "title": "ComposeConfig",
+      "type": "object"
+    },
+    "ComposeKinds": {
+      "additionalProperties": false,
+      "description": "Analytics kinds composed from format-2 partitions (addendum A2 \u00a74.1.1\u20134.1.2). Off by default\nso a generic logs config composes exactly what it did; the ``logs_example`` profile turns them on.",
+      "properties": {
+        "log_day": {
+          "default": false,
+          "title": "Log Day",
+          "type": "boolean"
+        },
+        "log_hour": {
+          "default": false,
+          "title": "Log Hour",
+          "type": "boolean"
+        },
+        "endpoint_day": {
+          "default": false,
+          "title": "Endpoint Day",
+          "type": "boolean"
+        },
+        "exception_day": {
+          "default": false,
+          "title": "Exception Day",
+          "type": "boolean"
+        },
+        "coverage_day": {
+          "default": false,
+          "title": "Coverage Day",
+          "type": "boolean"
+        },
+        "incident": {
+          "default": false,
+          "title": "Incident",
+          "type": "boolean"
+        },
+        "shared_error": {
+          "default": false,
+          "title": "Shared Error",
+          "type": "boolean"
+        }
+      },
+      "title": "ComposeKinds",
+      "type": "object"
+    },
+    "CountQueryConfig": {
+      "additionalProperties": false,
+      "description": "A named count query. Built **per index from its mapping**: a ``level_field`` terms query on\n``mapping.level`` where that field exists in the index, and otherwise a ``token_match`` query on\nthe message field. Without ``tokens`` an index lacking the level field is a typed schema-drift\nerror, never a zero.",
+      "properties": {
+        "levels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Levels",
+          "type": "array"
+        },
+        "tokens": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tokens",
+          "type": "array"
+        }
+      },
+      "title": "CountQueryConfig",
+      "type": "object"
+    },
+    "CoverageTargets": {
+      "additionalProperties": false,
+      "properties": {
+        "deterministic": {
+          "default": 0.9,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Deterministic",
+          "type": "number"
+        },
+        "extracted": {
+          "default": 0.99,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Extracted",
+          "type": "number"
+        },
+        "info_tier": {
+          "default": 0.8,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Info Tier",
+          "type": "number"
+        },
+        "core_services": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Core Services",
+          "type": "array"
+        }
+      },
+      "title": "CoverageTargets",
+      "type": "object"
+    },
+    "CrossSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdentityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "links": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LinksConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "planner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlannerConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "CrossSourceConfig",
+      "type": "object"
+    },
+    "CustomRedactor": {
+      "additionalProperties": false,
+      "description": "A user redactor of the ``safe`` engine: a regular expression in the RE2 subset that passes\nthe ReDoS lint (validated at load), and what replaces each match. ``mask`` writes\n``[REDACTED_<NAME>]``; ``hash`` writes ``[<NAME>:<12 hex>]``, a keyed sha256 of the match, so\nequal values stay joinable without being readable.",
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_]{0,31}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "regex": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Regex",
+          "type": "string"
+        },
+        "action": {
+          "default": "mask",
+          "enum": [
+            "mask",
+            "hash"
+          ],
+          "title": "Action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "regex"
+      ],
+      "title": "CustomRedactor",
       "type": "object"
     },
     "DecisionConfig": {
@@ -729,6 +1909,33 @@
           "minimum": 1,
           "title": "Max Steps",
           "type": "integer"
+        },
+        "schema_repair_attempts": {
+          "default": 0,
+          "enum": [
+            0,
+            1
+          ],
+          "title": "Schema Repair Attempts",
+          "type": "integer"
+        },
+        "on_step_failure": {
+          "default": "abstain",
+          "enum": [
+            "abstain",
+            "partial",
+            "retrieval_only"
+          ],
+          "title": "On Step Failure",
+          "type": "string"
+        },
+        "typed_query": {
+          "$ref": "#/$defs/TypedQueryDecision"
+        },
+        "arm_cards": {
+          "default": false,
+          "title": "Arm Cards",
+          "type": "boolean"
         },
         "prompt": {
           "anyOf": [
@@ -930,6 +2137,64 @@
       "title": "EmbedderRole",
       "type": "object"
     },
+    "EmbeddingSpace": {
+      "additionalProperties": false,
+      "description": "``collection.embedding_space`` (\u00a76.2): one space for every member the dense arm reads. The\nmodel identity is ``models.roles.embedder``'s; ``template`` names the declared input template\n(title + field + chunk text order). A member from another space is refused by the dense arm.",
+      "properties": {
+        "id": {
+          "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "template": {
+          "default": "engine_template",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Template",
+          "type": "string"
+        },
+        "epoch": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Epoch"
+        },
+        "equivalence": {
+          "$ref": "#/$defs/PrecomputedEquivalence"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "EmbeddingSpace",
+      "type": "object"
+    },
+    "EndpointsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "normalise": {
+          "const": "path_template",
+          "default": "path_template",
+          "title": "Normalise",
+          "type": "string"
+        },
+        "max_per_service": {
+          "default": 500,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Per Service",
+          "type": "integer"
+        }
+      },
+      "title": "EndpointsConfig",
+      "type": "object"
+    },
     "EvidenceBudget": {
       "additionalProperties": false,
       "properties": {
@@ -990,6 +2255,7 @@
         "extractors": {
           "items": {
             "enum": [
+              "pattern",
               "gazetteer",
               "regex",
               "spacy",
@@ -1000,6 +2266,17 @@
           },
           "title": "Extractors",
           "type": "array"
+        },
+        "pattern_library": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatternLibraryRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "grounding": {
           "$ref": "#/$defs/GroundingConfig"
@@ -1091,6 +2368,238 @@
         }
       },
       "title": "ExtractionConfig",
+      "type": "object"
+    },
+    "ExtractionEgressConfig": {
+      "additionalProperties": false,
+      "description": "Egress of the fallback (A2 \u00a74.2.4, N6): a line that still shows a PII shape after redaction is\n``unresolved: egress_refused`` on its own and never sent; the whole run is refused only when the\nrefused share of the residue exceeds ``max_refused_share``.",
+      "properties": {
+        "allow_hosted": {
+          "default": false,
+          "title": "Allow Hosted",
+          "type": "boolean"
+        },
+        "allow_lan": {
+          "default": false,
+          "title": "Allow Lan",
+          "type": "boolean"
+        },
+        "pseudonymise": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pseudonymise",
+          "type": "array"
+        },
+        "max_refused_share": {
+          "default": 0.01,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max Refused Share",
+          "type": "number"
+        }
+      },
+      "title": "ExtractionEgressConfig",
+      "type": "object"
+    },
+    "ExtractionFallbackConfig": {
+      "additionalProperties": false,
+      "description": "``learning.extraction``: the LLM fallback for log lines the pattern library cannot parse or\nparses without a required field (addendum A2 \u00a74.2). It runs after a day partition is sealed and\nwrites a versioned **fallback overlay** next to it; the sealed partition is never changed.\n\n``fields`` names the fields a model may label or quote, with their types (the closed set\nbelow); a label or quote naming any other field is dropped. ``max_residue_lines`` caps the\nresidue queue per run; lines beyond it are ``unresolved: budget_deferred`` and reported.\n``reply_cache`` defaults to ``<spend ledger dir>/.fallback_replies.sqlite``. Nothing here names\ncode.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "fields": {
+          "additionalProperties": {
+            "enum": [
+              "string",
+              "integer",
+              "number",
+              "boolean",
+              "datetime"
+            ],
+            "type": "string"
+          },
+          "title": "Fields",
+          "type": "object"
+        },
+        "max_residue_lines": {
+          "default": 200000,
+          "maximum": 10000000,
+          "minimum": 1,
+          "title": "Max Residue Lines",
+          "type": "integer"
+        },
+        "held_out_per_pattern": {
+          "default": 200,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Held Out Per Pattern",
+          "type": "integer"
+        },
+        "template": {
+          "$ref": "#/$defs/TemplateFallbackConfig"
+        },
+        "lines": {
+          "$ref": "#/$defs/LineFallbackConfig"
+        },
+        "fill": {
+          "$ref": "#/$defs/FillFallbackConfig"
+        },
+        "grounding": {
+          "$ref": "#/$defs/GroundingFallbackConfig"
+        },
+        "budget": {
+          "$ref": "#/$defs/FallbackBudgetConfig"
+        },
+        "egress": {
+          "$ref": "#/$defs/ExtractionEgressConfig"
+        },
+        "spend_ledger": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Spend Ledger"
+        },
+        "reply_cache": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply Cache"
+        },
+        "stop_file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop File"
+        },
+        "carry_forward_days": {
+          "default": 3,
+          "maximum": 60,
+          "minimum": 0,
+          "title": "Carry Forward Days",
+          "type": "integer"
+        }
+      },
+      "title": "ExtractionFallbackConfig",
+      "type": "object"
+    },
+    "FallbackBudgetConfig": {
+      "additionalProperties": false,
+      "description": "Spend caps of the ``log_extractor`` role (scope ``learning.extraction``): per run, per\ncalendar day and in total (persistent ledger; the day in ``timezone``). Provider lifetime caps\nare ``budgets.providers.<provider>.max_usd_total``.",
+      "properties": {
+        "max_usd_per_day": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0.5,
+          "title": "Max Usd Per Day"
+        },
+        "max_usd_total": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Total"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "max_calls_per_day": {
+          "default": 400,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Max Calls Per Day",
+          "type": "integer"
+        },
+        "max_usd_per_run": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Run"
+        },
+        "max_calls_per_run": {
+          "default": 400,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Max Calls Per Run",
+          "type": "integer"
+        }
+      },
+      "title": "FallbackBudgetConfig",
+      "type": "object"
+    },
+    "FewShotExample": {
+      "additionalProperties": false,
+      "description": "One planner example: a question and the typed intent call it should plan (the arguments are\nvalidated against the intent's input model).",
+      "properties": {
+        "question": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        },
+        "intent": {
+          "maxLength": 32,
+          "minLength": 1,
+          "title": "Intent",
+          "type": "string"
+        },
+        "args": {
+          "additionalProperties": true,
+          "title": "Args",
+          "type": "object"
+        }
+      },
+      "required": [
+        "question",
+        "intent"
+      ],
+      "title": "FewShotExample",
       "type": "object"
     },
     "FieldSpec": {
@@ -1207,6 +2716,42 @@
           },
           "title": "States",
           "type": "array"
+        },
+        "additive": {
+          "default": true,
+          "title": "Additive",
+          "type": "boolean"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "enum": [
+                "exactness",
+                "basis",
+                "extraction"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Role"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
         }
       },
       "required": [
@@ -1214,6 +2759,87 @@
         "type"
       ],
       "title": "FieldSpec",
+      "type": "object"
+    },
+    "FieldValidatorConfig": {
+      "additionalProperties": false,
+      "description": "A value check for one field (A2 \u00a74.2.4, N17): numeric ``min``/``max``, an ``enum`` or an\nanchored ``regex`` (RE2 subset, linted). A value that fails it is ``range_invalid``.",
+      "properties": {
+        "min": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "enum": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enum"
+        },
+        "regex": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Regex"
+        }
+      },
+      "title": "FieldValidatorConfig",
+      "type": "object"
+    },
+    "FillFallbackConfig": {
+      "additionalProperties": false,
+      "description": "Missing-field fill (A2 \u00a74.2.4) for lines an approved pattern matched without a valid value\nfor a field ``logs.accounting.required_fields`` requires: a cluster ``fix`` proposal first, then\nat most ``max_per_day`` per-line quote calls.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_per_day": {
+          "default": 200,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Per Day",
+          "type": "integer"
+        }
+      },
+      "title": "FillFallbackConfig",
       "type": "object"
     },
     "GenerationStageConfig": {
@@ -1259,6 +2885,15 @@
           },
           "title": "Evidence Fields",
           "type": "array"
+        },
+        "schema_repair_attempts": {
+          "default": 0,
+          "enum": [
+            0,
+            1
+          ],
+          "title": "Schema Repair Attempts",
+          "type": "integer"
         }
       },
       "title": "GenerationStageConfig",
@@ -1313,6 +2948,27 @@
             }
           ],
           "default": null
+        },
+        "edge_kinds": {
+          "items": {
+            "enum": [
+              "fact",
+              "co_occurrence",
+              "mention",
+              "native_link",
+              "derived",
+              "co_firing"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Edge Kinds",
+          "type": "array"
+        },
+        "path_evidence": {
+          "default": false,
+          "title": "Path Evidence",
+          "type": "boolean"
         }
       },
       "required": [
@@ -1370,6 +3026,85 @@
       "title": "GroundingConfig",
       "type": "object"
     },
+    "GroundingFallbackConfig": {
+      "additionalProperties": false,
+      "description": "How a model quote is located in its line (``extraction/grounding.py``). ``relocated`` does\nnot exist for a single line and is refused; fuzzy matching does not exist at all. ``reject``\nrejects an ambiguous quote unless the located text is identical at every occurrence.",
+      "properties": {
+        "levels": {
+          "items": {
+            "enum": [
+              "exact",
+              "normalised"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Levels",
+          "type": "array"
+        },
+        "ambiguous": {
+          "const": "reject",
+          "default": "reject",
+          "title": "Ambiguous",
+          "type": "string"
+        }
+      },
+      "title": "GroundingFallbackConfig",
+      "type": "object"
+    },
+    "HistoryConfig": {
+      "additionalProperties": false,
+      "description": "Serving window of derived data until the history tier (H1) lands: compose serves derived days\nonly within ``serve_days`` (default: the masked window, ``retention.keep_days``); older derived\nsnapshots stay archived for the history tier to import.",
+      "properties": {
+        "serve_days": {
+          "anyOf": [
+            {
+              "maximum": 3660,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Serve Days"
+        },
+        "max_serve_rows": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Serve Rows"
+        },
+        "tier": {
+          "default": false,
+          "title": "Tier",
+          "type": "boolean"
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend"
+        }
+      },
+      "title": "HistoryConfig",
+      "type": "object"
+    },
     "HttpConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1410,6 +3145,27 @@
       "title": "HttpConfig",
       "type": "object"
     },
+    "IdDirectoryConfig": {
+      "additionalProperties": false,
+      "description": "``collection.id_directory`` (\u00a76.1): the persistent id \u2192 unit table. ``path`` unset: under the\nmember registry (decided by the partition core).",
+      "properties": {
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        }
+      },
+      "title": "IdDirectoryConfig",
+      "type": "object"
+    },
     "IdentifierPin": {
       "additionalProperties": false,
       "description": "Lexical front policy (off by default): documents named by an identifier in the query lead the\nlexical list. Identifiers are matches of the ``pattern`` of ``id`` fields in ``metadata_schema``\n(``fields`` narrows which; empty = all) and resolve by exact equality on that document field\ninside the request's scope. No normalisation, no fuzzy match; at most ``max_records``.",
@@ -1435,6 +3191,180 @@
         }
       },
       "title": "IdentifierPin",
+      "type": "object"
+    },
+    "IdentityConfig": {
+      "additionalProperties": false,
+      "description": "``crosssource.identity``: the registry file (sqlite or YAML export) and its digest; a digest\nmismatch disables every cross-source join (fail closed, \u00a76.12).",
+      "properties": {
+        "registry_path": {
+          "format": "path",
+          "title": "Registry Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "auto_match": {
+          "default": "exact",
+          "enum": [
+            "exact",
+            "fuzzy"
+          ],
+          "title": "Auto Match",
+          "type": "string"
+        },
+        "fuzzy_min_confidence": {
+          "default": 0.8,
+          "maximum": 1.0,
+          "minimum": 0.5,
+          "title": "Fuzzy Min Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "registry_path",
+        "sha256"
+      ],
+      "title": "IdentityConfig",
+      "type": "object"
+    },
+    "ImportedCommunities": {
+      "additionalProperties": false,
+      "description": "``communities.strategy: imported`` (``communities/imported.py``): a JSONL file of communities\nbuilt elsewhere, pinned by ``sha256``. Only claims whose quotes occur verbatim in a member's\npassage are stored; summary prose is refused. ``extractive_sentences`` (0 = off) gives a\ncommunity left without a grounded claim that many verbatim member sentences as claims.",
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "on_ungrounded": {
+          "default": "drop_claim",
+          "enum": [
+            "drop_claim",
+            "fail"
+          ],
+          "title": "On Ungrounded",
+          "type": "string"
+        },
+        "extractive_sentences": {
+          "default": 0,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Extractive Sentences",
+          "type": "integer"
+        },
+        "min_members": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Min Members",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ImportedCommunities",
+      "type": "object"
+    },
+    "IndexNameConfig": {
+      "additionalProperties": false,
+      "description": "Index-name grammar: ``[<prefix>-][<deployment prefix>-]<prefix fields>-<service>-<date>``\n(``deployment_position: leading``) or ``[<prefix>-]<prefix fields>-[<deployment prefix>-]<service>-<date>``\n(``deployment_position: before_service``).\n\n- ``date_format`` matches the trailing date (``%Y``, ``%m``, ``%d`` and literal separators).\n- ``prefix`` (optional) is a literal every name must start with, followed by ``separator``. It\n  is stripped before the segments are read, so it never becomes part of the first prefix field\n  (``prefix: logs`` reads ``logs-acme-prod-crawler-\u2026`` as tenant ``acme``).\n- ``deployment_prefixes`` (optional) are deployment or infrastructure prefixes, tried longest\n  first; ``{n}`` stands for a run of digits (``os-data-{n}`` matches ``os-data-1``). A matched\n  prefix is recorded as the ``deployment`` attribute (``none`` when the name has none).\n  ``deployment_position`` says where they stand: at the left of the prefix fields (``leading``,\n  the default) or between the prefix fields and the service (``before_service``). ``after_env``\n  is env-anchored and needs no list: the deployment is whatever lies between the last prefix\n  field (matched by its vocabulary) and the service (matched by its vocabulary).\n- ``service_suffix: numeric`` reads a trailing digit run (at least ``service_suffix_min_digits``)\n  after the service as the ``deployment_id`` attribute (``ml-service-1658254295-2026.03.01`` is\n  service ``ml-service``, deployment id ``1658254295``).\n- ``prefix_fields`` (default ``tenant``, ``env``) and ``service`` are the segments. A segment\n  with a vocabulary takes the **longest** vocabulary entry that fits (``query-gateway`` wins\n  over ``gateway``); a segment without one is exactly one separator-free token, so service\n  names such as ``slack_bot`` parse with the ``-`` separator.\n\nA name that does not fit the grammar, or that fits it in more than one way (with and without\na deployment prefix), is ``unparsed`` with a typed reason and ``unknown`` attributes: never a\nguess.",
+      "properties": {
+        "separator": {
+          "default": "-",
+          "maxLength": 3,
+          "minLength": 1,
+          "title": "Separator",
+          "type": "string"
+        },
+        "date_format": {
+          "default": "%Y.%m.%d",
+          "title": "Date Format",
+          "type": "string"
+        },
+        "prefix": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prefix"
+        },
+        "deployment_prefixes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Deployment Prefixes",
+          "type": "array"
+        },
+        "deployment_position": {
+          "default": "leading",
+          "enum": [
+            "leading",
+            "before_service",
+            "after_env"
+          ],
+          "title": "Deployment Position",
+          "type": "string"
+        },
+        "unparsed": {
+          "default": "include",
+          "enum": [
+            "include",
+            "exclude"
+          ],
+          "title": "Unparsed",
+          "type": "string"
+        },
+        "prefix_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Prefix Fields",
+          "type": "array"
+        },
+        "vocabularies": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Vocabularies",
+          "type": "object"
+        },
+        "service_suffix": {
+          "default": "none",
+          "enum": [
+            "none",
+            "numeric"
+          ],
+          "title": "Service Suffix",
+          "type": "string"
+        },
+        "service_suffix_min_digits": {
+          "default": 6,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Service Suffix Min Digits",
+          "type": "integer"
+        }
+      },
+      "title": "IndexNameConfig",
       "type": "object"
     },
     "IngestBudget": {
@@ -1494,6 +3424,36 @@
           "anyOf": [
             {
               "$ref": "#/$defs/InputMapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "attach": {
+          "items": {
+            "$ref": "#/$defs/AttachSource"
+          },
+          "maxItems": 8,
+          "title": "Attach",
+          "type": "array"
+        },
+        "line_recipe": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LineRecipeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "projections": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectionsConfig"
             },
             {
               "type": "null"
@@ -1563,6 +3523,63 @@
         }
       },
       "title": "InputMapping",
+      "type": "object"
+    },
+    "KeywordFileConfig": {
+      "additionalProperties": false,
+      "description": "One keyword family file (YAML: ``family``, ``phrases``, ``rules``) and its pinned sha256.",
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "KeywordFileConfig",
+      "type": "object"
+    },
+    "KeywordPolicyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "items": {
+            "$ref": "#/$defs/KeywordFileConfig"
+          },
+          "maxItems": 32,
+          "title": "Files",
+          "type": "array"
+        },
+        "effective_from": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effective From"
+        },
+        "gap_seconds": {
+          "default": 300,
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Gap Seconds",
+          "type": "integer"
+        }
+      },
+      "title": "KeywordPolicyConfig",
       "type": "object"
     },
     "KnnConfig": {
@@ -1663,6 +3680,38 @@
       "title": "KuzuBackend",
       "type": "object"
     },
+    "LearningConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "patterns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatternLearningConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "extraction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExtractionFallbackConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "bootstrap": {
+          "$ref": "#/$defs/BootstrapConfig"
+        }
+      },
+      "title": "LearningConfig",
+      "type": "object"
+    },
     "LexicalArm": {
       "additionalProperties": false,
       "properties": {
@@ -1692,6 +3741,480 @@
         "backend"
       ],
       "title": "LexicalArm",
+      "type": "object"
+    },
+    "LexicalStratum": {
+      "additionalProperties": false,
+      "description": "``collection.lexical.<member>`` (\u00a76.5): the statistics model of one stratum. ``adopted``\nreads the adopted store's own files (support stratum); ``query_time`` sums statistics over the\npinned units per query; ``member_rrf`` (archive months only) fuses per-member lists.",
+      "properties": {
+        "stats": {
+          "enum": [
+            "adopted",
+            "query_time",
+            "member_rrf"
+          ],
+          "title": "Stats",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stats"
+      ],
+      "title": "LexicalStratum",
+      "type": "object"
+    },
+    "LineFallbackConfig": {
+      "additionalProperties": false,
+      "description": "Capped per-line tail (A2 \u00a74.2.4): singletons and lines whose provisional application failed\nalignment, at most ``max_per_day`` lines per run in batches of ``batch_size`` lines of one\n``(service, level)``; lines longer than ``max_line_chars`` are never sent.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_per_day": {
+          "default": 200,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Per Day",
+          "type": "integer"
+        },
+        "batch_size": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_line_chars": {
+          "default": 2000,
+          "maximum": 100000,
+          "minimum": 64,
+          "title": "Max Line Chars",
+          "type": "integer"
+        }
+      },
+      "title": "LineFallbackConfig",
+      "type": "object"
+    },
+    "LineRecipeConfig": {
+      "additionalProperties": false,
+      "description": "``ingestion.line_recipe``: the ``line`` chunk recipe (addendum \u00a73.4.2 n1). Each listed field is\ncut into one chunk per log record (records are separated by one blank line), whatever\n``chunking.size`` is, so a line-scoped fact never spans two chunks. A record longer than\n``max_chunk_chars`` is a build error, never split.",
+      "properties": {
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Fields",
+          "type": "array"
+        },
+        "max_chunk_chars": {
+          "default": 24576,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Chunk Chars",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fields"
+      ],
+      "title": "LineRecipeConfig",
+      "type": "object"
+    },
+    "LinkReview": {
+      "additionalProperties": false,
+      "description": "Model review of non-exact aliases and candidate links: ``role`` is a configured chat role;\n``usd_ceiling`` is cumulative across runs (persistent ledger) and shared with identity review;\n``approval_ref`` records who approved the ceiling (required, recorded in the ledger).",
+      "properties": {
+        "role": {
+          "default": "reviewer",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Role",
+          "type": "string"
+        },
+        "usd_ceiling": {
+          "default": 10.0,
+          "exclusiveMinimum": 0,
+          "maximum": 10.0,
+          "title": "Usd Ceiling",
+          "type": "number"
+        },
+        "approval_ref": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Approval Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approval_ref"
+      ],
+      "title": "LinkReview",
+      "type": "object"
+    },
+    "LinksConfig": {
+      "additionalProperties": false,
+      "description": "``crosssource.links`` (\u00a76.9): the tier-B time window around a ticket's span, the per-record\ncap, how unreviewed candidates are displayed (``labelled``) and the review settings.",
+      "properties": {
+        "window_before_days": {
+          "default": 1,
+          "maximum": 90,
+          "minimum": 0,
+          "title": "Window Before Days",
+          "type": "integer"
+        },
+        "window_after_days": {
+          "default": 7,
+          "maximum": 365,
+          "minimum": 0,
+          "title": "Window After Days",
+          "type": "integer"
+        },
+        "max_per_record": {
+          "default": 5,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Per Record",
+          "type": "integer"
+        },
+        "show_candidates": {
+          "default": "labelled",
+          "enum": [
+            "labelled",
+            "hidden"
+          ],
+          "title": "Show Candidates",
+          "type": "string"
+        },
+        "review": {
+          "$ref": "#/$defs/LinkReview"
+        },
+        "store_path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Store Path"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        }
+      },
+      "required": [
+        "review"
+      ],
+      "title": "LinksConfig",
+      "type": "object"
+    },
+    "LivenessConfig": {
+      "additionalProperties": false,
+      "description": "``log_liveness``: last success, expected cadence and halt / recovery from success heartbeats.",
+      "properties": {
+        "cadence_days": {
+          "default": 7,
+          "maximum": 90,
+          "minimum": 1,
+          "title": "Cadence Days",
+          "type": "integer"
+        },
+        "min_intervals": {
+          "default": 3,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Min Intervals",
+          "type": "integer"
+        },
+        "halt_factor": {
+          "default": 3.0,
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "title": "Halt Factor",
+          "type": "number"
+        }
+      },
+      "title": "LivenessConfig",
+      "type": "object"
+    },
+    "LogFieldMap": {
+      "additionalProperties": false,
+      "description": "Which source fields become ``LogRecord`` fields. Only these (plus ``extra``) are requested\nthrough ``_source`` includes; ``drop_fields`` are never requested.",
+      "properties": {
+        "timestamp": {
+          "default": "@timestamp",
+          "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "message": {
+          "default": "message",
+          "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+          "title": "Message",
+          "type": "string"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Level"
+        },
+        "stack": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stack"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
+        },
+        "container": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container"
+        },
+        "file": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "File"
+        },
+        "offset": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Offset"
+        },
+        "extra": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Extra",
+          "type": "array"
+        },
+        "drop_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Drop Fields",
+          "type": "array"
+        }
+      },
+      "title": "LogFieldMap",
+      "type": "object"
+    },
+    "LogIntentsConfig": {
+      "additionalProperties": false,
+      "description": "The typed log intents and tools (addendum A2 \u00a74.1.5). ``enabled`` makes every decision agent\nroute recognised log questions through one typed intent step, and refuses free structured scopes\nover the rollups (review B5).",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "default_window": {
+          "default": "today",
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Default Window",
+          "type": "string"
+        },
+        "planner_context": {
+          "default": true,
+          "title": "Planner Context",
+          "type": "boolean"
+        },
+        "cascade_to_planner": {
+          "default": true,
+          "title": "Cascade To Planner",
+          "type": "boolean"
+        },
+        "planner_context_max_chars": {
+          "default": 24000,
+          "maximum": 200000,
+          "minimum": 2000,
+          "title": "Planner Context Max Chars",
+          "type": "integer"
+        },
+        "not_values": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Not Values",
+          "type": "object"
+        },
+        "few_shot": {
+          "items": {
+            "$ref": "#/$defs/FewShotExample"
+          },
+          "maxItems": 50,
+          "title": "Few Shot",
+          "type": "array"
+        },
+        "few_shot_file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Few Shot File"
+        }
+      },
+      "title": "LogIntentsConfig",
+      "type": "object"
+    },
+    "LogsCommunitiesConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "co_firing": {
+          "$ref": "#/$defs/CoFiringConfig"
+        },
+        "shared_error": {
+          "$ref": "#/$defs/SharedErrorConfig"
+        }
+      },
+      "title": "LogsCommunitiesConfig",
+      "type": "object"
+    },
+    "LogsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "partitions": {
+          "$ref": "#/$defs/PartitionsConfig"
+        },
+        "parse": {
+          "$ref": "#/$defs/ParseConfig"
+        },
+        "compose": {
+          "$ref": "#/$defs/ComposeConfig"
+        },
+        "retention": {
+          "$ref": "#/$defs/RetentionConfig"
+        },
+        "pins": {
+          "$ref": "#/$defs/PinsConfig"
+        },
+        "schedule": {
+          "$ref": "#/$defs/ScheduleConfig"
+        },
+        "settle": {
+          "$ref": "#/$defs/SettleConfig"
+        },
+        "accounting": {
+          "$ref": "#/$defs/AccountingConfig"
+        },
+        "communities": {
+          "$ref": "#/$defs/LogsCommunitiesConfig"
+        },
+        "intents": {
+          "$ref": "#/$defs/LogIntentsConfig"
+        },
+        "serving": {
+          "$ref": "#/$defs/LogsServingConfig"
+        },
+        "history": {
+          "$ref": "#/$defs/HistoryConfig"
+        },
+        "collection": {
+          "$ref": "#/$defs/CollectionPolicyConfig"
+        }
+      },
+      "required": [
+        "source",
+        "partitions"
+      ],
+      "title": "LogsConfig",
+      "type": "object"
+    },
+    "LogsServingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_adhoc_scopes": {
+          "default": false,
+          "title": "Allow Adhoc Scopes",
+          "type": "boolean"
+        }
+      },
+      "title": "LogsServingConfig",
       "type": "object"
     },
     "LuceneBackend": {
@@ -1724,6 +4247,9 @@
           "maximum": 600,
           "title": "Timeout Seconds",
           "type": "number"
+        },
+        "records": {
+          "$ref": "#/$defs/LuceneRecordsConfig"
         }
       },
       "required": [
@@ -1731,6 +4257,44 @@
         "hosts_env"
       ],
       "title": "LuceneBackend",
+      "type": "object"
+    },
+    "LuceneRecordsConfig": {
+      "additionalProperties": false,
+      "description": "How the ``records`` facet evaluates a typed scope. ``client`` (default): the matched records are\nscanned and the operations computed in Python, bounded by ``max_matched`` (typed refusal above\nit). ``native``: the operations are compiled to aggregations on the server (no record scan);\n``matched_ids`` then holds at most ``matched_ids_cap`` ids (``matched_ids_truncated`` above it), more\nthan ``max_groups`` groups is a ``bounded`` result, and ``count_distinct`` is exact up to\n``distinct_exact_cap`` distinct values, ``approximate`` (engine ``cardinality``) above it. A query-time\nsetting: not part of the index recipe.",
+      "properties": {
+        "aggregation": {
+          "default": "client",
+          "enum": [
+            "client",
+            "native"
+          ],
+          "title": "Aggregation",
+          "type": "string"
+        },
+        "matched_ids_cap": {
+          "default": 10000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Matched Ids Cap",
+          "type": "integer"
+        },
+        "max_groups": {
+          "default": 10000,
+          "maximum": 50000,
+          "minimum": 1,
+          "title": "Max Groups",
+          "type": "integer"
+        },
+        "distinct_exact_cap": {
+          "default": 100000,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Distinct Exact Cap",
+          "type": "integer"
+        }
+      },
+      "title": "LuceneRecordsConfig",
       "type": "object"
     },
     "McpConfig": {
@@ -1746,9 +4310,105 @@
           },
           "title": "Transports",
           "type": "array"
+        },
+        "log_tools": {
+          "default": true,
+          "title": "Log Tools",
+          "type": "boolean"
+        },
+        "mount_on_http": {
+          "default": false,
+          "title": "Mount On Http",
+          "type": "boolean"
+        },
+        "token_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Token Env"
         }
       },
       "title": "McpConfig",
+      "type": "object"
+    },
+    "MemberAdoption": {
+      "additionalProperties": false,
+      "description": "``collection.members.<id>.adopt`` (\u00a76.3): a validated store served read-only, never written,\nre-stamped or relocated. ``original_config`` is the configuration that built it, pinned by\n``original_config_sha256``; its recipe is recomputed backend-free (``ingestion/recipes.py``)\nand checked against the store's own manifest when the member is registered (M1b).",
+      "properties": {
+        "store": {
+          "format": "path",
+          "title": "Store",
+          "type": "string"
+        },
+        "original_config": {
+          "format": "path",
+          "title": "Original Config",
+          "type": "string"
+        },
+        "original_config_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Original Config Sha256",
+          "type": "string"
+        },
+        "embedding_space": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Space"
+        }
+      },
+      "required": [
+        "store",
+        "original_config",
+        "original_config_sha256"
+      ],
+      "title": "MemberAdoption",
+      "type": "object"
+    },
+    "MemberProducer": {
+      "additionalProperties": false,
+      "description": "Who builds the member's partitions: ``write_path`` (the shared write path, in this process),\n``log_host`` (a sealed handoff from the log host, sha256 verified), ``upload`` (a daily file\nupload) or ``adopted`` (read-only adoption of an existing store). ``source`` names an existing\n``sources.<name>`` read-only log source when the member is fed by one.",
+      "properties": {
+        "kind": {
+          "default": "write_path",
+          "enum": [
+            "write_path",
+            "log_host",
+            "upload",
+            "adopted"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
+        }
+      },
+      "title": "MemberProducer",
       "type": "object"
     },
     "MemoryBackendConfig": {
@@ -1901,6 +4561,39 @@
           ],
           "default": null
         },
+        "pattern_learner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "log_extractor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "query_writer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "embedder": {
           "$ref": "#/$defs/EmbedderRole"
         },
@@ -1919,11 +4612,133 @@
       "title": "ModelRoles",
       "type": "object"
     },
+    "ModelRoute": {
+      "additionalProperties": false,
+      "description": "One provider route of a learning role (owner decision 2026-11-04: local models first).\n\n``health_url`` is probed (HTTP GET, 2xx = ready) before the first call of a run; for an\n``openai_compatible`` role it defaults to ``<base_url>/models``. ``capacity_url`` is an optional\nsecond GET whose JSON ``{\"available\": true|false}`` (or a 2xx without a body) says whether the\nserver takes work now. A hosted route without a ``health_url`` is not probed. There is no probe\n*command*: config never names code.",
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ChatRole"
+        },
+        "tier": {
+          "anyOf": [
+            {
+              "enum": [
+                "local",
+                "lan",
+                "paid"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tier"
+        },
+        "health_url": {
+          "anyOf": [
+            {
+              "pattern": "^https?://",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health Url"
+        },
+        "capacity_url": {
+          "anyOf": [
+            {
+              "pattern": "^https?://",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capacity Url"
+        },
+        "probe_timeout_seconds": {
+          "default": 3.0,
+          "exclusiveMinimum": 0,
+          "maximum": 60,
+          "title": "Probe Timeout Seconds",
+          "type": "number"
+        },
+        "windows": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Windows",
+          "type": "array"
+        },
+        "max_invalid_replies": {
+          "anyOf": [
+            {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 3,
+          "title": "Max Invalid Replies"
+        }
+      },
+      "required": [
+        "name",
+        "role"
+      ],
+      "title": "ModelRoute",
+      "type": "object"
+    },
+    "ModelRoutes": {
+      "additionalProperties": false,
+      "description": "Ordered provider routes per learning role (``pattern_learner``: cluster calls;\n``log_extractor``: line and fill calls). The first available route is used; when none is\navailable the items are ``unresolved: capacity_deferred`` and the next run retries them. A paid\n(non-loopback) route after a local one is used only with ``allow_paid_fallback: true``. Empty\nlists mean the single route ``models.roles.<role>``.",
+      "properties": {
+        "pattern_learner": {
+          "items": {
+            "$ref": "#/$defs/ModelRoute"
+          },
+          "title": "Pattern Learner",
+          "type": "array"
+        },
+        "log_extractor": {
+          "items": {
+            "$ref": "#/$defs/ModelRoute"
+          },
+          "title": "Log Extractor",
+          "type": "array"
+        },
+        "allow_paid_fallback": {
+          "default": false,
+          "title": "Allow Paid Fallback",
+          "type": "boolean"
+        }
+      },
+      "title": "ModelRoutes",
+      "type": "object"
+    },
     "ModelsConfig": {
       "additionalProperties": false,
       "properties": {
         "roles": {
           "$ref": "#/$defs/ModelRoles"
+        },
+        "routes": {
+          "$ref": "#/$defs/ModelRoutes"
         }
       },
       "title": "ModelsConfig",
@@ -1965,6 +4780,64 @@
         "database"
       ],
       "title": "MongoBackend",
+      "type": "object"
+    },
+    "MultilineConfig": {
+      "additionalProperties": false,
+      "description": "Join continuation documents (stack frames, ``Caused by:``, column-0 Python tracebacks, lone\nclosing brackets \u2026) onto the preceding head of the same ``(container, file)`` within\n``max_gap_ms``. ``continuation`` names built-in rules (``sources/multiline.py``); the approved\n``continuation`` entries of the pattern library are applied in addition wherever a library is\nloaded (``logs`` pulls, ``patterns coverage|mine``).",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "continuation": {
+          "items": {
+            "enum": [
+              "indented",
+              "java_frame",
+              "python_frame",
+              "caused_by",
+              "traceback_header",
+              "ellipsis_more",
+              "closing_bracket",
+              "python_traceback"
+            ],
+            "type": "string"
+          },
+          "title": "Continuation",
+          "type": "array"
+        },
+        "max_gap_ms": {
+          "default": 2000,
+          "maximum": 600000,
+          "minimum": 0,
+          "title": "Max Gap Ms",
+          "type": "integer"
+        },
+        "max_lines": {
+          "default": 200,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Lines",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "default": 16384,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "fragment_sample_rate": {
+          "default": 0.01,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Fragment Sample Rate",
+          "type": "number"
+        }
+      },
+      "title": "MultilineConfig",
       "type": "object"
     },
     "NamedState": {
@@ -2065,6 +4938,22 @@
           "title": "Field Priority",
           "type": "array"
         },
+        "metadata_fields": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Metadata Fields",
+          "type": "array"
+        },
+        "passage_selection": {
+          "default": "prefix",
+          "enum": [
+            "prefix",
+            "question_windows"
+          ],
+          "title": "Passage Selection",
+          "type": "string"
+        },
         "fairness": {
           "default": "fair_share",
           "enum": [
@@ -2086,9 +4975,328 @@
           "maximum": 1,
           "title": "Aggregate Reserve Max",
           "type": "number"
+        },
+        "metadata_max_share": {
+          "default": 0.25,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Metadata Max Share",
+          "type": "number"
+        },
+        "metadata_protected": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Metadata Protected",
+          "type": "array"
+        },
+        "metadata_show_null": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Metadata Show Null",
+          "type": "array"
         }
       },
       "title": "PackingConfig",
+      "type": "object"
+    },
+    "ParseConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "workers": {
+          "default": 1,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Workers",
+          "type": "integer"
+        },
+        "batch_size": {
+          "default": 2000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_exemplars_per_signature": {
+          "default": 3,
+          "maximum": 50,
+          "minimum": 0,
+          "title": "Max Exemplars Per Signature",
+          "type": "integer"
+        },
+        "max_unparsed": {
+          "default": 2000,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Unparsed",
+          "type": "integer"
+        }
+      },
+      "title": "ParseConfig",
+      "type": "object"
+    },
+    "PartitionsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "clock": {
+          "default": "index_date",
+          "enum": [
+            "index_date",
+            "event_time"
+          ],
+          "title": "Clock",
+          "type": "string"
+        },
+        "raw": {
+          "$ref": "#/$defs/RawCopyConfig"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "PartitionsConfig",
+      "type": "object"
+    },
+    "PatternEgressConfig": {
+      "additionalProperties": false,
+      "description": "What may leave the process for the ``pattern_learner`` model.\n\nOnly lines processed by the configured ``privacy`` redaction are ever sent (anything else is\nrefused, not repaired). ``allow_hosted: false`` (the default) permits only an\n``openai_compatible`` role on a loopback host. ``pseudonymise`` lists line attributes whose\nvalues are replaced by stable per-run aliases (in the attributes and in the line text) before\nthe prompt is built.",
+      "properties": {
+        "allow_hosted": {
+          "default": false,
+          "title": "Allow Hosted",
+          "type": "boolean"
+        },
+        "allow_lan": {
+          "default": false,
+          "title": "Allow Lan",
+          "type": "boolean"
+        },
+        "pseudonymise": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pseudonymise",
+          "type": "array"
+        }
+      },
+      "title": "PatternEgressConfig",
+      "type": "object"
+    },
+    "PatternGateConfig": {
+      "additionalProperties": false,
+      "description": "The deterministic validation gate a learned pattern must pass (``learning/patterns/gate.py``).",
+      "properties": {
+        "min_support": {
+          "default": 3,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Min Support",
+          "type": "integer"
+        },
+        "require_re2": {
+          "default": true,
+          "title": "Require Re2",
+          "type": "boolean"
+        },
+        "min_cluster_coverage": {
+          "default": 0.9,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Min Cluster Coverage",
+          "type": "number"
+        },
+        "max_out_of_cluster": {
+          "default": 0,
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Out Of Cluster",
+          "type": "integer"
+        }
+      },
+      "title": "PatternGateConfig",
+      "type": "object"
+    },
+    "PatternLearningConfig": {
+      "additionalProperties": false,
+      "description": "``learning.patterns``: one ``patterns learn`` run mines the unparsed lines, asks\n``pattern_learner`` about at most ``max_clusters_per_run`` clusters (each with at most\n``max_lines_per_cluster`` example lines and ``nearest_patterns`` approved patterns), gates every\nreply, writes the passing ones under the promotion policy and reports coverage before and after.\n\n**Spend.** Every call is reserved before it is sent, against the run caps\n(``max_calls_per_run``, ``max_usd_per_run``) and the persistent per-day caps\n(``max_calls_per_day``, ``max_usd_per_day``; the day is the calendar day in ``timezone``). USD\ncaps need ``budgets.price_table``; a hosted role needs both USD caps. A refused reservation stops\nthe run; nothing is retried or downgraded. The ledger is ``spend_ledger`` (default\n``<library>/.spend_ledger.sqlite``).",
+      "properties": {
+        "max_clusters_per_run": {
+          "default": 10,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Max Clusters Per Run",
+          "type": "integer"
+        },
+        "max_lines_per_cluster": {
+          "default": 8,
+          "maximum": 50,
+          "minimum": 3,
+          "title": "Max Lines Per Cluster",
+          "type": "integer"
+        },
+        "nearest_patterns": {
+          "default": 3,
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Nearest Patterns",
+          "type": "integer"
+        },
+        "max_calls_per_run": {
+          "default": 10,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Calls Per Run",
+          "type": "integer"
+        },
+        "max_calls_per_day": {
+          "default": 50,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Calls Per Day",
+          "type": "integer"
+        },
+        "max_usd_per_run": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Run"
+        },
+        "max_usd_per_day": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Day"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "spend_ledger": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Spend Ledger"
+        },
+        "git_commit": {
+          "default": false,
+          "title": "Git Commit",
+          "type": "boolean"
+        },
+        "stop_file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop File"
+        },
+        "egress": {
+          "$ref": "#/$defs/PatternEgressConfig"
+        }
+      },
+      "title": "PatternLearningConfig",
+      "type": "object"
+    },
+    "PatternLibraryRef": {
+      "additionalProperties": false,
+      "description": "``extraction.pattern_library``: the library directory of the ``pattern`` extractor.\n\nOnly ``engine``, ``max_line_bytes`` and ``mode`` enter the index recipe. The library contents,\nthe engine version and the promotion policy are build provenance (generation manifest), so a\nlibrary edit never changes the live fingerprint; it changes the extraction reuse salt instead.",
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "engine": {
+          "default": "re2",
+          "enum": [
+            "re2",
+            "regex"
+          ],
+          "title": "Engine",
+          "type": "string"
+        },
+        "max_line_bytes": {
+          "default": 8192,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Line Bytes",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "line",
+          "default": "line",
+          "title": "Mode",
+          "type": "string"
+        },
+        "promotion": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "manual"
+          ],
+          "title": "Promotion",
+          "type": "string"
+        },
+        "min_literal_chars": {
+          "default": 4,
+          "maximum": 64,
+          "minimum": 0,
+          "title": "Min Literal Chars",
+          "type": "integer"
+        },
+        "regex_timeout_ms": {
+          "default": 100,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Regex Timeout Ms",
+          "type": "integer"
+        },
+        "gate": {
+          "$ref": "#/$defs/PatternGateConfig"
+        },
+        "log_links": {
+          "default": false,
+          "title": "Log Links",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "PatternLibraryRef",
       "type": "object"
     },
     "PgVectorConfig": {
@@ -2155,6 +5363,27 @@
       "title": "PhraseBoost",
       "type": "object"
     },
+    "PinsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "ttl_seconds": {
+          "default": 120,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Ttl Seconds",
+          "type": "number"
+        },
+        "heartbeat_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Heartbeat Seconds",
+          "type": "number"
+        }
+      },
+      "title": "PinsConfig",
+      "type": "object"
+    },
     "PipelineConfig": {
       "additionalProperties": false,
       "description": "One retrieval/answer pipeline. ``pipeline`` is the default (named ``default``); every entry of\n``pipelines`` is an overlay deep-merged onto it before validation (an arm set to ``null`` is\ndisabled in that pipeline).",
@@ -2200,6 +5429,70 @@
       "title": "PipelineConfig",
       "type": "object"
     },
+    "PlannerConfig": {
+      "additionalProperties": false,
+      "description": "``crosssource.planner`` (M2b-2, \u00a76.11): two-halves planning. ``knowledge_sources``: the\n``Document.source`` values of the knowledge half (tickets, docs, tracker issues); empty on a\npartitioned collection = every member not produced by a log host. ``customer_namespaces``: the\nregistry namespaces whose raw values name customers in questions; ``tenant_namespace``: the\nnamespace of log tenants (a named customer filters the operations half to its matched tenants,\nor the operations half is refused for it, never widened). ``fallback``: what a failed planner\nleaves (``deterministic_plan``: a labelled plan of both halves; ``abstain``: today's policy).\n``scope_knowledge_steps`` (default on): when the collection holds sources outside\n``knowledge_sources`` (a log member), every knowledge-half retrieval and structured step reads\nthe knowledge sources only (a ``source in knowledge_sources`` scope applied at execution, never\nwritten into the plan), so the operations half alone reads logs; without such a source nothing\nchanges. ``false`` restores unscoped knowledge steps (log records may then enter the hits).\n\n``operations_terms`` (staging round 2, N2): a question gets an operations half only when it\nasks for operations evidence: one of these words or phrases (whole word, case-insensitive; list\nevery inflection, there is no prefix matching) or a failure symptom of the unified detector\n(``decision/log_intents.OPS_SYMPTOM``: \"unauthorized\", \"timed out\", \"stuck\", \"failed\", \"slow\",\n\"down\" ...). Generic words such as \"new\", \"mentions\" or \"increase\" are not evidence, so \"how many\nare new?\" stays a support question. An empty list leaves the symptoms only. The rule gates both\ntoday's log detectors and the unified detector; a log-only deployment (no ``crosssource``) is\nunchanged.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "knowledge_sources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Knowledge Sources",
+          "type": "array"
+        },
+        "customer_namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Customer Namespaces",
+          "type": "array"
+        },
+        "tenant_namespace": {
+          "default": "logs.tenant",
+          "pattern": "^[a-z][a-z0-9_]{0,63}\\.[a-z][a-z0-9_]{0,63}$",
+          "title": "Tenant Namespace",
+          "type": "string"
+        },
+        "fallback": {
+          "default": "deterministic_plan",
+          "enum": [
+            "deterministic_plan",
+            "abstain"
+          ],
+          "title": "Fallback",
+          "type": "string"
+        },
+        "max_operations_calls": {
+          "default": 3,
+          "maximum": 6,
+          "minimum": 1,
+          "title": "Max Operations Calls",
+          "type": "integer"
+        },
+        "scope_knowledge_steps": {
+          "default": true,
+          "title": "Scope Knowledge Steps",
+          "type": "boolean"
+        },
+        "operations_terms": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Operations Terms",
+          "type": "array"
+        }
+      },
+      "title": "PlannerConfig",
+      "type": "object"
+    },
     "PostgresBackend": {
       "additionalProperties": false,
       "properties": {
@@ -2240,6 +5533,35 @@
         "kind"
       ],
       "title": "PostgresBackend",
+      "type": "object"
+    },
+    "PrecomputedEquivalence": {
+      "additionalProperties": false,
+      "description": "Precomputed \u2194 online equivalence of a member's vectors (\u00a76.2): a verify sample of ``sample``\nchunks (stratified by kind) re-embedded online must reach the mean and minimum cosine.",
+      "properties": {
+        "sample": {
+          "default": 200,
+          "maximum": 100000,
+          "minimum": 200,
+          "title": "Sample",
+          "type": "integer"
+        },
+        "mean_cosine": {
+          "default": 0.995,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Mean Cosine",
+          "type": "number"
+        },
+        "min_cosine": {
+          "default": 0.98,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Min Cosine",
+          "type": "number"
+        }
+      },
+      "title": "PrecomputedEquivalence",
       "type": "object"
     },
     "PrecomputedVectors": {
@@ -2348,7 +5670,7 @@
     },
     "PrivacyConfig": {
       "additionalProperties": false,
-      "description": "Opt-in conservative redaction; not a complete PII detector.",
+      "description": "Opt-in conservative redaction; not a complete PII detector.\n\n``engine: legacy`` (default) is the a1/a2 behaviour: ``redact_emails`` and ``patterns`` with\nPython ``re`` on documents. ``engine: safe`` (B11) runs the named built-in ``redactors``, the\n``custom`` redactors and the ``patterns`` (as ``mask`` redactors) through the pattern engine's\nvalidator (RE2 subset, ReDoS lint) and runtime (``regex_engine``: ``re2``, or the ``regex``\ndevelopment engine with a per-call timeout that fails the redaction rather than skipping it).\nIt redacts log records before any persistence, ingested documents and every prompt line. The\nnew keys are omitted from every fingerprint while they hold their defaults.",
       "properties": {
         "redact_emails": {
           "default": false,
@@ -2377,9 +5699,613 @@
           ],
           "title": "Trace Masking",
           "type": "string"
+        },
+        "engine": {
+          "default": "legacy",
+          "enum": [
+            "legacy",
+            "safe"
+          ],
+          "title": "Engine",
+          "type": "string"
+        },
+        "redactors": {
+          "items": {
+            "enum": [
+              "email",
+              "ipv4",
+              "ipv6",
+              "bearer_token",
+              "jwt",
+              "api_key",
+              "aws_key",
+              "url_credentials",
+              "query_values",
+              "uuid",
+              "request_id",
+              "hex_secret",
+              "llm_text",
+              "content",
+              "query",
+              "tracking_id",
+              "record_payload",
+              "pg_row",
+              "phone",
+              "long_numeric_id",
+              "person_name",
+              "record_list",
+              "product_prose"
+            ],
+            "type": "string"
+          },
+          "title": "Redactors",
+          "type": "array"
+        },
+        "custom": {
+          "items": {
+            "$ref": "#/$defs/CustomRedactor"
+          },
+          "title": "Custom",
+          "type": "array"
+        },
+        "regex_engine": {
+          "default": "re2",
+          "enum": [
+            "re2",
+            "regex"
+          ],
+          "title": "Regex Engine",
+          "type": "string"
+        },
+        "regex_timeout_ms": {
+          "default": 100,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Regex Timeout Ms",
+          "type": "integer"
+        },
+        "hash_key_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hash Key Env"
+        },
+        "actions": {
+          "additionalProperties": {
+            "enum": [
+              "mask",
+              "hash"
+            ],
+            "type": "string"
+          },
+          "propertyNames": {
+            "enum": [
+              "email",
+              "ipv4",
+              "ipv6",
+              "bearer_token",
+              "jwt",
+              "api_key",
+              "aws_key",
+              "url_credentials",
+              "query_values",
+              "uuid",
+              "request_id",
+              "hex_secret",
+              "llm_text",
+              "content",
+              "query",
+              "tracking_id",
+              "record_payload",
+              "pg_row",
+              "phone",
+              "long_numeric_id",
+              "person_name",
+              "record_list",
+              "product_prose"
+            ]
+          },
+          "title": "Actions",
+          "type": "object"
+        },
+        "record_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Record Fields"
+        },
+        "record_fields_allow": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Record Fields Allow",
+          "type": "array"
+        },
+        "person_name_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Person Name Fields"
+        },
+        "record_list_fields": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Record List Fields"
+        },
+        "prose_products": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Prose Products",
+          "type": "array"
         }
       },
       "title": "PrivacyConfig",
+      "type": "object"
+    },
+    "ProjectionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend"
+        },
+        "tables": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProjectionTable"
+          },
+          "title": "Tables",
+          "type": "object"
+        },
+        "relations": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProjectionRelation"
+          },
+          "title": "Relations",
+          "type": "object"
+        }
+      },
+      "title": "ProjectionConfig",
+      "type": "object"
+    },
+    "ProjectionRelation": {
+      "additionalProperties": false,
+      "description": "``from: <child table>.<column>`` -> ``to: <parent table>.id``; cardinality is declared, never\ninferred, and ``many_to_one`` is the only one offered (outer joins are not). ``from`` is a Python\nkeyword, so the attribute is ``from_``; it is dumped as ``from`` so a dumped config validates again.",
+      "properties": {
+        "from": {
+          "pattern": "^[a-z][a-z0-9_]{0,40}\\.[a-z][a-z0-9_]{0,40}$",
+          "title": "From",
+          "type": "string"
+        },
+        "to": {
+          "pattern": "^[a-z][a-z0-9_]{0,40}\\.id$",
+          "title": "To",
+          "type": "string"
+        },
+        "cardinality": {
+          "const": "many_to_one",
+          "title": "Cardinality",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "cardinality",
+        "description"
+      ],
+      "title": "ProjectionRelation",
+      "type": "object"
+    },
+    "ProjectionTable": {
+      "additionalProperties": false,
+      "description": "One table: the records of one document ``kind``. ``columns`` name declared metadata fields\n(the key ``id`` is implicit). ``descriptions`` overrides ``FieldSpec.description`` per column;\nevery column needs a reviewed description from one of the two (planner-visible meaning, \u00a75.8).\n``text_columns`` (F6): free-text columns sourced from the document title or text fields.",
+      "properties": {
+        "kind": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Columns",
+          "type": "array"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "descriptions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Descriptions",
+          "type": "object"
+        },
+        "text_columns": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProjectionTextColumn"
+          },
+          "title": "Text Columns",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ProjectionTable",
+      "type": "object"
+    },
+    "ProjectionTextColumn": {
+      "additionalProperties": false,
+      "description": "A free-text column (2026-11-09 corpus-B fix F6): the document's ``title`` or one of its text\n``fields.<name>`` copied verbatim into the projection, so the SQL surface can match mentions with\n``LIKE``/``instr`` (never ``=``, never grouped, sorted or enumerated; no values reach a prompt).\n``description`` is the reviewed planner-visible meaning (required).",
+      "properties": {
+        "source": {
+          "pattern": "^(?:title|fields\\.[A-Za-z0-9_][A-Za-z0-9_.-]{0,63})$",
+          "title": "Source",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "description"
+      ],
+      "title": "ProjectionTextColumn",
+      "type": "object"
+    },
+    "ProjectionsConfig": {
+      "additionalProperties": false,
+      "description": "``ingestion.projections``: which document kinds stay out of a projection, and which fields of a\nkind are embedded. Catalog and records always hold every document.",
+      "properties": {
+        "exclude_kinds": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "propertyNames": {
+            "enum": [
+              "lexical",
+              "vector",
+              "graph"
+            ]
+          },
+          "title": "Exclude Kinds",
+          "type": "object"
+        },
+        "embed_fields": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Embed Fields",
+          "type": "object"
+        }
+      },
+      "title": "ProjectionsConfig",
+      "type": "object"
+    },
+    "ProviderBudget": {
+      "additionalProperties": false,
+      "description": "A lifetime (total-period) USD cap for one provider key across every learning and extraction\nscope (addendum A2 \u00a74.2.6). Reservations persist in the learning spend ledger; reaching the cap\nstops the step (``budget_deferred``), never a switch to another provider.",
+      "properties": {
+        "max_usd_total": {
+          "exclusiveMinimum": 0,
+          "title": "Max Usd Total",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_usd_total"
+      ],
+      "title": "ProviderBudget",
+      "type": "object"
+    },
+    "ProvisionalConfig": {
+      "additionalProperties": false,
+      "description": "Unclosed days served provisional (``ingestion/provisional.py``): per-scope snapshot versions\nand one replaceable, flagged projection file per day version. Needs the archive.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        }
+      },
+      "title": "ProvisionalConfig",
+      "type": "object"
+    },
+    "PullConfig": {
+      "additionalProperties": false,
+      "description": "Records-tier pull: cursor, page size, keepalive bound and stratified caps (\u00a73.1.3).",
+      "properties": {
+        "cursor": {
+          "default": "scroll",
+          "enum": [
+            "scroll",
+            "search_after"
+          ],
+          "title": "Cursor",
+          "type": "string"
+        },
+        "tiebreaker": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z@_][A-Za-z0-9@_.\\-]{0,255}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tiebreaker"
+        },
+        "page_size": {
+          "default": 500,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Page Size",
+          "type": "integer"
+        },
+        "keepalive": {
+          "default": "1m",
+          "title": "Keepalive",
+          "type": "string"
+        },
+        "keepalive_max": {
+          "default": "2m",
+          "title": "Keepalive Max",
+          "type": "string"
+        },
+        "records_query": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Records Query"
+        },
+        "max_docs_per_unit": {
+          "default": 20000,
+          "minimum": 1,
+          "title": "Max Docs Per Unit",
+          "type": "integer"
+        },
+        "max_docs_per_partition": {
+          "default": 500000,
+          "minimum": 1,
+          "title": "Max Docs Per Partition",
+          "type": "integer"
+        },
+        "sample_method": {
+          "default": "hourly_quota",
+          "enum": [
+            "hourly_quota",
+            "random_score"
+          ],
+          "title": "Sample Method",
+          "type": "string"
+        },
+        "seed": {
+          "default": 0,
+          "maximum": 2147483647,
+          "minimum": 0,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "max_concurrency": {
+          "default": 1,
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        },
+        "slices": {
+          "default": 1,
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Slices",
+          "type": "integer"
+        },
+        "max_restarts": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 0,
+          "title": "Max Restarts",
+          "type": "integer"
+        }
+      },
+      "title": "PullConfig",
+      "type": "object"
+    },
+    "QuestionConfig": {
+      "additionalProperties": false,
+      "description": "How a question's surface terms are read (\u00a76.11). ``timezone``: the question clock, the IANA\nzone in which an hour without a date (\"at 2\", \"around 14:00\") is read before it is converted\nto the log partition clock (``logs.timezone``); default UTC. It never changes partition dates\nand is independent of ``serving.ui.display_timezone``. An undated outage/presence question (\"is\nthere any outage\") reads the last ``logs.collection.serving.default_view_days`` days.",
+      "properties": {
+        "timezone": {
+          "default": "UTC",
+          "maxLength": 64,
+          "title": "Timezone",
+          "type": "string"
+        },
+        "vocabulary": {
+          "$ref": "#/$defs/QuestionVocabulary"
+        }
+      },
+      "title": "QuestionConfig",
+      "type": "object"
+    },
+    "QuestionVocabulary": {
+      "additionalProperties": false,
+      "description": "``question.vocabulary``: inline ``terms`` and/or a YAML ``file`` (a list of terms, relative\nto the config file) pinned by ``sha256``. A file whose digest differs refuses to start\n(\u00a76.12, \"vocabulary file pin mismatch\"). Terms must be unique across both.",
+      "properties": {
+        "terms": {
+          "items": {
+            "$ref": "#/$defs/VocabularyTerm"
+          },
+          "maxItems": 500,
+          "title": "Terms",
+          "type": "array"
+        },
+        "file": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "File"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        }
+      },
+      "title": "QuestionVocabulary",
+      "type": "object"
+    },
+    "RawCopyConfig": {
+      "additionalProperties": false,
+      "description": "Optional raw-copy store (``ingestion/raw_store.py``): pulled units **unredacted**, so redaction\nand parsing can be re-run without the source. Off by default; kept ``retention.raw_days``.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "compression": {
+          "default": "gzip",
+          "enum": [
+            "gzip",
+            "none"
+          ],
+          "title": "Compression",
+          "type": "string"
+        }
+      },
+      "title": "RawCopyConfig",
       "type": "object"
     },
     "RequestConfig": {
@@ -2393,7 +6319,7 @@
           "type": "array"
         },
         "context_max_bytes": {
-          "default": 8192,
+          "default": 131072,
           "maximum": 1000000,
           "minimum": 256,
           "title": "Context Max Bytes",
@@ -2438,13 +6364,94 @@
           },
           "title": "Modes",
           "type": "array"
+        },
+        "evidence_chars_max": {
+          "anyOf": [
+            {
+              "maximum": 2000000,
+              "minimum": 500,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence Chars Max"
         }
       },
       "title": "RequestConfig",
       "type": "object"
     },
+    "RerankOptions": {
+      "additionalProperties": false,
+      "description": "``pipeline.selection.reranking`` (read only with ``rerank: true``; ``selection/rerank.py``).\n\n``top_k_in``: unpinned records scored (the rest keep fusion order after them; None = all).\n``top_k_out``: explicit cut after reranking (None = no cut). ``timeout_ms``: latency budget of\nthe scoring call (None = unbounded). ``on_error``: ``fail`` raises; ``fusion_order`` keeps the\nfusion order and records ``status: failed_open`` with the reason in the selection trace.\n``passage_chars``: characters of title + retrieved passage sent per record.",
+      "properties": {
+        "top_k_in": {
+          "anyOf": [
+            {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Top K In"
+        },
+        "top_k_out": {
+          "anyOf": [
+            {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Top K Out"
+        },
+        "timeout_ms": {
+          "anyOf": [
+            {
+              "maximum": 600000,
+              "minimum": 10,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout Ms"
+        },
+        "on_error": {
+          "default": "fail",
+          "enum": [
+            "fail",
+            "fusion_order"
+          ],
+          "title": "On Error",
+          "type": "string"
+        },
+        "passage_chars": {
+          "default": 1900,
+          "maximum": 20000,
+          "minimum": 100,
+          "title": "Passage Chars",
+          "type": "integer"
+        }
+      },
+      "title": "RerankOptions",
+      "type": "object"
+    },
     "RerankerRole": {
       "additionalProperties": false,
+      "description": "A local cross-encoder (``selection/rerank.py``). ``device: auto`` = CUDA when available, else\nCPU; an unavailable explicit ``cuda`` is a load error (never a silent CPU fallback). ``dtype:\nauto`` = float16 on CUDA, float32 on CPU.",
       "properties": {
         "provider": {
           "const": "sentence_transformers",
@@ -2456,12 +6463,141 @@
           "minLength": 1,
           "title": "Model",
           "type": "string"
+        },
+        "device": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "cpu",
+            "cuda"
+          ],
+          "title": "Device",
+          "type": "string"
+        },
+        "dtype": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "float32",
+            "float16"
+          ],
+          "title": "Dtype",
+          "type": "string"
+        },
+        "batch_size": {
+          "default": 32,
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_length": {
+          "anyOf": [
+            {
+              "maximum": 8192,
+              "minimum": 16,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Length"
         }
       },
       "required": [
         "model"
       ],
       "title": "RerankerRole",
+      "type": "object"
+    },
+    "RetentionConfig": {
+      "additionalProperties": false,
+      "description": "Retention per data class.\n\n- ``keep_days`` (alias ``partition_days``): the masked day partitions (records, matches, unparsed\n  queue), the N most recent complete days.\n- ``raw_days``: the raw-copy store (``partitions.raw``), shorter than ``keep_days``.\n- ``derived``: the composed arm data (day and hour rollups, signature catalog and exemplars, graph,\n  communities, the documents of every projection). ``window`` (default; the single-window\n  behaviour): derived data follows the partitions. ``forever``: every composed day stays in the\n  serving generation after its partition expired. An integer: days of derived data kept\n  (at least ``keep_days``).",
+      "properties": {
+        "keep_days": {
+          "default": 10,
+          "maximum": 3660,
+          "minimum": 1,
+          "title": "Keep Days",
+          "type": "integer"
+        },
+        "raw_days": {
+          "default": 3,
+          "maximum": 3660,
+          "minimum": 1,
+          "title": "Raw Days",
+          "type": "integer"
+        },
+        "derived": {
+          "anyOf": [
+            {
+              "enum": [
+                "window",
+                "forever"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            }
+          ],
+          "default": "window",
+          "title": "Derived"
+        },
+        "keep_generations": {
+          "default": 2,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Keep Generations",
+          "type": "integer"
+        },
+        "max_pin_wait_seconds": {
+          "default": 900,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Max Pin Wait Seconds",
+          "type": "number"
+        },
+        "pin_retry_seconds": {
+          "default": 15,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Pin Retry Seconds",
+          "type": "number"
+        },
+        "verify_sample": {
+          "default": 1000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Verify Sample",
+          "type": "integer"
+        }
+      },
+      "title": "RetentionConfig",
+      "type": "object"
+    },
+    "RetryTransient": {
+      "additionalProperties": false,
+      "description": "One (or two) more attempts after a transient provider failure: HTTP 5xx/overloaded, 429,\ntimeout, connection error, or a stream that ended before its final event without a\n``max_tokens`` stop. Each attempt is a separate metered call; an attempt is made only when the\nrequest deadline leaves more than ``backoff_seconds`` plus the role timeout's floor of one\nsecond, and only when the budget can reserve it (otherwise the original error stands).",
+      "properties": {
+        "attempts": {
+          "default": 1,
+          "maximum": 2,
+          "minimum": 1,
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "backoff_seconds": {
+          "default": 2.0,
+          "maximum": 30,
+          "minimum": 0,
+          "title": "Backoff Seconds",
+          "type": "number"
+        }
+      },
+      "title": "RetryTransient",
       "type": "object"
     },
     "ReviewConfig": {
@@ -2493,6 +6629,76 @@
         }
       },
       "title": "ReviewConfig",
+      "type": "object"
+    },
+    "ScheduleConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "lock_ttl_seconds": {
+          "default": 3600,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "title": "Lock Ttl Seconds",
+          "type": "number"
+        }
+      },
+      "title": "ScheduleConfig",
+      "type": "object"
+    },
+    "SegmentArm": {
+      "additionalProperties": false,
+      "description": "The ``segment`` arm (``arms/segment.py``): a sealed child-record index (``segments/``) built\nwith ``su-multi-arm segments build``. Hits are parent records with their best segments as\nprovenance; the request scope is evaluated on the parent. ``kinds`` narrows the segment kinds\nsearched (empty: all). ``lexical`` fuses a BM25 list over segment text by reciprocal rank.",
+      "properties": {
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        },
+        "candidates": {
+          "default": 200,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Candidates",
+          "type": "integer"
+        },
+        "kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Kinds",
+          "type": "array"
+        },
+        "lexical": {
+          "default": true,
+          "title": "Lexical",
+          "type": "boolean"
+        },
+        "lexical_candidates": {
+          "default": 400,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Lexical Candidates",
+          "type": "integer"
+        },
+        "rrf_k": {
+          "default": 60,
+          "minimum": 1,
+          "title": "Rrf K",
+          "type": "integer"
+        },
+        "max_segments_per_parent": {
+          "default": 3,
+          "maximum": 20,
+          "minimum": 1,
+          "title": "Max Segments Per Parent",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "SegmentArm",
       "type": "object"
     },
     "SelectionConfig": {
@@ -2606,11 +6812,72 @@
           "title": "Rerank",
           "type": "boolean"
         },
+        "reranking": {
+          "$ref": "#/$defs/RerankOptions"
+        },
         "packing": {
           "$ref": "#/$defs/PackingConfig"
         }
       },
       "title": "SelectionConfig",
+      "type": "object"
+    },
+    "ServingAnswersSpend": {
+      "additionalProperties": false,
+      "description": "``serving.answers`` (addendum A2 rev 4): answer-time model calls (planner, generator,\nreviewer) reserve on a persistent per-day ledger under their own scope ``serving.answers``,\nseparate from the learning scopes, and on ``budgets.providers.<provider>.max_usd_total`` when\nthe provider has one. Off by default (per-request ``budgets`` only). A refused reservation fails\nthe call before it is sent; there is no fallback to another provider.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_usd_per_day": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Usd Per Day"
+        },
+        "max_calls_per_day": {
+          "default": 10000,
+          "maximum": 10000000,
+          "minimum": 1,
+          "title": "Max Calls Per Day",
+          "type": "integer"
+        },
+        "ledger": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ledger"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "stale_reservation_seconds": {
+          "default": 3600,
+          "maximum": 604800,
+          "minimum": 60,
+          "title": "Stale Reservation Seconds",
+          "type": "number"
+        }
+      },
+      "title": "ServingAnswersSpend",
       "type": "object"
     },
     "ServingConfig": {
@@ -2619,11 +6886,24 @@
         "http": {
           "$ref": "#/$defs/HttpConfig"
         },
+        "answers": {
+          "$ref": "#/$defs/ServingAnswersSpend"
+        },
         "mcp": {
           "$ref": "#/$defs/McpConfig"
         },
         "actions": {
           "$ref": "#/$defs/ActionsServingConfig"
+        },
+        "allowed_hosts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Hosts",
+          "type": "array"
+        },
+        "ui": {
+          "$ref": "#/$defs/UiConfig"
         }
       },
       "title": "ServingConfig",
@@ -2718,6 +6998,296 @@
       "title": "SessionsConfig",
       "type": "object"
     },
+    "SettleConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_growth": {
+          "default": 0.05,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Max Growth",
+          "type": "number"
+        }
+      },
+      "title": "SettleConfig",
+      "type": "object"
+    },
+    "SharedErrorConfig": {
+      "additionalProperties": false,
+      "description": "Deterministic daily shared-pattern membership from classified hourly counts, not incidents.\nGeneric catch-all signatures should be excluded explicitly for the deployed pattern library.",
+      "properties": {
+        "min_tenants": {
+          "default": 2,
+          "maximum": 100000,
+          "minimum": 2,
+          "title": "Min Tenants",
+          "type": "integer"
+        },
+        "min_lines_per_tenant": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Min Lines Per Tenant",
+          "type": "integer"
+        },
+        "max_groups": {
+          "default": 2000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Groups",
+          "type": "integer"
+        },
+        "exclude_signatures": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Exclude Signatures",
+          "type": "array"
+        }
+      },
+      "title": "SharedErrorConfig",
+      "type": "object"
+    },
+    "SliceCompaction": {
+      "additionalProperties": false,
+      "description": "Live-slice compaction ladder (\u00a76.7): five-minute slices of the current hour become one hourly\nslice; every ``day_base_hours`` the day's slices become one day base.",
+      "properties": {
+        "refresh_seconds": {
+          "default": 300,
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Refresh Seconds",
+          "type": "integer"
+        },
+        "hourly_seconds": {
+          "default": 3600,
+          "maximum": 86400,
+          "minimum": 300,
+          "title": "Hourly Seconds",
+          "type": "integer"
+        },
+        "day_base_hours": {
+          "default": 6,
+          "maximum": 24,
+          "minimum": 1,
+          "title": "Day Base Hours",
+          "type": "integer"
+        }
+      },
+      "title": "SliceCompaction",
+      "type": "object"
+    },
+    "SliceSettings": {
+      "additionalProperties": false,
+      "description": "``collection.slices`` (\u00a76.7): the live log path. ``max_units_per_day`` bounds the slices a\nrequest pins per day; ``gc_grace_seconds`` keeps a retired, unpinned slice at least that long\n(never below the request deadline, checked against ``budgets.deadline_seconds``).",
+      "properties": {
+        "compaction": {
+          "$ref": "#/$defs/SliceCompaction"
+        },
+        "max_units_per_day": {
+          "default": 19,
+          "maximum": 200,
+          "minimum": 1,
+          "title": "Max Units Per Day",
+          "type": "integer"
+        },
+        "embed_lag_seconds": {
+          "default": 900,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Embed Lag Seconds",
+          "type": "integer"
+        },
+        "gc_grace_seconds": {
+          "default": 3600,
+          "maximum": 604800,
+          "minimum": 60,
+          "title": "Gc Grace Seconds",
+          "type": "integer"
+        }
+      },
+      "title": "SliceSettings",
+      "type": "object"
+    },
+    "SourceConfig": {
+      "additionalProperties": false,
+      "description": "One read-only log source. ``kind: elasticsearch_rest`` covers Elasticsearch \u2265 7.9 and\nOpenSearch \u2265 1.0 over plain REST (older 7.x discover through ``/{expr}/_alias``).",
+      "properties": {
+        "kind": {
+          "const": "elasticsearch_rest",
+          "title": "Kind",
+          "type": "string"
+        },
+        "url_env": {
+          "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+          "title": "Url Env",
+          "type": "string"
+        },
+        "auth": {
+          "default": "none",
+          "enum": [
+            "none",
+            "basic",
+            "api_key"
+          ],
+          "title": "Auth",
+          "type": "string"
+        },
+        "username_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Username Env"
+        },
+        "password_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Password Env"
+        },
+        "api_key_env": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z_][A-Z0-9_]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key Env"
+        },
+        "verify_tls": {
+          "default": true,
+          "title": "Verify Tls",
+          "type": "boolean"
+        },
+        "ca_bundle": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ca Bundle"
+        },
+        "indices": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Indices",
+          "type": "array"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "require_read_only_role": {
+          "default": false,
+          "title": "Require Read Only Role",
+          "type": "boolean"
+        },
+        "disallow": {
+          "items": {
+            "const": "pit",
+            "type": "string"
+          },
+          "title": "Disallow",
+          "type": "array"
+        },
+        "mapping": {
+          "$ref": "#/$defs/LogFieldMap"
+        },
+        "index_name": {
+          "$ref": "#/$defs/IndexNameConfig"
+        },
+        "multiline": {
+          "$ref": "#/$defs/MultilineConfig"
+        },
+        "counts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CountQueryConfig"
+          },
+          "title": "Counts",
+          "type": "object"
+        },
+        "pull": {
+          "$ref": "#/$defs/PullConfig"
+        },
+        "limits": {
+          "$ref": "#/$defs/SourceLimits"
+        },
+        "max_line_bytes": {
+          "default": 8192,
+          "maximum": 1048576,
+          "minimum": 256,
+          "title": "Max Line Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "url_env",
+        "indices"
+      ],
+      "title": "SourceConfig",
+      "type": "object"
+    },
+    "SourceLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "requests_per_second": {
+          "default": 2.0,
+          "exclusiveMinimum": 0,
+          "maximum": 50,
+          "title": "Requests Per Second",
+          "type": "number"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "exclusiveMinimum": 0,
+          "maximum": 300,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "max_response_bytes": {
+          "default": 67108864,
+          "maximum": 536870912,
+          "minimum": 1024,
+          "title": "Max Response Bytes",
+          "type": "integer"
+        },
+        "max_context_per_partition": {
+          "default": 200,
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Max Context Per Partition",
+          "type": "integer"
+        }
+      },
+      "title": "SourceLimits",
+      "type": "object"
+    },
     "SqlAlchemyBackend": {
       "additionalProperties": false,
       "properties": {
@@ -2749,6 +7319,74 @@
         "url_env"
       ],
       "title": "SqlAlchemyBackend",
+      "type": "object"
+    },
+    "SqlSurfaceConfig": {
+      "additionalProperties": false,
+      "description": "``typed_query`` in ``mode: sql_surface`` (opt-in; adapted from NVIDIA Auto-Ontology's\ncatalog + text-to-SQL flow): a model writes one SQLite ``SELECT`` over the logical projection\ncatalog; the arm parses it (``sqlglot``, extra ``su-multi-arm[sql-surface]``), refuses anything\noutside the catalog/allowlists, checks every filter value against the ``ValueResolver``, binds\nthe principal's ACL and executes read-only on the per-tenant file. ``repair_attempts``: at most\none re-prompt with the typed parse/validation/database error (never for unknown values or\nsecurity refusals). ``sample_values``: observed values shown per listable column (0: none).\n``list_values_up_to`` (2026-11-09 corpus-B fix F7; with ``sample_values`` > 0): a listable column with at most this many\nACL-scoped observed values (or an enum with at most this many declared values) shows **every**\nvalue, marked complete, instead of ``sample_values`` samples; 0 keeps samples only. The\ncolumn's ``max_catalog_cardinality`` still caps what is enumerated at all.\n``group_lineage_max`` (2026-11-09, corpus-B B7): a grouped result over one table lists the\nrecord ids of every returned group with at most this many contributing records (a bounded\nsecond read-only read on the same ACL-bound projection file), and a filtered scalar aggregate\nkeeps up to this many contributor ids (at least 8); 0 disables the group read.",
+      "properties": {
+        "role": {
+          "default": "planner",
+          "enum": [
+            "planner",
+            "reviewer",
+            "generator",
+            "query_writer"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "repair_attempts": {
+          "default": 1,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Repair Attempts",
+          "type": "integer"
+        },
+        "max_sql_chars": {
+          "default": 4000,
+          "maximum": 20000,
+          "minimum": 200,
+          "title": "Max Sql Chars",
+          "type": "integer"
+        },
+        "sample_values": {
+          "default": 5,
+          "maximum": 20,
+          "minimum": 0,
+          "title": "Sample Values",
+          "type": "integer"
+        },
+        "list_values_up_to": {
+          "default": 64,
+          "maximum": 500,
+          "minimum": 0,
+          "title": "List Values Up To",
+          "type": "integer"
+        },
+        "group_lineage_max": {
+          "default": 10,
+          "maximum": 50,
+          "minimum": 0,
+          "title": "Group Lineage Max",
+          "type": "integer"
+        },
+        "max_joins": {
+          "default": 3,
+          "maximum": 8,
+          "minimum": 0,
+          "title": "Max Joins",
+          "type": "integer"
+        },
+        "max_subqueries": {
+          "default": 4,
+          "maximum": 16,
+          "minimum": 0,
+          "title": "Max Subqueries",
+          "type": "integer"
+        }
+      },
+      "title": "SqlSurfaceConfig",
       "type": "object"
     },
     "SqliteBackend": {
@@ -2843,6 +7481,32 @@
       "title": "StagePolicies",
       "type": "object"
     },
+    "StagingConfig": {
+      "additionalProperties": false,
+      "description": "Handoff copies written by the collector: ``<path>/<YYYY-MM-DD>/*.json`` summary snapshots.\nA day's directory is deleted once the day is archived and the archived shard verified.",
+      "properties": {
+        "path": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "delete_after_import": {
+          "default": true,
+          "title": "Delete After Import",
+          "type": "boolean"
+        }
+      },
+      "title": "StagingConfig",
+      "type": "object"
+    },
     "StorageConfig": {
       "additionalProperties": false,
       "description": "Authoritative backend per non-arm capability; each must name exactly one backend declaring it.",
@@ -2917,6 +7581,45 @@
       "title": "StructuredArm",
       "type": "object"
     },
+    "TemplateFallbackConfig": {
+      "additionalProperties": false,
+      "description": "Cluster-first fallback (A2 \u00a74.2.3): one ``pattern_learner`` call per residue cluster of at\nleast ``min_support`` lines, at most ``max_clusters_per_day`` clusters per run (ranked by size x\nlevel weight), each prompt with at most ``max_lines_per_prompt`` lines. Calls reserve against\n``learning.patterns`` (scope ``learning.patterns``). ``write_proposals`` writes passing entries\nthrough the existing promotion policy (``learned.yaml`` + ``approve`` under ``auto``, otherwise\n``proposed.yaml``).",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_clusters_per_day": {
+          "default": 150,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Clusters Per Day",
+          "type": "integer"
+        },
+        "min_support": {
+          "default": 3,
+          "maximum": 1000,
+          "minimum": 2,
+          "title": "Min Support",
+          "type": "integer"
+        },
+        "max_lines_per_prompt": {
+          "default": 8,
+          "maximum": 50,
+          "minimum": 3,
+          "title": "Max Lines Per Prompt",
+          "type": "integer"
+        },
+        "write_proposals": {
+          "default": true,
+          "title": "Write Proposals",
+          "type": "boolean"
+        }
+      },
+      "title": "TemplateFallbackConfig",
+      "type": "object"
+    },
     "ToolsConfig": {
       "additionalProperties": false,
       "description": "Read-only tools exposed through the engine (plan \u00a73.4). Only registered components can be\nnamed: the built-ins; there is no code loading from config.",
@@ -2959,7 +7662,8 @@
               "co_occurrence",
               "mention",
               "native_link",
-              "derived"
+              "derived",
+              "co_firing"
             ],
             "type": "string"
           },
@@ -3045,6 +7749,200 @@
       "title": "TraversalTemplate",
       "type": "object"
     },
+    "TypedQueryArm": {
+      "additionalProperties": false,
+      "description": "The ``typed_query`` arm (typed-query plan \u00a75.5): compiled typed queries over the projection\nof ``projection.backend``; needs ``projection.enabled``. Limits bound every execution.\n``mode``: ``ir`` (default; the compiled ``TypedQueryDraft``) or ``sql_surface`` (validated\nmodel-written SQL, ``sql_surface`` settings); the arm executes only the input of its mode.",
+      "properties": {
+        "row_limit": {
+          "default": 200,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Row Limit",
+          "type": "integer"
+        },
+        "max_groups": {
+          "default": 500,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Groups",
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "default": 2000,
+          "maximum": 60000,
+          "minimum": 10,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "max_text_ids": {
+          "default": 10000,
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Text Ids",
+          "type": "integer"
+        },
+        "text_backend": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text Backend"
+        },
+        "mode": {
+          "default": "ir",
+          "enum": [
+            "ir",
+            "sql_surface"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "sql_surface": {
+          "$ref": "#/$defs/SqlSurfaceConfig"
+        }
+      },
+      "title": "TypedQueryArm",
+      "type": "object"
+    },
+    "TypedQueryDecision": {
+      "additionalProperties": false,
+      "description": "Typed-query planning on the ``llm`` planner (typed-query plan \u00a75.4/\u00a76, M6). ``enabled`` offers\n``arm: typed_query`` to the planner (only while the pipeline enables the ``typed_query`` arm and\nthe pinned generation has a sealed projection); ``repair_attempts: 1`` feeds typed compile errors\nback for one re-plan that may not drop a question qualifier or a request filter.\n\n``routing``: ``planner`` (default; the typed catalog and ``arm: typed_query`` are part of the main\nplanner request, M6 / SQL route) or ``router`` (opt-in, after M7): the main planner request is the\none of a deployment without typed queries, and a separate metered call (stage ``typed_router``,\n``models.roles.<router_role>``) sees only the question, the request filters and a compact catalog\nsummary and returns ``{route: typed | retrieval, sub_question, reason}``. A typed route executes\nbefore the planner (mode ir: one typed-plan call, stage ``typed_ir``; mode sql_surface: the SQL\nroute) and its evidence is packed ahead of the retrieval evidence; one that does not execute is a\nrecorded ``DroppedStep`` and the planner runs as usual (``on_step_failure: partial`` for that step).\n\n``parallel`` (routing router only; default on, 2026-11-08 latency fix): the router chain (router\ncall, then the SQL writer or the typed IR call) runs in a worker thread while the planner call\nruns, since the planner request does not depend on the route. Metering, the trace's call order\nand the merge are those of the sequential run; it runs sequentially when the call budget cannot\ncover both chains. ``router_role: query_writer`` selects ``models.roles.query_writer``.\nWhen the planner abstains, an executed typed route that answers the question's aggregate is\nkept as the plan (``policy_applied: typed_route_only``, the planner's failure recorded).",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "repair_attempts": {
+          "default": 0,
+          "enum": [
+            0,
+            1
+          ],
+          "title": "Repair Attempts",
+          "type": "integer"
+        },
+        "routing": {
+          "default": "planner",
+          "enum": [
+            "planner",
+            "router"
+          ],
+          "title": "Routing",
+          "type": "string"
+        },
+        "router_role": {
+          "default": "planner",
+          "enum": [
+            "planner",
+            "reviewer",
+            "generator",
+            "query_writer"
+          ],
+          "title": "Router Role",
+          "type": "string"
+        },
+        "parallel": {
+          "default": true,
+          "title": "Parallel",
+          "type": "boolean"
+        }
+      },
+      "title": "TypedQueryDecision",
+      "type": "object"
+    },
+    "UiConfig": {
+      "additionalProperties": false,
+      "description": "The static web UI (addendum A2 \u00a74.4; wheel ``su-multi-arm-ui``). ``enabled`` mounts it at\n``mount`` on the HTTP app; without the wheel the server refuses to start (``ConfigError``). The\nUI needs bearer auth (or an injected resolver) unless ``allow_unauthenticated_loopback`` is set\nexplicitly for single-user development.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "mount": {
+          "default": "/ui",
+          "pattern": "^/[a-z][a-z0-9_-]{0,31}$",
+          "title": "Mount",
+          "type": "string"
+        },
+        "display_timezone": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Timezone"
+        },
+        "navigation_profile": {
+          "default": "standard",
+          "enum": [
+            "standard",
+            "focused"
+          ],
+          "title": "Navigation Profile",
+          "type": "string"
+        },
+        "session_storage_token": {
+          "default": false,
+          "title": "Session Storage Token",
+          "type": "boolean"
+        },
+        "allow_unauthenticated_loopback": {
+          "default": false,
+          "title": "Allow Unauthenticated Loopback",
+          "type": "boolean"
+        },
+        "theme": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Theme"
+        }
+      },
+      "title": "UiConfig",
+      "type": "object"
+    },
+    "UtcWindow": {
+      "additionalProperties": false,
+      "description": "A daily window in UTC, ``start`` inclusive, ``end`` exclusive (``\"24:00\"`` allowed as end).\nThe window lies inside one UTC day (``start < end``): a heavy pass never crosses midnight.",
+      "properties": {
+        "start": {
+          "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "pattern": "^(?:(?:[01][0-9]|2[0-3]):[0-5][0-9]|24:00)$",
+          "title": "End",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "UtcWindow",
+      "type": "object"
+    },
     "VerbatimBoost": {
       "additionalProperties": false,
       "description": "Lexical front policy (off by default): documents whose text holds a quoted string of the query,\nor at least ``min_windows`` of its ``window_tokens``-token windows verbatim (error messages, pasted\nexcerpts, exact subjects), lead the lexical list, at most ``max_records``, ranked by (quoted,\nwindows matched). A window counts only if one of its tokens is in at most ``common_df`` chunks; a\nwindow found in more than ``max_window_hits`` chunks is boilerplate and ignored; a window whose\ntokens co-occur in more than ``max_candidates`` chunks is not verified (skipped, counted in the\ntrace). Needs a lexical index that exposes its analyzer and term statistics (sqlite\n``lexical_engine: bm25``); anything else is a validation error.",
@@ -3101,13 +7999,71 @@
       },
       "title": "VerbatimBoost",
       "type": "object"
+    },
+    "VocabularyTerm": {
+      "additionalProperties": false,
+      "description": "One reviewed surface term. ``match``: ``word`` (the term as a whole word) or ``prefix``\n(words starting with it: \"crawl\" matches \"crawling\", \"crawler\"). ``field: service`` grounds the\nterm to the listed service values (only the values the generation has indexed are applied; none\nindexed refuses the question's scope rather than widening it). ``field: symptom`` marks a\ndescriptive word (\"slow\") that is not a literal record term; it is stated, never filtered on.\n``note`` is stated in the answer when the term is used.",
+      "properties": {
+        "term": {
+          "pattern": "^[a-z][a-z0-9 _-]{0,47}$",
+          "title": "Term",
+          "type": "string"
+        },
+        "match": {
+          "default": "word",
+          "enum": [
+            "word",
+            "prefix"
+          ],
+          "title": "Match",
+          "type": "string"
+        },
+        "field": {
+          "default": "service",
+          "enum": [
+            "service",
+            "symptom"
+          ],
+          "title": "Field",
+          "type": "string"
+        },
+        "values": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Values",
+          "type": "array"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        }
+      },
+      "required": [
+        "term"
+      ],
+      "title": "VocabularyTerm",
+      "type": "object"
     }
   },
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": 2,
       "default": 2,
+      "enum": [
+        2,
+        3
+      ],
       "title": "Schema Version",
       "type": "integer"
     },
@@ -3230,6 +8186,58 @@
     },
     "actions": {
       "$ref": "#/$defs/ActionsConfig"
+    },
+    "access": {
+      "$ref": "#/$defs/AccessConfig"
+    },
+    "sources": {
+      "additionalProperties": {
+        "$ref": "#/$defs/SourceConfig"
+      },
+      "title": "Sources",
+      "type": "object"
+    },
+    "learning": {
+      "$ref": "#/$defs/LearningConfig"
+    },
+    "logs": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LogsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "projection": {
+      "$ref": "#/$defs/ProjectionConfig"
+    },
+    "question": {
+      "$ref": "#/$defs/QuestionConfig"
+    },
+    "collection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CollectionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "crosssource": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CrossSourceConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

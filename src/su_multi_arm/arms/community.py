@@ -53,12 +53,19 @@ class CommunityArm(BaseArm):
             docs = self._eligible(ctx, inputs.scope, community.document_ids)
             if not docs:
                 continue
+            # A partial member scope must not expose an unrestricted label (which may name
+            # excluded tenants/entities) or report status. Claims are still independently gated.
+            complete_membership = docs == set(community.document_ids)
+            label = community.label if complete_membership else "Scoped community"
+            report_status = community.status() if complete_membership else "scoped"
             # A report claim is usable only when every cited record is eligible.
             claims = [c for c in report.get("claims", []) if all(ref["document_id"] in docs for ref in c["evidence"])]
             overlap = len(query_terms & set(tokens(" ".join(c["text"] for c in claims))))
             if not seed_ids.intersection(community.entity_ids) and not overlap:
                 continue
-            reports.append({"community_id": community.id, "label": community.label, "status": community.status(), "claims": claims})
+            reports.append({"community_id": community.id, "label": label, "status": report_status, "claims": claims})
+            if self.cfg.claim_hits:
+                scored.extend(self._claim_rows(community, claims, label, report_status, len(docs), query_terms))
             member_scope = Scope(predicates=[], document_ids=sorted(docs))
             for mention in graph.mentions(ctx.generation, community.entity_ids, member_scope, inputs.candidates):
                 scored.append(
@@ -67,14 +74,55 @@ class CommunityArm(BaseArm):
                         1.0 + overlap / max(1, len(query_terms)),
                         {
                             "community_id": community.id,
-                            "label": community.label,
+                            "label": label,
                             "member_count": len(docs),
                             "quote": mention.span.text,
                             "kind": "membership_not_causality",
-                            "report_status": community.status(),
+                            "report_status": report_status,
                             "report_claims": claims,
                         },
                     )
                 )
         scored.sort(key=lambda row: (-row[1], row[0]))
         return ArmResult(arm=self.name, hits=self.collapse(ctx, scored), reports=reports)
+
+    def _claim_rows(self, community, claims, label: str, status: str, members: int, query_terms: set[str]) -> list[tuple[str, float, dict]]:
+        """``claim_hits``: each eligible claim sharing enough content terms with the query cites its
+        evidence passages as hits (membership lineage and the claim travel in the provenance)."""
+        wanted = content_terms(query_terms)
+        if not wanted:
+            return []
+        need = min(self.cfg.claim_min_terms, len(wanted))
+        rows = []
+        for claim in claims:
+            shared = len(wanted & content_terms(set(tokens(claim["text"])) | {t for ref in claim["evidence"] for t in tokens(ref["quote"])}))
+            if shared < need:
+                continue
+            for ref in claim["evidence"]:
+                rows.append(
+                    (
+                        ref["chunk_id"],
+                        1.0 + shared / len(wanted),
+                        {
+                            "community_id": community.id,
+                            "label": label,
+                            "member_count": members,
+                            "level": community.level,
+                            "quote": ref["quote"],
+                            "claim": claim["text"],
+                            "kind": "community_claim",
+                            "report_status": status,
+                            "report_origin": community.report.get("origin"),
+                        },
+                    )
+                )
+        return rows
+
+
+FUNCTION_WORDS = frozenset(
+    "the and for are was were with that this from have has had not but you your our their they them what which who whom when where why how all any can could would should will into over about than then there these those its also been being does did done".split()
+)
+
+
+def content_terms(terms: set[str]) -> set[str]:
+    return {t for t in terms if len(t) >= 3 and t not in FUNCTION_WORDS}

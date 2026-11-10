@@ -6,17 +6,17 @@ Capability matrix from `su_multi_arm/backends/capabilities.py`. Configuration va
 same matrix: an arm or storage slot that names a backend which does not serve the capability is a
 `ConfigError`, never a silent fallback. `yes` = implemented on the frozen contracts; `planned` = declared, no code, configuration naming it is rejected; `legacy` = v1 code only; `—` = not declared.
 
-| Backend | catalog | lexical | vector | records | graph | cache | ledger | session | Evidence |
-|---|---|---|---|---|---|---|---|---|---|
-| `memory` | yes | yes | yes | yes | yes | yes | yes | yes | in-process conformance kit, default test run (`tests/conformance/test_backend_conformance.py`) |
-| `sqlite` | yes | yes | yes | yes | yes | yes | yes | yes | in-process conformance kit, default test run (`tests/conformance/test_backend_conformance.py`) |
-| `postgres` | yes | yes | yes | yes | planned | yes | yes | yes | real-service conformance suite `tests/conformance/test_postgres_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
-| `sqlalchemy` | yes | planned | planned | yes | — | yes | yes | yes | real-service conformance suite `tests/conformance/test_sql_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
-| `opensearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/services/test_opensearch_adapter.py` (passed against OpenSearch 2.19.1 and 3.9.0 in the 2.0.0a3 run, see VALIDATION.md) |
-| `elasticsearch` | yes | yes | yes | yes | — | — | — | — | real-service conformance suite `tests/conformance/test_elasticsearch_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
-| `neo4j` | — | — | — | — | yes | — | — | — | real-service conformance suite `tests/conformance/test_neo4j_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
-| `kuzu` | — | — | — | — | yes | — | — | — | in-process conformance kit, default test run (`tests/conformance/test_kuzu_conformance.py`) |
-| `mongodb` | yes | yes | planned | yes | — | yes | yes | yes | real-service conformance suite `tests/conformance/test_mongodb_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| Backend | catalog | lexical | vector | records | graph | cache | ledger | session | relational | Evidence |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `memory` | yes | yes | yes | yes | yes | yes | yes | yes | yes | in-process conformance kit, default test run (`tests/conformance/test_backend_conformance.py`) |
+| `sqlite` | yes | yes | yes | yes | yes | yes | yes | yes | yes | in-process conformance kit, default test run (`tests/conformance/test_backend_conformance.py`) |
+| `postgres` | yes | yes | yes | yes | planned | yes | yes | yes | — | real-service conformance suite `tests/conformance/test_postgres_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| `sqlalchemy` | yes | planned | planned | yes | — | yes | yes | yes | — | real-service conformance suite `tests/conformance/test_sql_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| `opensearch` | yes | yes | yes | yes | — | — | — | — | — | real-service conformance suite `tests/services/test_opensearch_adapter.py` (passed against OpenSearch 2.19.1 and 3.9.0 in the 2.0.0a3 run, see VALIDATION.md) |
+| `elasticsearch` | yes | yes | yes | yes | — | — | — | — | — | real-service conformance suite `tests/conformance/test_elasticsearch_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| `neo4j` | — | — | — | — | yes | — | — | — | — | real-service conformance suite `tests/conformance/test_neo4j_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
+| `kuzu` | — | — | — | — | yes | — | — | — | — | in-process conformance kit, default test run (`tests/conformance/test_kuzu_conformance.py`) |
+| `mongodb` | yes | yes | planned | yes | — | yes | yes | yes | — | real-service conformance suite `tests/conformance/test_mongodb_conformance.py` (passed in the 2.0.0a1 release run, see VALIDATION.md) |
 
 "Real-service conformance" means the backend's conformance suite exists, is marked `external`, and
 runs against a throwaway container (`tests/services/docker-compose.yml`). The recorded runs, image
@@ -28,8 +28,8 @@ versions and their limits are in [Validation](VALIDATION.md). It is not a releva
 - **`sqlite`**: Local default on the frozen contracts (backends/sqlite/); conformance kit v0 passes with numpy and faiss.
 - **`postgres`**: backends/postgres/ on the contracts, one schema per generation; conformance passed against pgvector/pgvector:0.8.0-pg17. FTS scores are ts_rank_cd, not BM25. Graph is planned.
 - **`sqlalchemy`**: backends/sql/ (SQLAlchemy Core) on the contracts; conformance passed on SQLite and PostgreSQL. Other dialects build but are untested. Lexical and vector are dialect-specific and planned.
-- **`opensearch`**: backends/opensearch/ on the frozen contracts (OpenSearch 2.x and 3.x, opensearch-py; same index layout on both, 3.x BM25 scores are the 2.x scores / 2.2, rankings unchanged). Generation-named indices + dataset aliases; BM25 over the standard analyzer; exact cosine by default, HNSW (lucene engine) opt-in with exact rescore; records exact through native filter pushdown and a bounded scan (max_matched). graph/cache/ledger/session are not served (plan §3.5 table).
-- **`elasticsearch`**: backends/elasticsearch/ on the frozen contracts (Elasticsearch 8.x, elasticsearch-py), built on the OpenSearch adapter classes over backends/_lucene_common.py: same index layout, aliases, BM25 and typed pushdown; dense_vector exact cosine by default, HNSW (float, unquantised) opt-in with exact rescore; records exact through a bounded scan (max_matched). graph/cache/ledger/session are not served.
+- **`opensearch`**: backends/opensearch/ on the frozen contracts (OpenSearch 2.x and 3.x, opensearch-py; same index layout on both, 3.x BM25 scores are the 2.x scores / 2.2, rankings unchanged). Generation-named indices + dataset aliases; BM25 over the standard analyzer; exact cosine by default, HNSW (lucene engine) opt-in with exact rescore; records exact through native filter pushdown and a bounded scan (max_matched), or with records.aggregation: native through server-side aggregations (no scan; capped matched ids; cardinality only above the exact distinct cap, labelled approximate). graph/cache/ledger/session are not served (plan §3.5 table).
+- **`elasticsearch`**: backends/elasticsearch/ on the frozen contracts (Elasticsearch 8.x, elasticsearch-py), built on the OpenSearch adapter classes over backends/_lucene_common.py: same index layout, aliases, BM25 and typed pushdown; dense_vector exact cosine by default, HNSW (float, unquantised) opt-in with exact rescore; records exact through a bounded scan (max_matched) or server-side aggregations (records.aggregation: native). graph/cache/ledger/session are not served.
 - **`neo4j`**: backends/neo4j/ on the contracts; graph conformance passed against neo4j:5.26 community. Fixed parameterised Cypher only; eligibility is a pushed-down document-id allow/deny list (predicate_scope false: the arms resolve predicates through the catalog first).
 - **`kuzu`**: backends/kuzu/ (embedded Kuzu, the 'kuzu' extra) on the contracts; graph conformance passes in-process (no service). Fixed parameterised Cypher only; eligibility is a document-id allow/deny list (predicate_scope false). mode: attach opens an existing database read-only through a declared mapping file (upsert/put_communities refused).
 - **`mongodb`**: backends/mongodb/ on the contracts; conformance passed against a community server (mongo:7). Text-index scores are not BM25. Vector search exists only on MongoDB Atlas and stays planned: it cannot be verified against the community server and is never claimed.

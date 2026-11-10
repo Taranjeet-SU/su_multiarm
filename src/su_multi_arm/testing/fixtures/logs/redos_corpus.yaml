@@ -1,0 +1,79 @@
+# ReDoS corpus (addendum A1 §4 L0; consumed by the pattern engine/validator L2 and safe redaction B11).
+# Synthetic. Each case is a regular expression that backtracking engines evaluate in exponential or
+# polynomial time on the attack input  prefix + pump * repeat + suffix.
+#   class:   nested_quantifier | overlapping_alternation | polynomial | backreference | lookaround
+#   re2:     true when RE2 compiles it (RE2 then matches in linear time); false when RE2 refuses it
+#   expect:  what the safe path must do: "linear" (accepted, bounded time) or "refuse" (validator error)
+#   lint:    true when the ReDoS lint (L2 §3.4.1) must flag it even though RE2 would accept it
+format_version: 1
+cases:
+  - id: nested_plus
+    class: nested_quantifier
+    pattern: '^(a+)+$'
+    attack: {prefix: '', pump: 'a', repeat: 28, suffix: '!'}
+    re2: true
+    expect: linear
+    lint: true
+  - id: nested_star_group
+    class: nested_quantifier
+    pattern: '^(\w*)*x$'
+    attack: {prefix: '', pump: 'ab', repeat: 14, suffix: '!'}
+    re2: true
+    expect: linear
+    lint: true
+  - id: alternation_overlap
+    class: overlapping_alternation
+    pattern: '^(a|a)+$'
+    attack: {prefix: '', pump: 'a', repeat: 28, suffix: '!'}
+    re2: true
+    expect: linear
+    lint: true
+  - id: alternation_word_digit
+    class: overlapping_alternation
+    pattern: '^(\w|\d)+$'
+    attack: {prefix: '', pump: '1', repeat: 28, suffix: '-'}
+    re2: true
+    expect: linear
+    lint: true
+  - id: kv_greedy_pair
+    class: polynomial
+    pattern: '(\S+=\S+\s*)+;'
+    attack: {prefix: '', pump: 'k=v ', repeat: 600, suffix: ''}
+    re2: true
+    expect: linear
+    lint: true
+  - id: dotstar_twice
+    class: polynomial
+    pattern: '^.*error.*error.*timeout$'
+    attack: {prefix: '', pump: 'error ', repeat: 400, suffix: 'x'}
+    re2: true
+    expect: linear
+    lint: false
+  - id: email_like
+    class: nested_quantifier
+    pattern: '^([a-z0-9]+\.?)+@example\.invalid$'
+    attack: {prefix: '', pump: 'a', repeat: 28, suffix: '@'}
+    re2: true
+    expect: linear
+    lint: true
+  - id: backreference
+    class: backreference
+    pattern: '^(a+)\1+$'
+    attack: {prefix: '', pump: 'a', repeat: 28, suffix: '!'}
+    re2: false
+    expect: refuse
+    lint: true
+  - id: lookahead
+    class: lookaround
+    pattern: '^(?=(a+)+$)x'
+    attack: {prefix: '', pump: 'a', repeat: 28, suffix: '!'}
+    re2: false
+    expect: refuse
+    lint: true
+  - id: anchored_literal_safe
+    class: polynomial
+    pattern: '^ts=[0-9T:.\-]+Z lvl=[a-z]+ '
+    attack: {prefix: 'ts=', pump: '0', repeat: 5000, suffix: ''}
+    re2: true
+    expect: linear
+    lint: false

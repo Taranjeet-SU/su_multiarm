@@ -50,6 +50,11 @@ class PredicateSupport:
         own = content or self.stems(words)
         return [own, *self._triggers.get(predicate.casefold(), [])] if own else list(self._triggers.get(predicate.casefold(), []))
 
+    def negated(self, span_text: str, low: int, high: int) -> bool:
+        """A negation marker between character offsets ``low`` and ``high`` of ``span_text``. Used
+        when the trigger is a declared, matched group (the ``pattern`` extractor's trigger_group)."""
+        return any(stem in _NEGATION and low <= offset <= high for stem, offset in self.tokens(span_text))
+
     def check(
         self,
         predicate: str,

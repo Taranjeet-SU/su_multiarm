@@ -1,4 +1,42 @@
+## Incident-summary deployment addendum — 2026-11-07
+
+Implemented opt-in source-side rule summary contract, bounded evidence, canonical hourly counts,
+ACL-scoped `incident_episodes`, graph association documents, declared shared-rule communities,
+and summary Overview. Private deployment scheduling is separate from public package source.
+Uncaptured source scopes take priority over refreshes; bounded batches reserve limited current-day
+freshness work and historical rollups are refreshed at most daily. Initial validation is scoped: no claim of full-service completeness or incident precision. Remaining
+work is fleet capture/backlog completion, unclassified-candidate rule review, and operation-lifecycle
+instrumentation sufficient to establish real recovery durations. No raw-export fallback is allowed.
+
 # Implementation plan and status
+
+The [Unified SU platform plan](plans/unified_su_platform.md) records the requested endgame:
+SU tickets, KB/docs and ELK connected through governed identities, graph/community evidence,
+one MCP/UI and federated multi-arm planning. It identifies current dataset and tenant-ACL
+limits, compatibility gates and a staged migration. It is a roadmap, not a deployed
+cross-source integration; ongoing coverage and learning work continues.
+
+The shared [Observability V2 proposal](plans/observability_v2.md) records the next ontology/graph
+direction for Codex and Claude review. **Service coverage remains the active priority**; the broader
+proposal is deferred and does not replace the package implementation plan below.
+
+The shared [Extraction learning plan V2](EXTRACTION_LEARNING_PLAN.md) defines the next
+coverage-improvement workflow: one versioned semantic contract, identical evidence,
+independent comparison/adjudication, mandatory tenant/day/template holdouts,
+QA-gated rule promotion and affected-record reparse. Its status table distinguishes
+implemented library/audit mechanisms from planned enforcement and excluded batch
+experiments. Learning changes the extraction library, not model weights.
+
+[NVIDIA context-layer lessons](plans/nvidia_context_layer_lessons.md) records the inspected
+source/reuse decision and portable question-aware packing, metadata and aggregate-lineage changes.
+The full configured planner/extractor experiment and packing-only ablation are separate from the
+original pilot; record actual development and fresh-evaluation results in VALIDATION.md before
+claiming a quality improvement or promoting a configuration.
+
+The [2026-11-07 handover](plans/codex_handover_2026_11_07.md) separates current
+general package changes, SU integration findings, completed experiments and active
+source-review/larger-local-audit work. It records intentional uncommitted changes
+and the remaining opt-in packing and semantic-validation gates.
 
 **Status (2026-11-03): superseded for 2.0.0a1.** The current plan, phases and acceptance criteria are
 in [plans/v2_implementation_plan.md](plans/v2_implementation_plan.md); per-slice progress and

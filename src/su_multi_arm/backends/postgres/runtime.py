@@ -8,7 +8,7 @@ deletes it. ``invalidate(prefix)`` compares the literal key prefix (``left(key, 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from ...core.errors import BackendError
 from ...core.types import CacheEntry, LedgerEntry, RawReply, SessionRecord
@@ -88,19 +88,94 @@ class PostgresLedger:
             row = cur.fetchone()
         return None if row is None else row[0]
 
-    def put_raw(self, key: str, raw_reply: str, valid: bool) -> None:
+    def put_raw(self, key: str, raw_reply: str, valid: bool, tags: Sequence[str] = ()) -> None:
         with self._b.tx("put_raw") as cur:
             cur.execute(
                 f"INSERT INTO {self._b.table('raw_replies')}(key, raw_reply, valid) VALUES (%s,%s,%s) "
                 "ON CONFLICT (key) DO UPDATE SET raw_reply=EXCLUDED.raw_reply, valid=EXCLUDED.valid",
                 (key, raw_reply, bool(valid)),
             )
+        if tags:
+            self.tag_raw(key, tags)
 
     def get_raw(self, key: str) -> RawReply | None:
         with self._b.tx("get_raw") as cur:
             cur.execute(f"SELECT raw_reply, valid FROM {self._b.table('raw_replies')} WHERE key = %s", (key,))
             row = cur.fetchone()
         return None if row is None else RawReply(key=key, raw_reply=row[0], valid=bool(row[1]))
+
+
+    # retention (``extras.LedgerRetention``) ----------------------------------------------------
+    def tag_raw(self, key: str, tags: Sequence[str]) -> None:
+        with self._b.tx("tag_raw") as cur:
+            cur.execute(f"SELECT 1 FROM {self._b.table('raw_replies')} WHERE key = %s", (key,))
+            if cur.fetchone() is None:
+                raise BackendError(KIND, "tag_raw", f"unknown raw entry {key}")
+            for tag in sorted(set(tags)):
+                cur.execute(f"INSERT INTO {self._b.table('raw_tags')}(key, tag) VALUES (%s,%s) ON CONFLICT DO NOTHING", (key, tag))
+
+    def _column(self, operation: str, sql: str, params: tuple) -> list[str]:
+        with self._b.tx(operation) as cur:
+            cur.execute(sql, params)
+            return [r[0] for r in cur.fetchall()]
+
+    def raw_tags(self, key: str) -> list[str]:
+        return self._column("raw_tags", f"SELECT tag FROM {self._b.table('raw_tags')} WHERE key = %s ORDER BY tag", (key,))
+
+    def tagged(self, tag: str) -> list[str]:
+        return self._column("tagged", f"SELECT key FROM {self._b.table('raw_tags')} WHERE tag = %s ORDER BY key", (tag,))
+
+    def add_refs(self, generation: str, keys: Sequence[str]) -> None:
+        with self._b.tx("add_refs") as cur:
+            for key in sorted(set(keys)):
+                cur.execute(f"INSERT INTO {self._b.table('ledger_refs')}(generation, key) VALUES (%s,%s) ON CONFLICT DO NOTHING", (generation, key))
+
+    def refs(self, generation: str) -> list[str]:
+        return self._column("refs", f"SELECT key FROM {self._b.table('ledger_refs')} WHERE generation = %s ORDER BY key", (generation,))
+
+    def referencing_generations(self) -> list[str]:
+        return self._column("referencing_generations", f"SELECT DISTINCT generation FROM {self._b.table('ledger_refs')} ORDER BY generation", ())
+
+    def purge(self, spec: Any) -> dict[str, int]:
+        raw, tags, refs = self._b.table("raw_replies"), self._b.table("raw_tags"), self._b.table("ledger_refs")
+        with self._b.tx("purge") as cur:
+            dropped = 0
+            for generation in spec.drop_refs_of:
+                cur.execute(f"DELETE FROM {refs} WHERE generation = %s", (generation,))
+                dropped += int(cur.rowcount)
+            tagged = 0
+            for tag in spec.tags:
+                cur.execute(f"DELETE FROM {raw} WHERE key IN (SELECT key FROM {tags} WHERE tag = %s)", (tag,))
+                tagged += int(cur.rowcount)
+            unreferenced = 0
+            for prefix in spec.unreferenced_prefixes:
+                cur.execute(
+                    f"DELETE FROM {raw} r WHERE left(r.key, %s) = %s AND NOT EXISTS (SELECT 1 FROM {refs} x WHERE x.key = r.key) "
+                    f"AND NOT EXISTS (SELECT 1 FROM {tags} g WHERE g.key = r.key)",
+                    (len(prefix), prefix),
+                )
+                unreferenced += int(cur.rowcount)
+            cur.execute(f"DELETE FROM {tags} t WHERE NOT EXISTS (SELECT 1 FROM {raw} r WHERE r.key = t.key)")
+        return {"refs_dropped": dropped, "tagged": tagged, "unreferenced": unreferenced}
+
+    def drop_job(self, job_id: str) -> int:
+        with self._b.tx("drop_job") as cur:
+            cur.execute(f"DELETE FROM {self._b.table('ledger')} WHERE job_id = %s", (job_id,))
+            removed = int(cur.rowcount)
+            cur.execute(f"DELETE FROM {self._b.table('jobs')} WHERE job_id = %s", (job_id,))
+        return removed
+
+    def jobs(self) -> list[str]:
+        return self._column("jobs", f"SELECT DISTINCT job_id FROM {self._b.table('ledger')} ORDER BY job_id", ())
+
+    def raw_entries(self, prefix: str, after: str | None, limit: int) -> list[RawReply]:
+        with self._b.tx("raw_entries") as cur:
+            cur.execute(
+                f"SELECT key, raw_reply, valid FROM {self._b.table('raw_replies')} WHERE left(key, %s) = %s AND key > %s ORDER BY key LIMIT %s",
+                (len(prefix), prefix, after or "", limit),
+            )
+            rows = cur.fetchall()
+        return [RawReply(key=r[0], raw_reply=r[1], valid=bool(r[2])) for r in rows]
 
 
 class PostgresSessions:

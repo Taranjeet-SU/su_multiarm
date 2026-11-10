@@ -1,0 +1,22 @@
+# Synthetic keyword family for logs.collection.keywords (illustrative names only).
+# Phrases form the keyword union counted at the source; rules are mutually exclusive
+# detection rules in precedence order (an earlier rule wins). Changing this file changes
+# its sha256: re-pin it in the policy, with keywords.effective_from once days are archived.
+family: example_ml
+phrases:
+  - model server unavailable
+  - training job failed
+  - connection refused
+rules:
+  - id: ml.model_unavailable
+    title: Model server unavailable
+    category: ml_serving
+    alternatives: [[model server unavailable]]
+  - id: ml.training_failed
+    title: Training job failed
+    category: ml_training
+    alternatives: [[training job failed]]
+  - id: net.refused
+    title: Connection refused
+    category: connectivity
+    alternatives: [[connection refused]]

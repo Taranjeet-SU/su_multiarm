@@ -181,8 +181,11 @@ BUILTIN_TOOL_CLASSES: tuple[type, ...] = (SearchTool, GetDocumentTool, ListValue
 
 def builtin_tool_registry(enabled: list[str]) -> ToolRegistry:
     """A ``ToolRegistry`` holding exactly the enabled built-ins (config names only registered classes)."""
+    from .log_tools import LOG_TOOL_CLASSES
+    from .episode_tools import EpisodeTool
+
     registry = ToolRegistry()
-    known = {cls.name: cls for cls in BUILTIN_TOOL_CLASSES}
+    known = {cls.name: cls for cls in (*BUILTIN_TOOL_CLASSES, *LOG_TOOL_CLASSES, EpisodeTool)}
     for name in enabled:
         registry.register(known[name])
     return registry

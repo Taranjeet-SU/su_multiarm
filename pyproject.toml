@@ -17,6 +17,8 @@ classifiers = ["Development Status :: 3 - Alpha", "Programming Language :: Pytho
 faiss = ["faiss-cpu>=1.8"]
 postgres = ["psycopg[binary]>=3.2,<4"]
 sql = ["sqlalchemy>=2.0,<3"]
+# typed_query mode sql_surface: model-written SQLite SELECTs parsed and guarded (ported from NVIDIA Auto-Ontology)
+sql-surface = ["sqlglot>=30,<31"]
 neo4j = ["neo4j>=5.24,<7"]
 kuzu = ["kuzu>=0.11,<0.12"]
 elasticsearch = ["elasticsearch>=8.17,<9"]
@@ -27,13 +29,18 @@ local = ["sentence-transformers>=3.0"]  # local embedder/reranker models (alias 
 spacy = ["spacy>=3.8"]
 gliner = ["gliner>=0.2"]
 communities = ["networkx>=3.3"]
+# pattern extractor engines (chosen explicitly by extraction.pattern_library.engine; no fallback)
+patterns = ["google-re2>=1.1"]
+patterns-lite = ["regex>=2023.0"]
 api = ["fastapi>=0.115", "uvicorn>=0.30"]
 mcp = ["mcp>=1.10,<2"]
+# The web UI: static assets in a separate wheel built from ui/ (addendum A2 §4.4.1); not in `all`.
+ui = ["su-multi-arm-ui==2.0.0a3", "fastapi>=0.115", "uvicorn>=0.30"]
 # The OpenAI and Anthropic providers speak the HTTP APIs through httpx (a core dependency); these
 # extras are intentionally empty so `pip install su-multi-arm[openai]` / `[anthropic]` resolve.
 openai = []
 anthropic = []
-all = ["su-multi-arm[faiss,postgres,sql,neo4j,kuzu,elasticsearch,mongodb,opensearch,semantic,spacy,gliner,communities,api,mcp]"]
+all = ["su-multi-arm[faiss,postgres,sql,sql-surface,neo4j,kuzu,elasticsearch,mongodb,opensearch,semantic,spacy,gliner,communities,patterns,api,mcp]"]
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5,<10"]
 dev = ["pytest>=8", "ruff>=0.9", "build>=1.2", "hatchling>=1.25"]
 
@@ -42,6 +49,10 @@ su-multi-arm = "su_multi_arm.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/su_multi_arm"]
+
+[tool.hatch.build.targets.sdist]
+# the UI is its own distribution (ui/python): the core sdist never carries it or node_modules
+exclude = ["/ui", "/.claude"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -55,7 +55,7 @@ def test_probe_reports_backends_and_provider_pairs_without_model_calls(monkeypat
     report = probe_report(engine)
     backend = report["backends"]["local"]
     assert report["probe"] == "ok" and report["model_calls"] == 0 and backend["status"] == "ok" and backend["kind"] == kind
-    assert set(backend["contracts"]) == {"catalog", "lexical", "vector", "records", "graph", "cache", "ledger", "session"}
+    assert set(backend["contracts"]) == {"catalog", "lexical", "vector", "records", "graph", "cache", "ledger", "session", "relational"}
     if kind == "sqlite":
         assert backend["detail"]["sqlite_version"] and backend["detail"]["generations"] == 0
     else:

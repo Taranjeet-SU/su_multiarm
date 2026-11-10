@@ -169,3 +169,41 @@ def test_error_categories_are_stable():
     assert error_category(SchemaViolation("bad", raw="{}")) == "schema_violation"
     assert error_category(RequestRejected("no")) == "rejected"
     assert error_category(KeyError("k")) == "internal"
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_a_schema_violating_generator_reply_is_logged_and_returns_evidence_with_an_abstain(fake, caplog, streaming):
+    """Real-run fix: the stream ended with a bare ``error: schema_violation`` and nothing in the
+    server log. The cause is logged (paths, error types, stop reason; never the reply) and the run
+    ends with ``done``: the retrieved evidence and an abstaining answer."""
+    secret_marker = "SYNTHETIC-REPLY-TEXT-7731"
+    fake.answer = lambda payload: {"answer": secret_marker, "citations": "not-a-list"}
+    engine = engine_with(fake.role(streaming=streaming))
+    with caplog.at_level("WARNING", logger="su_multi_arm.engine"):
+        events = list(engine.answer_stream(SearchRequest.model_validate(REQUEST)))
+    assert events[-1].event == "done" and not any(isinstance(e, ErrorEvent) for e in events)
+    result = events[-1].result
+    assert result.answer.insufficient_evidence and "schema_violation" in result.answer.answer
+    assert result.retrieval.hits  # the evidence is still returned
+    logged = [r.getMessage() for r in caplog.records if "answer schema" in r.getMessage()]
+    assert len(logged) == 1 and "citations (list_type)" in logged[0] and '"stop_reason": "stop"' in logged[0]
+    assert secret_marker not in logged[0]
+    plain = engine.answer(SearchRequest.model_validate(REQUEST))  # the non-streaming path too
+    assert plain.answer.insufficient_evidence and "schema_violation" in plain.answer.answer
+
+
+def test_incomplete_stream_has_safe_stage_diagnostic_and_no_partial_success(caplog):
+    from su_multi_arm.providers import ProviderIncomplete
+    from su_multi_arm.runtime.events import AnswerStream
+    from su_multi_arm.serving.sse import format_event
+
+    def fail(emit, delta):
+        raise ProviderIncomplete("PRIVATE-PARTIAL-REPLY", stage="generator")
+
+    events = list(AnswerStream(fail))
+    assert len(events) == 1 and isinstance(events[0], ErrorEvent)
+    assert events[0].stage == "generator" and events[0].category == "provider_incomplete"
+    wire = format_event(events[0])
+    assert "generating the answer" in wire and "No completed answer" in wire
+    assert "PRIVATE-PARTIAL-REPLY" not in wire and "PRIVATE-PARTIAL-REPLY" not in caplog.text
+    assert "stage=generator" in caplog.text
