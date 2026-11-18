@@ -102,10 +102,11 @@ class Qualifier(StrictModel):
     token: bool = False
 
 
-# A negation cue ending right before a candidate (an article may sit between). ``no`` is excluded:
-# it is the absence operator ("are there no open tickets"), not an exclusion of a value.
+# A negation cue ending right before a candidate (a preposition and an article may sit between:
+# "not from X", "not in X"). ``no`` is excluded: it is the absence operator ("are there no open
+# tickets"), not an exclusion of a value.
 _NEGATION = re.compile(
-    r"(?:\b(?:not|non|never|except|excluding|exclude|without)|\b(?:other|rather)\s+than|\binstead\s+of|\b\w+n't)\s*-?\s*(?:(?:a|an|the|any)\s+)?$",
+    r"(?:\b(?:not|non|never|except|excluding|exclude|without)|\b(?:other|rather)\s+than|\binstead\s+of|\b\w+n't)\s*-?\s*(?:(?:from|in|by|with|for|at|of|to)\s+)?(?:(?:a|an|the|any)\s+)?$",
     re.I,
 )
 # Explicit operators that bind any word to a string/id field ("severity = high", "owner: alex").

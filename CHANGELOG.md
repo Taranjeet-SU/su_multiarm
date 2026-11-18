@@ -8,6 +8,12 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Changed ("not from X" is read as an exclusion)
+- The qualifier checker's negation cue may now be followed by a preposition (`from`, `in`, `by`, `with`,
+  `for`, `at`, `of`, `to`) before the value. "How many tickets are not Closed and not from Acme?" no longer
+  reads Acme as a positive filter and refuses the correctly negated plan as `qualifier_not_applied`.
+  A cue that matched before still matches.
+
 ### Changed (a single share shows its percentage)
 - `render_aggregate` now writes a scalar share as `share: 0.01951, that is 1.951% (exact; 205 records matched)`.
   The writer copies a ready percentage instead of converting the fraction itself (small fractions were
