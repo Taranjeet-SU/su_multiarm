@@ -8,6 +8,11 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Changed (a single share shows its percentage)
+- `render_aggregate` now writes a scalar share as `share: 0.01951, that is 1.951% (exact; 205 records matched)`.
+  The writer copies a ready percentage instead of converting the fraction itself (small fractions were
+  mis-converted). Grouped shares and all other measures render as before.
+
 ### Added (group-size thresholds as aggregate questions)
 
 - The intent grammar recognises "more than N", "fewer/less than N", "at least N", "at most N" and
