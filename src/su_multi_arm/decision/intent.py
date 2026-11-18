@@ -40,8 +40,8 @@ _OPERATORS: dict[AggregateKind, str] = {
     "total": r"(total(?!\s+number\b)|sum of|summed|altogether|add up)",
     "list": r"(list (all|every)|show (me )?(all|every)|all (of )?the|every|enumerate|exhaustive)",
     "absence": r"((is|are) there (any|no)|(does|do) any|none of|any at all)",
-    "earliest": r"(earliest|first (recorded|seen|reported|known)|oldest|first time)",
-    "latest": r"(latest|most recent|last (recorded|seen|reported)|newest|last time)",
+    "earliest": r"(earliest|first (recorded|seen|reported|known)|oldest|first time|first(?= (\w+ ){0,4}?(ticket|record|case|issue|request|item)s? (created|opened|filed|raised|reported|submitted|logged)))",
+    "latest": r"(latest|most recent|last (recorded|seen|reported)|newest|last time|last(?= (\w+ ){0,4}?(ticket|record|case|issue|request|item)s? (created|opened|filed|raised|reported|submitted|logged)))",
     # query-compiler operators (2.0.0a3): ranking, breakdowns, numeric measures, shares, comparisons
     # "(has) raised/filed/opened ... the most": record-producing verbs only (2026-11-08 parity fix)
     # 2026-11-09 corpus-B fix F5: "appears/occurs most often", "spans/covers the most distinct",

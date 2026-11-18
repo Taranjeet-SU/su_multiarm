@@ -8,6 +8,13 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Changed ("the first X ticket created" is an earliest/latest question)
+- The `earliest` and `latest` aggregate operators now also recognise "the first/last <words> ticket
+  created" (and opened, filed, raised, reported, submitted, logged). "Which was the first Acme ticket
+  created?" no longer has its structured step dropped as `unsolicited_structured`, which made the writer
+  guess a record from a semantic search. Other uses of "first" ("how do I create my first ticket") stay
+  retrieval questions.
+
 ### Changed ("not from X" is read as an exclusion)
 - The qualifier checker's negation cue may now be followed by a preposition (`from`, `in`, `by`, `with`,
   `for`, `at`, `of`, `to`) before the value. "How many tickets are not Closed and not from Acme?" no longer
