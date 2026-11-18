@@ -8,6 +8,14 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Added (group-size thresholds as aggregate questions)
+
+- The intent grammar recognises "more than N", "fewer/less than N", "at least N", "at most N" and
+  "between A and B" next to a structured target ("which customers have more than 300 tickets") as a
+  count question, so a structured step for it is no longer dropped as `unsolicited_structured`. The
+  phrases need a target word, so "restarts more than 3 times" stays a retrieval question, and the
+  schema-less fallback is unchanged.
+
 ### Added (role temperature)
 
 - `temperature` (0 to 2) on a chat role, sent by the `openai` and `openai_compatible` providers only

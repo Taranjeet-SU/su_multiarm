@@ -52,6 +52,9 @@ _OPERATORS: dict[AggregateKind, str] = {
     "measure": r"(average|avg|mean|median|minimum|maximum)",
     "share": r"(percentages?|percent|share|proportions?|fractions?|ratios?)",
     "compare": r"(vs\.?|versus|compared (to|with)|compare)",
+    # group-size thresholds ("customers with more than 300 tickets", "at least 50", "between 70 and 80"): a count question, but only next to a
+    # structured target, so "restarts more than 3 times" stays a retrieval question. Under the ``count`` kind, whose untargeted phrases are above.
+    "count": r"((more|greater|fewer|less) than \d+|at least \d+|at most \d+|between \d+ and \d+)",
 }
 # Operators that must sit right next to their target (at most an article between): "by" and "per"
 # are ordinary English otherwise ("created by the team").
