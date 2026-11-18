@@ -8,6 +8,12 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Added (role temperature)
+
+- `temperature` (0 to 2) on a chat role, sent by the `openai` and `openai_compatible` providers only
+  when set; unset roles send exactly the request they sent before. 0 makes a call repeatable. It is
+  refused for the `anthropic` provider and together with `reasoning_effort`.
+
 ### Added (retrieval parity, all opt-in)
 
 - Cross-encoder rerank stage with device/dtype/batch/length, `top_k_in`/`top_k_out`, a latency

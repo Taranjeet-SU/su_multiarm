@@ -137,6 +137,7 @@ class HttpChatProvider:
             thinking=self.role.thinking,
             thinking_budget_tokens=self.role.thinking_budget_tokens,
             effort=self.role.effort,
+            temperature=self.role.temperature,
         )
         if problems:
             raise CapabilityMismatch("; ".join(f"{key}: {message}" for key, message in problems))

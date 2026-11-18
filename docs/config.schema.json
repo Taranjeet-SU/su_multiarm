@@ -720,6 +720,20 @@
           "default": null,
           "title": "Reasoning Effort"
         },
+        "temperature": {
+          "anyOf": [
+            {
+              "maximum": 2,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Temperature"
+        },
         "thinking": {
           "anyOf": [
             {
