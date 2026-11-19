@@ -1,3 +1,37 @@
+## Built-in prompt guide and seven small planner, contract and rendering fixes — 2026-11-19
+
+Evidence level: **synthetic / contract-mocked tests, a wheel and sdist build, and an offline smoke test
+of the built wheel.** Synthetic fixtures only, in-memory backends, mocked model transport, no live
+service and no paid model call from this repository's tests. The contributor also measured the changes
+against a real model and a real OpenSearch index on a private question set; those questions, answers
+and figures are not part of this repository and are not repeated here. Nothing in the tests measures
+relevance or production latency.
+
+- `tests/unit/test_role_temperature.py` (6): the optional `temperature` on a chat role is passed to
+  OpenAI-compatible providers, refused for Anthropic and together with `reasoning_effort`, bounded 0 to 2.
+- `tests/unit/test_intent_thresholds.py` (10): "more than N", "at least N", "at most N", "between A and B"
+  next to a structured target are aggregate questions; the same words without a target stay retrieval.
+- `tests/unit/test_share_percent_rendering.py` (3): a single share renders its percentage next to the
+  fraction; other measures render as before.
+- `tests/unit/test_negation_preposition.py` (7): a negation cue may be followed by a preposition
+  ("not from X", "not in X"); a preposition alone is not a negation.
+- `tests/unit/test_intent_first_created.py` (9): "the first/last X record created, opened, filed ..." is
+  an earliest/latest question; other uses of "first" stay retrieval questions.
+- `tests/unit/test_bound_range.py` (6): a datetime or date bound that cannot be read in UTC is refused as
+  `unparseable_bound`; ordinary bounds still parse.
+- `tests/unit/test_typed_planner.py`: the two recorded planner request hashes are re-recorded for one
+  intended change, the longer built-in planner prompt (about 22 KB more in both modes); the wire schema is
+  unchanged. `tests/contract/test_domains.py` still passes, so the new prompt text uses no domain words.
+
+Full run: 4,476 passed, 255 skipped, 0 failed; `ruff check src tests` clean. `python -m build` from a clean
+export of the commit produced the wheel and the sdist; the README quickstart (ingest, search, an aggregate
+request, `doctor`) ran from the built wheel on `examples/v2/local.yaml` with hash embeddings and returned
+normal output.
+
+Not verified: relevance on real corpora (not measured in this repository); the effect of the longer
+planner prompt on token cost and latency; behaviour of the guide with log intents and the unified
+collection; models other than the one used for the private measurement.
+
 ## Legacy QA adapter pre-cutover hardening — 2026-11-09
 
 Evidence level: **synthetic / contract-mocked only.** Synthetic corpus (`tests/compat_support.py`),
