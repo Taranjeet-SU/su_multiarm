@@ -132,6 +132,10 @@ def _parse_datetime_bound(spec: FieldSpec, value: Any) -> datetime:
         if spec.timezone_policy == "require_offset":
             raise BoundError("timezone_missing", f"{spec.name}: bound {value!r} needs an explicit UTC offset")
         parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        parsed.astimezone(timezone.utc)  # the stores compare instants in UTC: an edge-of-range bound cannot be read
+    except OverflowError:
+        raise BoundError("unparseable_bound", f"{spec.name}: bound {value!r} is outside the supported date range") from None
     return parsed
 
 
@@ -149,7 +153,10 @@ def _parse_date_bound(spec: FieldSpec, value: Any) -> date:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00") if text.endswith("Z") else text)
     except ValueError:
         raise BoundError("unparseable_bound", f"{spec.name}: bound {value!r} is not an ISO 8601 date") from None
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).date()
+    try:
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).date()
+    except OverflowError:
+        raise BoundError("unparseable_bound", f"{spec.name}: bound {value!r} is outside the supported date range") from None
 
 
 def _calendar_bound(spec: FieldSpec, value: Any, granularity: Granularity) -> datetime:

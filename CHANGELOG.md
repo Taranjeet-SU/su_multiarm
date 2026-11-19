@@ -8,6 +8,10 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Fixed (a date bound at the edge of the range)
+- A datetime or date bound that cannot be read in UTC (for example year 0001 with a positive offset) is
+  refused as `unparseable_bound` instead of raising `OverflowError`.
+
 ### Changed ("the first X ticket created" is an earliest/latest question)
 - The `earliest` and `latest` aggregate operators now also recognise "the first/last <words> ticket
   created" (and opened, filed, raised, reported, submitted, logged). "Which was the first Acme ticket
