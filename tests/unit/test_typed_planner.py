@@ -399,10 +399,14 @@ def test_typed_planning_needs_the_typed_query_arm(tmp_path):
 # prompt or the wire schema of existing configurations fails here. Re-recorded 2026-11-09 (B5
 # q043) for one intended change only: the scope draft's new optional ``min_count`` field (the
 # groups' record threshold) and its description in the wire schema; the prompt is unchanged
-# (previous: e04ffaeb.../20881 and cf8cf8f7.../13985).
+# (previous: e04ffaeb.../20881 and cf8cf8f7.../13985). Re-recorded again for one intended change
+# only: the built-in planner prompt now ends with a guide to choosing the arm and writing a structured
+# scope, and eighteen worked plans (``profiles/prompts.py``, ``_PLANNER_GUIDE``); the wire schema is
+# unchanged and the request grew by the same 22200 bytes in both modes (previous: 32c28137.../21445 and
+# 0dffc514.../14288).
 BASELINE = [
-    ("32c28137e5c6147505da0e304dee67422a4c193ddcc6cb0f4ae2191fac28cf8d", 21445),
-    ("0dffc51488fb7147df682defee9e471ba494783462a2b6e6c24ca4ebda47882d", 14288),
+    ("979a9f3d042f23fd621cf151f870bf039a6b59c7f2356671d0e5a8047ae90765", 43645),
+    ("fcebc9b82ce22101bd72c1d31b6bae049bdf16416cf27d3b51439ff3eccbb47f", 36488),
 ]
 
 

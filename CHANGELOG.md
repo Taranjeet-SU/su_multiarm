@@ -8,6 +8,22 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Added (a guide to choosing the arm and writing a structured scope, in the built-in planner prompt)
+- The built-in planner prompt keeps its paragraph and now continues with a short guide to choosing the
+  arm (an id goes to `exact_id`, a topic to `dense`/`lexical`, `structured` only for counts, totals,
+  rankings and lists) and to filling in a structured scope (predicates and negation, date groups with a
+  granularity, rankings and "fewest", `count_distinct` without `group_by`, group-size thresholds,
+  newest/oldest lists with `sort` and `limit`, first/last dates, shares with a numerator, multi-part
+  questions), with eighteen worked plans in the wire shape of `LlmPlan`. The wording is domain-neutral
+  (the neutral-vocabulary test still passes) and uses made-up names only. The planner request grows by
+  about 22 KB in both modes, so the two recorded request hashes in `tests/unit/test_typed_planner.py` are
+  re-recorded for this one intended change; a config that sets its own `prompt` is not affected.
+- The built-in answer-writer prompt gets three sentences: name every record an aggregate lists by id and
+  cite the aggregate id in a narrative claim (an `examples` claim cites record ids, which a list has
+  none of); state a share exactly as rendered, adding no count or total the rendering does not give; say
+  that the collection does not cover a question the evidence does not address, instead of answering from
+  general knowledge.
+
 ### Fixed (a date bound at the edge of the range)
 - A datetime or date bound that cannot be read in UTC (for example year 0001 with a positive offset) is
   refused as `unparseable_bound` instead of raising `OverflowError`.
