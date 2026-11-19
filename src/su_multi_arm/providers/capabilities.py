@@ -206,6 +206,7 @@ def check_role(
     thinking: str | None = None,
     thinking_budget_tokens: int | None = None,
     effort: str | None = None,
+    temperature: float | None = None,
 ) -> list[tuple[str, str]]:
     """Static checks of a chat role against the registry: ``[(key, message), ...]``, empty when valid."""
     try:
@@ -213,6 +214,11 @@ def check_role(
     except KeyError as error:
         return [("provider", str(error))]
     problems: list[tuple[str, str]] = []
+    if temperature is not None:
+        if provider == "anthropic":
+            problems.append(("temperature", "temperature is not supported for the anthropic provider"))
+        elif reasoning_effort is not None:
+            problems.append(("temperature", "temperature cannot be combined with reasoning_effort (reasoning models reject it)"))
     if structured_output == "native":
         if not caps.native_structured_output:
             problems.append(

@@ -8,6 +8,58 @@ mocked or real-service) is recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## [Unreleased]
 
+### Added (a guide to choosing the arm and writing a structured scope, in the built-in planner prompt)
+- The built-in planner prompt keeps its paragraph and now continues with a short guide to choosing the
+  arm (an id goes to `exact_id`, a topic to `dense`/`lexical`, `structured` only for counts, totals,
+  rankings and lists) and to filling in a structured scope (predicates and negation, date groups with a
+  granularity, rankings and "fewest", `count_distinct` without `group_by`, group-size thresholds,
+  newest/oldest lists with `sort` and `limit`, first/last dates, shares with a numerator, multi-part
+  questions), with eighteen worked plans in the wire shape of `LlmPlan`. The wording is domain-neutral
+  (the neutral-vocabulary test still passes) and uses made-up names only. The planner request grows by
+  about 22 KB in both modes, so the two recorded request hashes in `tests/unit/test_typed_planner.py` are
+  re-recorded for this one intended change; a config that sets its own `prompt` is not affected.
+- The built-in answer-writer prompt gets three sentences: name every record an aggregate lists by id and
+  cite the aggregate id in a narrative claim (an `examples` claim cites record ids, which a list has
+  none of); state a share exactly as rendered, adding no count or total the rendering does not give; say
+  that the collection does not cover a question the evidence does not address, instead of answering from
+  general knowledge.
+
+### Fixed (a date bound at the edge of the range)
+- A datetime or date bound that cannot be read in UTC (for example year 0001 with a positive offset) is
+  refused as `unparseable_bound` instead of raising `OverflowError`.
+
+### Changed ("the first X ticket created" is an earliest/latest question)
+- The `earliest` and `latest` aggregate operators now also recognise "the first/last <words> ticket
+  created" (and opened, filed, raised, reported, submitted, logged). "Which was the first Acme ticket
+  created?" no longer has its structured step dropped as `unsolicited_structured`, which made the writer
+  guess a record from a semantic search. Other uses of "first" ("how do I create my first ticket") stay
+  retrieval questions.
+
+### Changed ("not from X" is read as an exclusion)
+- The qualifier checker's negation cue may now be followed by a preposition (`from`, `in`, `by`, `with`,
+  `for`, `at`, `of`, `to`) before the value. "How many tickets are not Closed and not from Acme?" no longer
+  reads Acme as a positive filter and refuses the correctly negated plan as `qualifier_not_applied`.
+  A cue that matched before still matches.
+
+### Changed (a single share shows its percentage)
+- `render_aggregate` now writes a scalar share as `share: 0.01951, that is 1.951% (exact; 205 records matched)`.
+  The writer copies a ready percentage instead of converting the fraction itself (small fractions were
+  mis-converted). Grouped shares and all other measures render as before.
+
+### Added (group-size thresholds as aggregate questions)
+
+- The intent grammar recognises "more than N", "fewer/less than N", "at least N", "at most N" and
+  "between A and B" next to a structured target ("which customers have more than 300 tickets") as a
+  count question, so a structured step for it is no longer dropped as `unsolicited_structured`. The
+  phrases need a target word, so "restarts more than 3 times" stays a retrieval question, and the
+  schema-less fallback is unchanged.
+
+### Added (role temperature)
+
+- `temperature` (0 to 2) on a chat role, sent by the `openai` and `openai_compatible` providers only
+  when set; unset roles send exactly the request they sent before. 0 makes a call repeatable. It is
+  refused for the `anthropic` provider and together with `reasoning_effort`.
+
 ### Added (retrieval parity, all opt-in)
 
 - Cross-encoder rerank stage with device/dtype/batch/length, `top_k_in`/`top_k_out`, a latency

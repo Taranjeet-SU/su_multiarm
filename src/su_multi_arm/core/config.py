@@ -305,6 +305,8 @@ class ChatRole(RoleResilience):  # on_incomplete / retry_transient: core/config_
     # ``/v1`` ignores ``max_completion_tokens``: set ``max_tokens`` for it (docs/CONFIGURATION.md).
     max_tokens_parameter: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens"
     reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
+    # Sampling temperature (``openai`` / ``openai_compatible``); 0 makes a call repeatable. Unset: nothing is sent (the provider's default).
+    temperature: float | None = Field(default=None, ge=0, le=2)
     # Anthropic thinking/effort control (2026-11-09), validated per model against the registry:
     # ``off`` is realised as the model allows (Haiku 5.x: ``disabled``, only at effort <= high;
     # Sonnet 5.x: ``between_tools``, it cannot disable thinking; Haiku 4.5: no thinking field);
@@ -381,6 +383,7 @@ class ChatRole(RoleResilience):  # on_incomplete / retry_transient: core/config_
             self.thinking,
             self.thinking_budget_tokens,
             self.effort,
+            self.temperature,
         )
         if self.measure_first_token and not self.capabilities.streaming:
             problems.append(("measure_first_token", "measure_first_token streams the call; declare capabilities.streaming: true"))

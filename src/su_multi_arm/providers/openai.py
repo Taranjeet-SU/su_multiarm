@@ -97,6 +97,8 @@ class OpenAIProvider(HttpChatProvider):
             if param is None:  # pragma: no cover - rejected by check_role at construction
                 raise CapabilityMismatch(f"reasoning_effort is not declared for ({self.name}, {self.role.model})")
             body[param] = self.role.reasoning_effort
+        if self.role.temperature is not None:
+            body["temperature"] = self.role.temperature
         body["messages"] = [{"role": "system", "content": text}, {"role": "user", "content": user}]
         return "/chat/completions", {}, body
 

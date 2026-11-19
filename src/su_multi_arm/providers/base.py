@@ -271,6 +271,7 @@ class RoleSpec:
     structured_output: str = "none"
     prompt_caching: str = "none"
     reasoning_effort: str | None = None
+    temperature: float | None = None  # sampling temperature (openai / openai_compatible); unset sends nothing
     pricing_key: str | None = None
     streaming: bool = False  # the role declares ``capabilities.streaming``
     thinking: str | None = None  # Anthropic thinking control (``capabilities.thinking_wire``)
@@ -301,6 +302,7 @@ class RoleSpec:
             structured_output=getattr(caps, "structured_output", None) or "none",
             prompt_caching=getattr(caps, "prompt_caching", "none"),
             reasoning_effort=getattr(config, "reasoning_effort", None),
+            temperature=getattr(config, "temperature", None),
             pricing_key=pricing or config.model or None,
             streaming=bool(getattr(caps, "streaming", False)),
             thinking=getattr(config, "thinking", None),

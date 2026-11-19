@@ -40,8 +40,8 @@ _OPERATORS: dict[AggregateKind, str] = {
     "total": r"(total(?!\s+number\b)|sum of|summed|altogether|add up)",
     "list": r"(list (all|every)|show (me )?(all|every)|all (of )?the|every|enumerate|exhaustive)",
     "absence": r"((is|are) there (any|no)|(does|do) any|none of|any at all)",
-    "earliest": r"(earliest|first (recorded|seen|reported|known)|oldest|first time)",
-    "latest": r"(latest|most recent|last (recorded|seen|reported)|newest|last time)",
+    "earliest": r"(earliest|first (recorded|seen|reported|known)|oldest|first time|first(?= (\w+ ){0,4}?(ticket|record|case|issue|request|item)s? (created|opened|filed|raised|reported|submitted|logged)))",
+    "latest": r"(latest|most recent|last (recorded|seen|reported)|newest|last time|last(?= (\w+ ){0,4}?(ticket|record|case|issue|request|item)s? (created|opened|filed|raised|reported|submitted|logged)))",
     # query-compiler operators (2.0.0a3): ranking, breakdowns, numeric measures, shares, comparisons
     # "(has) raised/filed/opened ... the most": record-producing verbs only (2026-11-08 parity fix)
     # 2026-11-09 corpus-B fix F5: "appears/occurs most often", "spans/covers the most distinct",
@@ -52,6 +52,9 @@ _OPERATORS: dict[AggregateKind, str] = {
     "measure": r"(average|avg|mean|median|minimum|maximum)",
     "share": r"(percentages?|percent|share|proportions?|fractions?|ratios?)",
     "compare": r"(vs\.?|versus|compared (to|with)|compare)",
+    # group-size thresholds ("customers with more than 300 tickets", "at least 50", "between 70 and 80"): a count question, but only next to a
+    # structured target, so "restarts more than 3 times" stays a retrieval question. Under the ``count`` kind, whose untargeted phrases are above.
+    "count": r"((more|greater|fewer|less) than \d+|at least \d+|at most \d+|between \d+ and \d+)",
 }
 # Operators that must sit right next to their target (at most an article between): "by" and "per"
 # are ordinary English otherwise ("created by the team").

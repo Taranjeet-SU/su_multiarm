@@ -88,7 +88,10 @@ def render_aggregate(spec: ScopeSpec, result: ScopeResult) -> str:
     qualifier = _qualifier(result)
     if result.exactness == "bounded" and isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
         qualifier = qualifier.replace("bounded", "bounded, not an exact zero for the question", 1)  # B5 q041
-    return f"{label}: {number(value)} ({qualifier})."
+    shown = number(value)
+    if spec.measure is not None and spec.measure.kind == "share" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        shown += f", that is {number(value * 100)}%"  # the writer copies a ready percentage instead of converting
+    return f"{label}: {shown} ({qualifier})."
 
 
 MAX_CELL = 120  # characters of one free-text cell in a SQL rendering (longer cells end in "...")
